@@ -16,3 +16,8 @@ Cargo.lock
 
 ## Nix
 /.direnv
+
+## Node (release tooling)
+node_modules
+package.json
+bun.lock
