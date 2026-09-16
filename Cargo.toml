@@ -19,6 +19,7 @@ authors = [
 documentation = "https://docs.rs/fastembed"
 repository = "https://github.com/Anush008/fastembed-rs"
 homepage = "https://crates.io/crates/fastembed"
+include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [package.metadata.docs.rs]
 features = ["qwen3", "nomic-v2-moe"]
