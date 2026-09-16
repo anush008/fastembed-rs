@@ -99,7 +99,7 @@ impl<M: Default + HasMaxLength> InitOptionsWithLength<M> {
     }
 
     /// Set the number of intra-op threads ONNX Runtime uses. By default
-    /// (`None`) all available CPU cores are used; capping this limits CPU
+    /// (`None`) all available CPU cores are used. Capping this limits CPU
     /// usage at the cost of per-inference throughput.
     pub fn with_intra_threads(mut self, intra_threads: usize) -> Self {
         self.intra_threads = Some(intra_threads);
@@ -146,7 +146,7 @@ impl<M: Default> InitOptions<M> {
     }
 
     /// Set the number of intra-op threads ONNX Runtime uses. By default
-    /// (`None`) all available CPU cores are used; capping this limits CPU
+    /// (`None`) all available CPU cores are used. Capping this limits CPU
     /// usage at the cost of per-inference throughput.
     pub fn with_intra_threads(mut self, intra_threads: usize) -> Self {
         self.intra_threads = Some(intra_threads);

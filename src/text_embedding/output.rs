@@ -22,9 +22,6 @@ pub const OUTPUT_TYPE_PRECEDENCE: &[OutputKey] = &[
 /// Generates the default array transformer for the [`TextEmbedding`] model using the
 /// provided output precedence.
 ///
-// TODO (denwong47): now that pooling is done in SingleBatchOutput, it is possible that
-// all the models will use this same generic transformer. Move this into SingleBatchOutput?
-#[allow(unused_variables)]
 pub fn transformer_with_precedence(
     output_precedence: impl OutputPrecedence,
     pooling: Option<Pooling>,

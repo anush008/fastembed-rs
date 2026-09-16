@@ -34,7 +34,7 @@ pub fn cls(tensor: &ArrayView<f32, Dim<IxDynImpl>>) -> Result<Array2<f32>> {
 // https://github.com/UKPLab/sentence-transformers/blob/c0fc0e8238f7f48a1e92dc90f6f96c86f69f1e02/sentence_transformers/models/Pooling.py#L151
 pub fn mean(
     token_embeddings: &ArrayView<f32, Dim<IxDynImpl>>,
-    attention_mask_array: Array2<i64>,
+    attention_mask_array: &Array2<i64>,
 ) -> Result<Array2<f32>> {
     let attention_mask_original_dim = attention_mask_array.dim();
 
@@ -58,6 +58,7 @@ pub fn mean(
 
     // Compute attention mask
     let attention_mask = attention_mask_array
+        .view()
         .insert_axis(ndarray::Axis(2))
         .broadcast(token_embeddings.dim())
         .ok_or_else(|| {

@@ -36,11 +36,11 @@ pub enum EmbeddingModel {
     NomicEmbedTextV15,
     /// Quantized v1.5 nomic-ai/nomic-embed-text-v1.5
     NomicEmbedTextV15Q,
-    /// sentence-transformers/paraphrase-MiniLM-L6-v2
+    /// sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     ParaphraseMLMiniLML12V2,
-    /// Quantized sentence-transformers/paraphrase-MiniLM-L6-v2
+    /// Quantized sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     ParaphraseMLMiniLML12V2Q,
-    /// sentence-transformers/paraphrase-mpnet-base-v2
+    /// sentence-transformers/paraphrase-multilingual-mpnet-base-v2
     ParaphraseMLMpnetBaseV2,
     /// BAAI/bge-small-zh-v1.5
     BGESmallZHV15,
@@ -162,7 +162,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::BGEBaseENV15Q,
             dim: 768,
-            description: String::from("Quantized v1.5 release of the large English model"),
+            description: String::from("Quantized v1.5 release of the base English model"),
             model_code: String::from("Qdrant/bge-base-en-v1.5-onnx-Q"),
             model_file: String::from("model_optimized.onnx"),
             additional_files: Vec::new(),
@@ -353,7 +353,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::GTEBaseENV15,
             dim: 768,
-            description: String::from("Large multilingual embedding model from Alibaba"),
+            description: String::from("Base English embedding model from Alibaba"),
             model_code: String::from("Alibaba-NLP/gte-base-en-v1.5"),
             model_file: String::from("onnx/model.onnx"),
             additional_files: Vec::new(),
@@ -362,7 +362,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::GTEBaseENV15Q,
             dim: 768,
-            description: String::from("Quantized Large multilingual embedding model from Alibaba"),
+            description: String::from("Quantized base English embedding model from Alibaba"),
             model_code: String::from("Alibaba-NLP/gte-base-en-v1.5"),
             model_file: String::from("onnx/model_quantized.onnx"),
             additional_files: Vec::new(),
@@ -371,7 +371,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::GTELargeENV15,
             dim: 1024,
-            description: String::from("Large multilingual embedding model from Alibaba"),
+            description: String::from("Large English embedding model from Alibaba"),
             model_code: String::from("Alibaba-NLP/gte-large-en-v1.5"),
             model_file: String::from("onnx/model.onnx"),
             additional_files: Vec::new(),
@@ -380,7 +380,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::GTELargeENV15Q,
             dim: 1024,
-            description: String::from("Quantized Large multilingual embedding model from Alibaba"),
+            description: String::from("Quantized large English embedding model from Alibaba"),
             model_code: String::from("Alibaba-NLP/gte-large-en-v1.5"),
             model_file: String::from("onnx/model_quantized.onnx"),
             additional_files: Vec::new(),
@@ -536,13 +536,6 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         },
     ];
 
-    // TODO: Use when out in stable
-    // assert_eq!(
-    //     std::mem::variant_count::<EmbeddingModel>(),
-    //     models_list.len(),
-    //     "models::models() is not exhaustive"
-    // );
-
     models_list
         .into_iter()
         .fold(HashMap::new(), |mut map, model| {
@@ -559,7 +552,7 @@ pub fn models_map() -> &'static HashMap<EmbeddingModel, ModelInfo<EmbeddingModel
 
 /// Get a list of all available models.
 ///
-/// This will assign new memory to the models list; where possible, use
+/// This will assign new memory to the models list. Where possible, use
 /// [`models_map`] instead.
 pub fn models_list() -> Vec<ModelInfo<EmbeddingModel>> {
     models_map().values().cloned().collect()

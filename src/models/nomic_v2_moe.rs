@@ -4,7 +4,7 @@
 //! NomicBert architecture with MoE layers on alternating transformer blocks.
 //!
 //! This module provides [`NomicV2MoeTextEmbedding`] which handles tokenization,
-//! forward pass, mean pooling, and L2 normalization — entirely via candle-nn.
+//! forward pass, mean pooling, and L2 normalization, entirely via candle-nn.
 //! No ONNX runtime required.
 
 #[cfg(feature = "mkl")]
@@ -17,9 +17,6 @@ use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 use std::path::PathBuf;
-
-#[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiBuilder;
 
 // ---------------------------------------------------------------------------
 // Config (deserialized from config.json)
@@ -167,7 +164,7 @@ fn apply_rotary_full(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
-// NomicBert Embeddings (word + token_type, NO norm — emb_ln is separate)
+// NomicBert Embeddings (word + token_type, NO norm, emb_ln is separate)
 // ---------------------------------------------------------------------------
 
 struct NomicEmbeddings {
@@ -456,7 +453,7 @@ impl NomicMoELayer {
                     .to_dtype(xs.dtype())?;
             let weighted = down.broadcast_mul(&weights_t)?;
 
-            let weighted_vec = weighted.to_vec2::<f32>()?;
+            let weighted_vec = weighted.to_dtype(DType::F32)?.to_vec2::<f32>()?;
             for (local_idx, &global_idx) in assigned_tokens.iter().enumerate() {
                 for (j, val) in weighted_vec[local_idx].iter().enumerate() {
                     output_vec[global_idx * hidden + j] += val;
@@ -496,7 +493,7 @@ impl NomicMLP {
 }
 
 // ---------------------------------------------------------------------------
-// Transformer Block — POST-NORM (prenorm=false in config)
+// Transformer Block, POST-NORM (prenorm=false in config)
 //
 // Flow: attn(x) + x → norm1 → mlp + prev → norm2
 // Dropout (resid_pdrop=0.0) is a no-op at inference and omitted.
@@ -547,7 +544,7 @@ impl NomicBertBlock {
 }
 
 // ---------------------------------------------------------------------------
-// NomicBert Encoder — no final norm, blocks handle normalization internally
+// NomicBert Encoder, no final norm, blocks handle normalization internally
 // ---------------------------------------------------------------------------
 
 struct NomicBertEncoder {
@@ -591,7 +588,7 @@ pub struct NomicBertModel {
 }
 
 impl NomicBertModel {
-    fn new(cfg: NomicConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: NomicConfig, vb: VarBuilder) -> Result<Self> {
         let device = vb.device().clone();
         let embeddings = NomicEmbeddings::new(&cfg, vb.pp("embeddings"))?;
         let emb_ln = layer_norm(cfg.hidden_size, cfg.layer_norm_epsilon, vb.pp("emb_ln"))?;
@@ -687,11 +684,9 @@ impl NomicV2MoeTextEmbedding {
     ) -> Result<Self> {
         use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
 
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        let repo = api.model(repo_id.to_string());
+        let repo =
+            crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let cfg_path: PathBuf = repo
             .get("config.json")
@@ -701,29 +696,8 @@ impl NomicV2MoeTextEmbedding {
         )
         .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
-        let weight_files: Vec<PathBuf> = if let Ok(p) = repo.get("model.safetensors") {
-            vec![p]
-        } else {
-            let mut files = Vec::new();
-            for i in 1.. {
-                let candidates: Vec<_> = (1..=20)
-                    .filter_map(|total| {
-                        let fname = format!("model-{:05}-of-{:05}.safetensors", i, total);
-                        repo.get(&fname).ok()
-                    })
-                    .collect();
-                if candidates.is_empty() {
-                    break;
-                }
-                files.extend(candidates.into_iter().take(1));
-            }
-            if files.is_empty() {
-                return Err(candle_core::Error::Msg(
-                    "Could not locate model.safetensors or sharded weight files".into(),
-                ));
-            }
-            files
-        };
+        let weight_files: Vec<PathBuf> = crate::common::safetensors_weight_files(&repo)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
         let model = NomicBertModel::new(cfg.clone(), vb)?;

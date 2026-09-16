@@ -66,13 +66,6 @@ pub fn models_list() -> Vec<ModelInfo<ImageEmbeddingModel>> {
         },
     ];
 
-    // TODO: Use when out in stable
-    // assert_eq!(
-    //     std::mem::variant_count::<ImageEmbeddingModel>(),
-    //     models_list.len(),
-    //     "models::models() is not exhaustive"
-    // );
-
     models_list
 }
 

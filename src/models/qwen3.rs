@@ -12,7 +12,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::api::sync::ApiRepo;
 
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
@@ -113,6 +113,12 @@ fn scalar_f32(device: &Device, v: f32) -> Result<Tensor> {
 
 fn scalar_f64_as_f32(device: &Device, v: f64) -> Result<Tensor> {
     scalar_f32(device, v as f32)
+}
+
+#[cfg(feature = "hf-hub")]
+fn hf_repo(repo_id: &str) -> Result<ApiRepo> {
+    crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
+        .map_err(map_err)
 }
 
 fn map_err<E: std::fmt::Display>(err: E) -> candle_core::Error {
@@ -625,8 +631,9 @@ impl Qwen3RotaryEmbedding {
             let pos = position_ids.to_device(dev)?.to_vec3::<u32>()?;
             let mut freqs = vec![0f32; b * t * d2];
 
-            for (batch_idx, _) in pos.iter().enumerate().take(b) {
-                for (tok_idx, _) in pos.iter().enumerate().take(t) {
+            #[allow(clippy::needless_range_loop)]
+            for batch_idx in 0..b {
+                for tok_idx in 0..t {
                     let base = (batch_idx * t + tok_idx) * d2;
                     let temporal = pos[0][batch_idx][tok_idx] as f32;
                     for i in 0..d2 {
@@ -1015,11 +1022,7 @@ impl Qwen3TextEmbedding {
     ) -> Result<Self> {
         use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
 
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        let repo = api.model(repo_id.to_string());
+        let repo = hf_repo(repo_id)?;
 
         // Load config
         let cfg_path: PathBuf = repo
@@ -1030,29 +1033,8 @@ impl Qwen3TextEmbedding {
         let (cfg, weight_prefix) = parse_config_and_weight_prefix(&cfg_bytes)?;
 
         // Load weights (single or sharded)
-        let weight_files: Vec<PathBuf> = if let Ok(p) = repo.get("model.safetensors") {
-            vec![p]
-        } else {
-            let mut files = Vec::new();
-            for i in 1.. {
-                let candidates: Vec<_> = (1..=20)
-                    .filter_map(|total| {
-                        let fname = format!("model-{:05}-of-{:05}.safetensors", i, total);
-                        repo.get(&fname).ok()
-                    })
-                    .collect();
-                if candidates.is_empty() {
-                    break;
-                }
-                files.extend(candidates.into_iter().take(1));
-            }
-            if files.is_empty() {
-                return Err(candle_core::Error::Msg(
-                    "Could not locate model.safetensors or sharded weight files".into(),
-                ));
-            }
-            files
-        };
+        let weight_files: Vec<PathBuf> = crate::common::safetensors_weight_files(&repo)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
         let vb = match weight_prefix {
@@ -1164,11 +1146,7 @@ impl Qwen3VLEmbedding {
     ) -> Result<Self> {
         use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, TruncationParams};
 
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()
-            .map_err(map_err)?;
-        let repo = api.model(repo_id.to_string());
+        let repo = hf_repo(repo_id)?;
 
         let cfg_path: PathBuf = repo.get("config.json").map_err(map_err)?;
         let cfg_bytes = std::fs::read(&cfg_path).map_err(map_err)?;
@@ -1179,29 +1157,8 @@ impl Qwen3VLEmbedding {
         let preprocessor: Qwen3VLPreprocessorConfig =
             serde_json::from_slice(&preprocessor_bytes).map_err(map_err)?;
 
-        let weight_files: Vec<PathBuf> = if let Ok(p) = repo.get("model.safetensors") {
-            vec![p]
-        } else {
-            let mut files = Vec::new();
-            for i in 1.. {
-                let candidates: Vec<_> = (1..=20)
-                    .filter_map(|total| {
-                        let fname = format!("model-{:05}-of-{:05}.safetensors", i, total);
-                        repo.get(&fname).ok()
-                    })
-                    .collect();
-                if candidates.is_empty() {
-                    break;
-                }
-                files.extend(candidates.into_iter().take(1));
-            }
-            if files.is_empty() {
-                return Err(candle_core::Error::Msg(
-                    "Could not locate model.safetensors or sharded weight files".into(),
-                ));
-            }
-            files
-        };
+        let weight_files: Vec<PathBuf> = crate::common::safetensors_weight_files(&repo)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
         let model = Qwen3Model::new(cfg.text_config, vb.pp("model").pp("language_model"))?;
@@ -1470,6 +1427,72 @@ mod tests {
         expand_image_token_placeholders, find_token_spans, parse_config_and_weight_prefix,
         round_ties_to_even,
     };
+
+    #[test]
+    fn mrope_matches_plain_rope_for_identical_positions() {
+        use super::Qwen3RotaryEmbedding;
+        use candle_core::{DType, Device, Tensor};
+
+        let config = r#"{
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "head_dim": 16,
+            "hidden_act": "silu",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "max_position_embeddings": 4096,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 1,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "rope_scaling": {"rope_type": "default", "mrope_section": [4, 2, 2], "mrope_interleaved": false},
+            "rope_theta": 10000,
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "vocab_size": 1000
+        }"#;
+        let (cfg, _) = parse_config_and_weight_prefix(config.as_bytes()).unwrap();
+        let device = Device::Cpu;
+        let rotary = Qwen3RotaryEmbedding::new(&cfg, &device).unwrap();
+
+        let (batch, tokens) = (2usize, 9usize);
+        let xs = Tensor::zeros((batch, tokens, cfg.head_dim()), DType::F32, &device).unwrap();
+        let positions: Vec<u32> = (0..batch).flat_map(|_| 0..tokens as u32).collect();
+        let plain = Tensor::from_vec(positions.clone(), (batch, tokens), &device).unwrap();
+        let mrope = Tensor::from_vec(
+            [positions.clone(), positions.clone(), positions].concat(),
+            (3, batch, tokens),
+            &device,
+        )
+        .unwrap();
+
+        let (cos_plain, sin_plain) = rotary.forward(&xs, &plain).unwrap();
+        let (cos_mrope, sin_mrope) = rotary.forward(&xs, &mrope).unwrap();
+
+        let max_abs_diff = |a: &Tensor, b: &Tensor| -> f32 {
+            (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        assert!(max_abs_diff(&cos_plain, &cos_mrope) < 1e-5, "cos differs");
+        assert!(max_abs_diff(&sin_plain, &sin_mrope) < 1e-5, "sin differs");
+
+        let late_cos = cos_mrope
+            .get(0)
+            .unwrap()
+            .get(tokens - 1)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(late_cos.iter().any(|&c| (c - 1.0).abs() > 1e-3));
+    }
 
     #[test]
     fn parses_qwen3_config_without_prefix() {

@@ -17,7 +17,7 @@ impl HasMaxLength for SparseModel {
 /// Options for initializing the SparseTextEmbedding model
 pub type SparseInitOptions = InitOptionsWithLength<SparseModel>;
 
-/// Struct for "bring your own" embedding models
+/// Struct for "bring your own" sparse embedding models
 ///
 /// The onnx_file and tokenizer_files are expecting the files' bytes
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,14 +25,25 @@ pub type SparseInitOptions = InitOptionsWithLength<SparseModel>;
 pub struct UserDefinedSparseModel {
     pub onnx_file: Vec<u8>,
     pub tokenizer_files: TokenizerFiles,
+    /// Model family of the checkpoint, selects the post-processing of the ONNX outputs.
+    pub model: SparseModel,
+    /// `idf.json` bytes for inference-free models, enables [`SparseTextEmbedding::query_embed`].
+    pub idf_file: Option<Vec<u8>>,
 }
 
 impl UserDefinedSparseModel {
-    pub fn new(onnx_file: Vec<u8>, tokenizer_files: TokenizerFiles) -> Self {
+    pub fn new(onnx_file: Vec<u8>, tokenizer_files: TokenizerFiles, model: SparseModel) -> Self {
         Self {
             onnx_file,
             tokenizer_files,
+            model,
+            idf_file: None,
         }
+    }
+
+    pub fn with_idf_file(mut self, idf_file: Vec<u8>) -> Self {
+        self.idf_file = Some(idf_file);
+        self
     }
 }
 

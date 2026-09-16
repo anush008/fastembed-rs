@@ -3,23 +3,23 @@ use crate::common::{init_session_builder, load_tokenizer_hf_hub};
 #[cfg(feature = "hf-hub")]
 use crate::models::sparse::IDF_FILE;
 use crate::{
-    common::{Error, Result},
+    common::{encode_batch, load_tokenizer, Error, Result},
     models::sparse::{models_list, SparseModel},
+    text_embedding::InitOptionsUserDefined,
     ModelInfo, SparseEmbedding,
 };
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
-use ndarray::{Array, ArrayViewD, Axis, CowArray, Dim};
-use ort::{session::Session, value::Value};
+use ndarray::{Array2, ArrayViewD};
+use ort::session::{Session, SessionOutputs};
 use std::collections::{HashMap, HashSet};
-#[cfg_attr(not(feature = "hf-hub"), allow(unused_imports))]
 #[cfg(feature = "hf-hub")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "hf-hub")]
 use super::SparseInitOptions;
-use super::{SparseTextEmbedding, DEFAULT_BATCH_SIZE};
+use super::{SparseTextEmbedding, UserDefinedSparseModel, DEFAULT_BATCH_SIZE};
 
 impl SparseTextEmbedding {
     /// Try to generate a new SparseTextEmbedding Instance
@@ -29,8 +29,6 @@ impl SparseTextEmbedding {
     /// Uses the total number of CPUs available as the number of intra-threads
     #[cfg(feature = "hf-hub")]
     pub fn try_new(options: SparseInitOptions) -> Result<Self> {
-        use super::SparseInitOptions;
-
         let SparseInitOptions {
             max_length,
             model_name,
@@ -59,15 +57,13 @@ impl SparseTextEmbedding {
 
         // Download additional files if needed (e.g., model.onnx.data for large models)
         let mut idf_file_reference: Option<PathBuf> = None;
-        if !model_info.additional_files.is_empty() {
-            for file in &model_info.additional_files {
-                let reference = model_repo.get(file).map_err(|e| Error::ModelRetrieval {
-                    file: file.clone(),
-                    source: Box::new(e),
-                })?;
-                if file == IDF_FILE {
-                    idf_file_reference = Some(reference);
-                }
+        for file in &model_info.additional_files {
+            let reference = model_repo.get(file).map_err(|e| Error::ModelRetrieval {
+                file: file.clone(),
+                source: Box::new(e),
+            })?;
+            if file == IDF_FILE {
+                idf_file_reference = Some(reference);
             }
         }
 
@@ -78,14 +74,32 @@ impl SparseTextEmbedding {
         // Models declaring an `idf.json` embed queries from a lookup table instead of
         // running inference, so the table is loaded up front alongside the tokenizer.
         let token_id_to_idf = idf_file_reference
-            .map(|reference| Self::load_idf(&reference, &tokenizer))
+            .map(|reference| Self::load_idf(&std::fs::read(reference)?, &tokenizer))
             .transpose()?;
 
         Ok(Self::new(tokenizer, session, model_name, token_id_to_idf))
     }
 
+    /// Create a SparseTextEmbedding instance from model files provided by the user.
+    ///
+    /// This can be used for 'bring your own' sparse embedding models
+    pub fn try_new_from_user_defined(
+        model: UserDefinedSparseModel,
+        options: InitOptionsUserDefined,
+    ) -> Result<Self> {
+        let (mut session_builder, max_length) = options.into_session_builder()?;
+        let session = session_builder.commit_from_memory(&model.onnx_file)?;
+
+        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
+        let token_id_to_idf = model
+            .idf_file
+            .map(|bytes| Self::load_idf(&bytes, &tokenizer))
+            .transpose()?;
+
+        Ok(Self::new(tokenizer, session, model.model, token_id_to_idf))
+    }
+
     /// Private method to return an instance
-    #[cfg_attr(not(feature = "hf-hub"), allow(dead_code))]
     fn new(
         tokenizer: Tokenizer,
         session: Session,
@@ -112,14 +126,10 @@ impl SparseTextEmbedding {
         }
     }
 
-    /// Read the `idf.json` sidecar, resolving its token strings to token ids via the
-    /// tokenizer's vocabulary. Tokens the tokenizer does not know about are dropped.
-    #[cfg(feature = "hf-hub")]
-    fn load_idf(idf_file: &Path, tokenizer: &Tokenizer) -> Result<HashMap<usize, f32>> {
-        let token_to_idf: HashMap<String, f32> = serde_json::from_slice(&std::fs::read(idf_file)?)
-            .map_err(|e| {
-                Error::Other(format!("Failed to parse the {IDF_FILE} of the model: {e}"))
-            })?;
+    /// Parse `idf.json`, resolving token strings to ids. Unknown tokens are dropped.
+    fn load_idf(idf_json: &[u8], tokenizer: &Tokenizer) -> Result<HashMap<usize, f32>> {
+        let token_to_idf: HashMap<String, f32> = serde_json::from_slice(idf_json)
+            .map_err(|e| Error::Other(format!("Failed to parse the idf.json of the model: {e}")))?;
 
         let vocab = tokenizer.get_vocab(true);
         Ok(token_to_idf
@@ -171,145 +181,48 @@ impl SparseTextEmbedding {
             ));
         }
 
-        let output = texts
-            .chunks(batch_size)
-            .map(|batch| {
-                // Encode the texts in the batch
-                let inputs = batch.iter().map(|text| text.as_ref()).collect();
-                let encodings = self
-                    .tokenizer
-                    .encode_batch(inputs, true)
-                    .map_err(|e| Error::Tokenization(format!("Failed to encode the batch: {e}")))?;
+        let mut output = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(batch_size) {
+            let inputs = batch.iter().map(|text| text.as_ref()).collect();
+            let mut encoded = encode_batch(&self.tokenizer, inputs)?;
+            let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
 
-                // Extract the encoding length and batch size
-                let encoding_length = encodings.first().ok_or(Error::EmptyTokenizations)?.len();
-                let batch_size = batch.len();
+            let outputs = self
+                .session
+                .run(session_inputs)
+                .map_err(|e| Error::OrtSession(e.to_string()))?;
 
-                let max_size = encoding_length * batch_size;
-
-                // Preallocate arrays with the maximum size
-                let mut ids_array = Vec::with_capacity(max_size);
-                let mut mask_array = Vec::with_capacity(max_size);
-                let mut type_ids_array = Vec::with_capacity(max_size);
-
-                encodings.iter().for_each(|encoding| {
-                    let ids = encoding.get_ids();
-                    let mask = encoding.get_attention_mask();
-                    let type_ids = encoding.get_type_ids();
-
-                    ids_array.extend(ids.iter().map(|x| *x as i64));
-                    mask_array.extend(mask.iter().map(|x| *x as i64));
-                    type_ids_array.extend(type_ids.iter().map(|x| *x as i64));
-                });
-
-                let inputs_ids_array =
-                    Array::from_shape_vec((batch_size, encoding_length), ids_array)
-                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
-                let attention_mask_array =
-                    Array::from_shape_vec((batch_size, encoding_length), mask_array)
-                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-                let token_type_ids_array =
-                    Array::from_shape_vec((batch_size, encoding_length), type_ids_array)
-                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-                let mut session_inputs = ort::inputs![
-                    "input_ids" => Value::from_array(inputs_ids_array.clone())
-                        .map_err(|e| Error::OrtSession(e.to_string()))?,
-                    "attention_mask" => Value::from_array(attention_mask_array.clone())
-                        .map_err(|e| Error::OrtSession(e.to_string()))?,
-                ];
-
-                if self.need_token_type_ids {
-                    session_inputs.push((
-                        "token_type_ids".into(),
-                        Value::from_array(token_type_ids_array)
-                            .map_err(|e| Error::OrtSession(e.to_string()))?
-                            .into(),
-                    ));
+            let embeddings = match self.model {
+                SparseModel::SPLADEPPV1 => {
+                    let logits = extract_output(&outputs, "last_hidden_state")?;
+                    Self::post_process_splade(&logits, &encoded.attention_mask)
                 }
-
-                let outputs = self
-                    .session
-                    .run(session_inputs)
-                    .map_err(|e| Error::OrtSession(e.to_string()))?;
-
-                let embeddings = match self.model {
-                    SparseModel::SPLADEPPV1 => {
-                        let last_hidden_state_key = match outputs.len() {
-                            1 => outputs
-                                .keys()
-                                .next()
-                                .ok_or_else(|| Error::OutputKeyMissing {
-                                    key: "<only output>".into(),
-                                })?,
-                            _ => "last_hidden_state",
-                        };
-
-                        let (shape, data) = outputs[last_hidden_state_key]
-                            .try_extract_tensor::<f32>()
-                            .map_err(|e| Error::TensorExtraction(e.to_string()))?;
-                        let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-                        let output_array = ndarray::ArrayViewD::from_shape(shape.as_slice(), data)
-                            .map_err(|e| Error::InvalidShape(e.to_string()))?;
-                        let attention_mask_cow = ndarray::CowArray::from(&attention_mask_array);
-
-                        Self::post_process_splade(&output_array, &attention_mask_cow)
-                    }
-                    SparseModel::BGEM3 => {
-                        let output_key =
-                            outputs
-                                .keys()
-                                .next()
-                                .ok_or_else(|| Error::OutputKeyMissing {
-                                    key: "<first output>".into(),
-                                })?;
-
-                        let (shape, data) = outputs[output_key]
-                            .try_extract_tensor::<f32>()
-                            .map_err(|e| Error::TensorExtraction(e.to_string()))?;
-                        let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-                        let hidden_states = ndarray::ArrayViewD::from_shape(shape.as_slice(), data)
-                            .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-                        Self::post_process_bgem3(
-                            &hidden_states,
-                            &inputs_ids_array,
-                            &attention_mask_array,
-                        )
-                    }
-                    SparseModel::OpenSearchNeuralSparseDocV3Gte => {
-                        let logits_key = match outputs.len() {
-                            1 => outputs
-                                .keys()
-                                .next()
-                                .ok_or_else(|| Error::OutputKeyMissing {
-                                    key: "<only output>".into(),
-                                })?,
-                            _ => "logits",
-                        };
-
-                        let (shape, data) = outputs[logits_key]
-                            .try_extract_tensor::<f32>()
-                            .map_err(|e| Error::TensorExtraction(e.to_string()))?;
-                        let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-                        let logits = ndarray::ArrayViewD::from_shape(shape.as_slice(), data)
-                            .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-                        Self::post_process_if_splade(
-                            &logits,
-                            &attention_mask_array,
-                            &self.special_token_ids,
-                        )
-                    }
-                };
-
-                Ok(embeddings)
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+                SparseModel::BGEM3 => {
+                    let output_key =
+                        outputs
+                            .keys()
+                            .next()
+                            .ok_or_else(|| Error::OutputKeyMissing {
+                                key: "<first output>".into(),
+                            })?;
+                    let hidden_states = extract_output(&outputs, output_key)?;
+                    Self::post_process_bgem3(
+                        &hidden_states,
+                        &encoded.input_ids,
+                        &encoded.attention_mask,
+                    )
+                }
+                SparseModel::OpenSearchNeuralSparseDocV3Gte => {
+                    let logits = extract_output(&outputs, "logits")?;
+                    Self::post_process_if_splade(
+                        &logits,
+                        &encoded.attention_mask,
+                        &self.special_token_ids,
+                    )
+                }
+            };
+            output.extend(embeddings);
+        }
 
         Ok(output)
     }
@@ -365,32 +278,36 @@ impl SparseTextEmbedding {
             .collect()
     }
 
+    /// SPLADE++: `log(1 + relu(logits))` max-pooled over the unmasked positions.
     fn post_process_splade(
         model_output: &ArrayViewD<f32>,
-        attention_mask: &CowArray<i64, Dim<[usize; 2]>>,
+        attention_mask: &Array2<i64>,
     ) -> Vec<SparseEmbedding> {
-        let relu_log = model_output.mapv(|x| (1.0 + x.max(0.0)).ln());
+        let batch_size = attention_mask.shape()[0];
+        let seq_len = attention_mask.shape()[1];
+        let vocab_size = model_output.shape()[2];
 
-        let attention_mask = attention_mask.mapv(|x| x as f32).insert_axis(Axis(2));
+        (0..batch_size)
+            .map(|batch_idx| {
+                let mut pooled = vec![0.0f32; vocab_size];
+                for seq_idx in 0..seq_len {
+                    if attention_mask[[batch_idx, seq_idx]] == 0 {
+                        continue;
+                    }
+                    let token_logits = model_output.slice(ndarray::s![batch_idx, seq_idx, ..]);
+                    for (score, &logit) in pooled.iter_mut().zip(token_logits.iter()) {
+                        *score = score.max(logit);
+                    }
+                }
 
-        let weighted_log = relu_log * attention_mask;
-
-        let scores = weighted_log.fold_axis(Axis(1), f32::NEG_INFINITY, |r, &v| r.max(v));
-
-        scores
-            .rows()
-            .into_iter()
-            .map(|row_scores| {
-                let mut values: Vec<f32> = Vec::with_capacity(row_scores.len());
-                let mut indices: Vec<usize> = Vec::with_capacity(row_scores.len());
-
-                row_scores.into_iter().enumerate().for_each(|(idx, f)| {
-                    if *f > 0.0 {
-                        values.push(*f);
+                let mut values = Vec::new();
+                let mut indices = Vec::new();
+                for (idx, &score) in pooled.iter().enumerate() {
+                    if score > 0.0 {
+                        values.push((1.0 + score).ln());
                         indices.push(idx);
                     }
-                });
-
+                }
                 SparseEmbedding { values, indices }
             })
             .collect()
@@ -398,8 +315,8 @@ impl SparseTextEmbedding {
 
     fn post_process_bgem3(
         hidden_states: &ArrayViewD<f32>,
-        input_ids: &Array<i64, Dim<[usize; 2]>>,
-        attention_mask: &Array<i64, Dim<[usize; 2]>>,
+        input_ids: &Array2<i64>,
+        attention_mask: &Array2<i64>,
     ) -> Vec<SparseEmbedding> {
         use ndarray::ArrayView1;
 
@@ -454,7 +371,7 @@ impl SparseTextEmbedding {
     /// `log(1 + relu(x))` of SPLADE++.
     fn post_process_if_splade(
         logits: &ArrayViewD<f32>,
-        attention_mask: &Array<i64, Dim<[usize; 2]>>,
+        attention_mask: &Array2<i64>,
         special_token_ids: &HashSet<usize>,
     ) -> Vec<SparseEmbedding> {
         let batch_size = attention_mask.shape()[0];
@@ -494,5 +411,66 @@ impl SparseTextEmbedding {
                 SparseEmbedding { values, indices }
             })
             .collect()
+    }
+}
+
+/// The sole output, or the one named `preferred_key`, as a rank-3 `[batch, sequence, vocab]` view.
+fn extract_output<'a>(
+    outputs: &'a SessionOutputs<'_>,
+    preferred_key: &str,
+) -> Result<ArrayViewD<'a, f32>> {
+    let key = if outputs.len() == 1 {
+        outputs
+            .keys()
+            .next()
+            .ok_or_else(|| Error::OutputKeyMissing {
+                key: "<only output>".into(),
+            })?
+    } else {
+        preferred_key
+    };
+    let value = outputs.get(key).ok_or_else(|| Error::OutputKeyMissing {
+        key: key.to_string(),
+    })?;
+    let (shape, data) = value
+        .try_extract_tensor::<f32>()
+        .map_err(|e| Error::TensorExtraction(e.to_string()))?;
+    let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    if shape.len() != 3 {
+        return Err(Error::InvalidShape(format!(
+            "Output '{key}' must be rank-3 [batch, sequence, vocab], got shape {shape:?}"
+        )));
+    }
+    let view = ArrayViewD::from_shape(shape.as_slice(), data)
+        .map_err(|e| Error::InvalidShape(e.to_string()))?;
+    Ok(view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{arr2, Array3};
+
+    #[test]
+    fn splade_post_processing_max_pools_over_unmasked_tokens_only() {
+        // batch=1, seq=3, vocab=4. The last position is padding and carries the largest logits
+        let logits = Array3::from_shape_vec(
+            (1, 3, 4),
+            vec![
+                1.0, -1.0, 0.0, 0.5, //
+                0.5, 2.0, -3.0, 0.0, //
+                9.0, 9.0, 9.0, 9.0,
+            ],
+        )
+        .unwrap();
+        let mask = arr2(&[[1i64, 1, 0]]);
+
+        let out = SparseTextEmbedding::post_process_splade(&logits.view().into_dyn(), &mask);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].indices, vec![0, 1, 3]);
+        let expected = [2.0f32.ln(), 3.0f32.ln(), 1.5f32.ln()];
+        for (value, expected) in out[0].values.iter().zip(expected) {
+            assert!((value - expected).abs() < 1e-6, "{value} != {expected}");
+        }
     }
 }

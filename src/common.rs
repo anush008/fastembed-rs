@@ -1,12 +1,20 @@
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
+use ndarray::Array2;
 use ort::{
     execution_providers::ExecutionProviderDispatch,
-    session::builder::{GraphOptimizationLevel, SessionBuilder},
+    session::{
+        builder::{GraphOptimizationLevel, SessionBuilder},
+        SessionInputValue,
+    },
+    value::Value,
 };
+use std::borrow::Cow;
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
-use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{
+    AddedToken, EncodeInput, Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
+};
 
 const DEFAULT_CACHE_DIR: &str = ".fastembed_cache";
 
@@ -160,15 +168,21 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
             )
         })? as f32;
     let max_length = max_length.min(model_max_length as usize);
-    let pad_id = config["pad_token_id"].as_u64().unwrap_or(0) as u32;
-    let pad_token: String = tokenizer_config["pad_token"]
+    let pad_token_value = &tokenizer_config["pad_token"];
+    let pad_token: String = pad_token_value
         .as_str()
+        .or_else(|| pad_token_value["content"].as_str())
         .ok_or_else(|| {
             Error::TokenizerConfig(
                 "tokenizer_config.json is missing a string `pad_token` field".into(),
             )
         })?
         .into();
+    let pad_id = config["pad_token_id"]
+        .as_u64()
+        .map(|id| id as u32)
+        .or_else(|| tokenizer.token_to_id(&pad_token))
+        .unwrap_or(0);
 
     let mut tokenizer = tokenizer
         .with_padding(Some(PaddingParams {
@@ -238,6 +252,8 @@ pub fn normalize(v: &[f32]) -> Vec<f32> {
 /// Pulls a model repo from HuggingFace.
 /// HF_HOME decides the location of the cache folder
 /// HF_ENDPOINT modifies the URL for the HuggingFace location.
+/// HF_TOKEN authenticates the requests. Without it the token written by
+/// `huggingface-cli login` is used when present.
 #[cfg(feature = "hf-hub")]
 pub fn pull_from_hf(
     model_name: String,
@@ -252,15 +268,131 @@ pub fn pull_from_hf(
 
     let endpoint = env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
 
+    let token = env::var("HF_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .or_else(default_hf_token);
+
     let api = ApiBuilder::new()
         .with_cache_dir(cache_dir)
         .with_endpoint(endpoint)
+        .with_token(token)
         .with_progress(show_download_progress)
         .build()
         .map_err(|e| Error::Other(format!("Failed to initialize HuggingFace API: {e}")))?;
 
     let repo = api.model(model_name);
     Ok(repo)
+}
+
+/// Token written by `huggingface-cli login`. `Cache::default` panics without a home dir.
+#[cfg(feature = "hf-hub")]
+fn default_hf_token() -> Option<String> {
+    let has_home = std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some();
+    has_home.then(|| hf_hub::Cache::default().token()).flatten()
+}
+
+/// Safetensors files of a repo, resolving `model.safetensors.index.json` for sharded checkpoints.
+#[cfg(any(feature = "qwen3", feature = "nomic-v2-moe"))]
+pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
+    const SINGLE_FILE: &str = "model.safetensors";
+    const INDEX_FILE: &str = "model.safetensors.index.json";
+
+    if let Ok(path) = repo.get(SINGLE_FILE) {
+        return Ok(vec![path]);
+    }
+
+    let index_path = repo.get(INDEX_FILE).map_err(|e| Error::ModelRetrieval {
+        file: format!("{SINGLE_FILE} or {INDEX_FILE}"),
+        source: Box::new(e),
+    })?;
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(index_path)?)
+        .map_err(|e| Error::Other(format!("Failed to parse {INDEX_FILE}: {e}")))?;
+
+    let mut shards: Vec<String> = index["weight_map"]
+        .as_object()
+        .ok_or_else(|| Error::Other(format!("{INDEX_FILE} has no `weight_map` object")))?
+        .values()
+        .filter_map(|file| file.as_str().map(str::to_string))
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+
+    shards
+        .iter()
+        .map(|file| {
+            repo.get(file).map_err(|e| Error::ModelRetrieval {
+                file: file.clone(),
+                source: Box::new(e),
+            })
+        })
+        .collect()
+}
+
+/// One tokenized batch as `[batch, sequence]` tensors.
+pub(crate) struct EncodedBatch {
+    pub input_ids: Array2<i64>,
+    pub attention_mask: Array2<i64>,
+    pub token_type_ids: Array2<i64>,
+}
+
+impl EncodedBatch {
+    /// ONNX session inputs. `token_type_ids` is moved out and attached only when the graph
+    /// declares it, while `input_ids` and `attention_mask` stay available for post-processing.
+    pub fn session_inputs(
+        &mut self,
+        need_token_type_ids: bool,
+    ) -> Result<Vec<(Cow<'static, str>, SessionInputValue<'static>)>> {
+        let mut inputs = ort::inputs![
+            "input_ids" => Value::from_array(self.input_ids.clone())?,
+            "attention_mask" => Value::from_array(self.attention_mask.clone())?,
+        ];
+        if need_token_type_ids {
+            let token_type_ids = std::mem::take(&mut self.token_type_ids);
+            inputs.push((
+                "token_type_ids".into(),
+                Value::from_array(token_type_ids)?.into(),
+            ));
+        }
+        Ok(inputs)
+    }
+}
+
+/// Tokenize a batch into padded `[batch, sequence]` tensors.
+pub(crate) fn encode_batch<'s, E>(tokenizer: &Tokenizer, inputs: Vec<E>) -> Result<EncodedBatch>
+where
+    E: Into<EncodeInput<'s>> + Send,
+{
+    let encodings = tokenizer
+        .encode_batch(inputs, true)
+        .map_err(|e| Error::Tokenization(format!("Failed to encode the batch: {e}")))?;
+    encodings_to_batch(&encodings)
+}
+
+fn encodings_to_batch(encodings: &[Encoding]) -> Result<EncodedBatch> {
+    let encoding_length = encodings.first().ok_or(Error::EmptyTokenizations)?.len();
+    let batch_size = encodings.len();
+    let max_size = encoding_length * batch_size;
+
+    let mut ids = Vec::with_capacity(max_size);
+    let mut mask = Vec::with_capacity(max_size);
+    let mut type_ids = Vec::with_capacity(max_size);
+    for encoding in encodings {
+        ids.extend(encoding.get_ids().iter().map(|&x| x as i64));
+        mask.extend(encoding.get_attention_mask().iter().map(|&x| x as i64));
+        type_ids.extend(encoding.get_type_ids().iter().map(|&x| x as i64));
+    }
+
+    let shape = (batch_size, encoding_length);
+    let to_array = |data: Vec<i64>| {
+        Array2::from_shape_vec(shape, data).map_err(|e| Error::InvalidShape(e.to_string()))
+    };
+    Ok(EncodedBatch {
+        input_ids: to_array(ids)?,
+        attention_mask: to_array(mask)?,
+        token_type_ids: to_array(type_ids)?,
+    })
 }
 
 pub(crate) fn init_session_builder(
@@ -312,24 +444,20 @@ mod tests {
     use super::*;
 
     fn minimal_tokenizer_bytes() -> Vec<u8> {
-        // Minimal valid tokenizer.json (BPE with a tiny vocab; no ## prefix needed).
+        // Minimal valid tokenizer.json (word-level model with a tiny vocab).
         br#"{
             "version": "1.0",
             "truncation": null,
             "padding": null,
             "added_tokens": [],
             "normalizer": null,
-            "pre_tokenizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
             "post_processor": null,
             "decoder": null,
             "model": {
-                "type": "BPE",
-                "dropout": null,
+                "type": "WordLevel",
                 "unk_token": "[UNK]",
-                "fuse_unk": false,
-                "byte_fallback": false,
-                "vocab": {"[UNK]": 0, "[PAD]": 1, "hello": 2},
-                "merges": []
+                "vocab": {"[UNK]": 0, "[PAD]": 1, "hello": 2}
             }
         }"#
         .to_vec()
@@ -369,6 +497,36 @@ mod tests {
             "error message was: {err}"
         );
     }
+    #[test]
+    fn load_tokenizer_accepts_added_token_object_as_pad_token() {
+        let files = tokenizer_files(
+            r#"{"model_max_length": 512, "pad_token": {"__type": "AddedToken", "content": "[PAD]", "lstrip": false}}"#,
+        );
+        let tokenizer = load_tokenizer(files, 512).unwrap();
+        assert_eq!(tokenizer.get_padding().unwrap().pad_token, "[PAD]");
+    }
+
+    #[test]
+    fn load_tokenizer_resolves_pad_id_from_vocab_when_config_lacks_it() {
+        let mut files = tokenizer_files(r#"{"model_max_length": 512, "pad_token": "[PAD]"}"#);
+        files.config_file = b"{}".to_vec();
+        let tokenizer = load_tokenizer(files, 512).unwrap();
+        assert_eq!(tokenizer.get_padding().unwrap().pad_id, 1);
+    }
+
+    #[test]
+    fn encode_batch_pads_to_longest_and_masks_padding() {
+        let files = tokenizer_files(r#"{"model_max_length": 512, "pad_token": "[PAD]"}"#);
+        let tokenizer = load_tokenizer(files, 512).unwrap();
+        let batch = encode_batch(&tokenizer, vec!["hello", "hello hello"]).unwrap();
+        assert_eq!(batch.input_ids.dim(), (2, 2));
+        assert_eq!(batch.attention_mask.row(0).to_vec(), vec![1, 0]);
+        assert_eq!(batch.attention_mask.row(1).to_vec(), vec![1, 1]);
+        assert_eq!(batch.input_ids[[0, 1]], 0);
+        assert_eq!(batch.input_ids.row(1).to_vec(), vec![2, 2]);
+        assert!(encode_batch::<&str>(&tokenizer, vec![]).is_err());
+    }
+
     #[test]
     fn init_session_builder_applies_config_entry() {
         let builder = init_session_builder(

@@ -1,9 +1,9 @@
 //! The definition of the main struct for text embeddings - [`TextEmbedding`].
 
 #[cfg(feature = "hf-hub")]
-use crate::common::load_tokenizer_hf_hub;
+use crate::common::{init_session_builder, load_tokenizer_hf_hub};
 use crate::{
-    common::{init_session_builder, load_tokenizer, Error, Result},
+    common::{encode_batch, load_tokenizer, Error, Result},
     models::{text_embedding::models_list, ModelTrait},
     pooling::Pooling,
     Embedding, EmbeddingModel, EmbeddingOutput, ModelInfo, OutputKey, QuantizationMode,
@@ -11,8 +11,7 @@ use crate::{
 };
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
-use ndarray::Array;
-use ort::{session::Session, value::Value};
+use ort::session::Session;
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -57,13 +56,11 @@ impl TextEmbedding {
                     source: Box::new(e),
                 })?;
 
-        if !model_info.additional_files.is_empty() {
-            for file in &model_info.additional_files {
-                model_repo.get(file).map_err(|e| Error::ModelRetrieval {
-                    file: file.clone(),
-                    source: Box::new(e),
-                })?;
-            }
+        for file in &model_info.additional_files {
+            model_repo.get(file).map_err(|e| Error::ModelRetrieval {
+                file: file.clone(),
+                source: Box::new(e),
+            })?;
         }
 
         // prioritise loading pooling config if available, if not (thanks qdrant!), look for it in hardcoded
@@ -89,44 +86,16 @@ impl TextEmbedding {
         model: UserDefinedEmbeddingModel,
         options: InitOptionsUserDefined,
     ) -> Result<Self> {
-        let InitOptionsUserDefined {
-            execution_providers,
-            max_length,
-            intra_threads,
-            disable_cpu_fallback,
-            dimension_overrides,
-            session_config,
-        } = options;
-
-        let session = {
-            let builder_error = |err: ort::Error<ort::session::builder::SessionBuilder>| {
-                Error::OrtBuilder(err.to_string())
-            };
-            let mut session_builder =
-                init_session_builder(execution_providers, intra_threads, session_config)?;
-
-            if disable_cpu_fallback {
-                session_builder = session_builder
-                    .with_disable_cpu_fallback()
-                    .map_err(builder_error)?;
-            }
-            for (name, size) in dimension_overrides {
-                session_builder = session_builder
-                    .with_dimension_override(name, size)
-                    .map_err(builder_error)?;
-            }
-
-            for external_initializer_file in model.external_initializers {
-                session_builder = session_builder
-                    .with_external_initializer_file_in_memory(
-                        external_initializer_file.file_name,
-                        external_initializer_file.buffer.into(),
-                    )
-                    .map_err(builder_error)?;
-            }
-
-            session_builder.commit_from_memory(&model.onnx_file)?
-        };
+        let (mut session_builder, max_length) = options.into_session_builder()?;
+        for external_initializer_file in model.external_initializers {
+            session_builder = session_builder
+                .with_external_initializer_file_in_memory(
+                    external_initializer_file.file_name,
+                    external_initializer_file.buffer.into(),
+                )
+                .map_err(|err| Error::OrtBuilder(err.to_string()))?;
+        }
+        let session = session_builder.commit_from_memory(&model.onnx_file)?;
 
         let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
         Ok(Self::new(
@@ -315,7 +284,7 @@ impl TextEmbedding {
         })
     }
 
-    /// Method to generate an [`ort::SessionOutputs`] wrapped in a [`EmbeddingOutput`]
+    /// Method to generate the raw session outputs wrapped in an [`EmbeddingOutput`]
     /// instance, which can be used to extract the embeddings with default or custom
     /// methods as well as output key precedence.
     ///
@@ -375,55 +344,9 @@ impl TextEmbedding {
         let batches = texts
             .chunks(batch_size)
             .map(|batch| {
-                // Encode the texts in the batch
                 let inputs = batch.iter().map(|text| text.as_ref()).collect();
-                let encodings = self
-                    .tokenizer
-                    .encode_batch(inputs, true)
-                    .map_err(|e| Error::Tokenization(format!("Failed to encode the batch: {e}")))?;
-
-                // Extract the encoding length and batch size
-                let encoding_length = encodings.first().ok_or(Error::EmptyTokenizations)?.len();
-                let batch_size = batch.len();
-
-                let max_size = encoding_length * batch_size;
-
-                // Preallocate arrays with the maximum size
-                let mut ids_array = Vec::with_capacity(max_size);
-                let mut mask_array = Vec::with_capacity(max_size);
-                let mut type_ids_array = Vec::with_capacity(max_size);
-
-                encodings.iter().for_each(|encoding| {
-                    let ids = encoding.get_ids();
-                    let mask = encoding.get_attention_mask();
-                    let type_ids = encoding.get_type_ids();
-
-                    ids_array.extend(ids.iter().map(|x| *x as i64));
-                    mask_array.extend(mask.iter().map(|x| *x as i64));
-                    type_ids_array.extend(type_ids.iter().map(|x| *x as i64));
-                });
-
-                let inputs_ids_array =
-                    Array::from_shape_vec((batch_size, encoding_length), ids_array)
-                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
-                let attention_mask_array =
-                    Array::from_shape_vec((batch_size, encoding_length), mask_array)
-                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
-                let token_type_ids_array =
-                    Array::from_shape_vec((batch_size, encoding_length), type_ids_array)
-                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-                let mut session_inputs = ort::inputs![
-                    "input_ids" => Value::from_array(inputs_ids_array)?,
-                    "attention_mask" => Value::from_array(attention_mask_array.clone())?,
-                ];
-
-                if self.need_token_type_ids {
-                    session_inputs.push((
-                        "token_type_ids".into(),
-                        Value::from_array(token_type_ids_array)?.into(),
-                    ));
-                }
+                let mut encoded = encode_batch(&self.tokenizer, inputs)?;
+                let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
 
                 let outputs_map = self
                     .session
@@ -434,7 +357,7 @@ impl TextEmbedding {
                     .collect();
                 Ok(SingleBatchOutput {
                     outputs: outputs_map,
-                    attention_mask_array,
+                    attention_mask_array: encoded.attention_mask,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

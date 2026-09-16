@@ -110,7 +110,7 @@ Or add the following line to your Cargo.toml:
 
 ```toml
 [dependencies]
-fastembed = "5"
+fastembed = "6"
 ```
 
 ### Text Embeddings
@@ -215,7 +215,7 @@ println!("Rerank result: {:?}", results);
 
 ### Locally Available Models
 
-Alternatively, local model files can be used for inference via the `try_new_from_user_defined(...)` methods of respective structs.
+Alternatively, local model files can be used for inference via the `try_new_from_user_defined(...)` methods of the respective structs.
 
 ### Similarity Search
 
@@ -370,6 +370,7 @@ Models download on first use and load from cache afterwards (no network needed a
 - `FASTEMBED_CACHE_DIR` — cache location (default: `.fastembed_cache`). Equivalent to `TextInitOptions::with_cache_dir`.
 - `HF_HOME` — if set, takes precedence over the above.
 - `HF_ENDPOINT` — Hugging Face mirror base URL, for restricted networks.
+- `HF_TOKEN` — Hugging Face access token, for gated repositories and higher rate limits. Without it, the token saved by `huggingface-cli login` is used when present.
 
 ### DirectML (Windows)
 

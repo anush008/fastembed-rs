@@ -1,4 +1,5 @@
 #![cfg(feature = "hf-hub")]
+#![allow(clippy::excessive_precision)]
 
 use fastembed::{SparseInitOptions, SparseModel, SparseTextEmbedding};
 use std::collections::HashMap;
@@ -49,7 +50,7 @@ fn test_bgem3_sparse_embeddings_match_python() {
     .into_iter()
     .collect();
 
-    let expected = vec![expected_0, expected_1];
+    let expected = [expected_0, expected_1];
 
     assert_eq!(embeddings.len(), expected.len());
 

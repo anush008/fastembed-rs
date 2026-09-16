@@ -1,4 +1,5 @@
 #![cfg(feature = "hf-hub")]
+#![allow(clippy::excessive_precision)]
 
 use std::fs;
 use std::path::Path;
@@ -6,10 +7,10 @@ use std::path::Path;
 use hf_hub::Repo;
 
 use fastembed::{
-    get_cache_dir, Embedding, EmbeddingModel, InitOptions, InitOptionsUserDefined, OnnxSource,
-    Pooling, QuantizationMode, RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel,
-    RerankerModelInfo, SparseInitOptions, SparseTextEmbedding, TextEmbedding, TextRerank,
-    TokenizerFiles, UserDefinedEmbeddingModel, UserDefinedRerankingModel,
+    get_cache_dir, Embedding, EmbeddingModel, InitOptionsUserDefined, OnnxSource, Pooling,
+    QuantizationMode, RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel,
+    RerankerModelInfo, SparseInitOptions, SparseTextEmbedding, TextEmbedding, TextInitOptions,
+    TextRerank, TokenizerFiles, UserDefinedEmbeddingModel, UserDefinedRerankingModel,
 };
 
 /// A small epsilon value for floating point comparisons.
@@ -120,7 +121,7 @@ macro_rules! create_embeddings_test {
             TextEmbedding::list_supported_models()
                 .iter()
                 .for_each(|supported_model| {
-                    let mut model: TextEmbedding = TextEmbedding::try_new(InitOptions::new(supported_model.model.clone()))
+                    let mut model: TextEmbedding = TextEmbedding::try_new(TextInitOptions::new(supported_model.model.clone()))
                     .unwrap();
 
                     let documents = vec![
@@ -225,7 +226,7 @@ fn test_user_defined_embedding_model() {
     // Constitute the model in order to ensure it's downloaded and cached
     let test_model_info = TextEmbedding::get_model_info(&EmbeddingModel::AllMiniLML6V2).unwrap();
 
-    TextEmbedding::try_new(InitOptions::new(test_model_info.model.clone())).unwrap();
+    TextEmbedding::try_new(TextInitOptions::new(test_model_info.model.clone())).unwrap();
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
@@ -491,7 +492,7 @@ fn test_user_defined_reranking_model() {
 
 fn clean_cache(model_code: String) {
     let repo = Repo::model(model_code);
-    let cache_dir = format!("{}/{}", &get_cache_dir(), repo.folder_name());
+    let cache_dir = format!("{}/{}", get_cache_dir(), repo.folder_name());
     fs::remove_dir_all(cache_dir).ok();
 }
 
@@ -504,7 +505,7 @@ fn get_sample_text() -> String {
 #[test]
 fn test_batch_size_does_not_change_output() {
     let mut model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_max_length(384),
+        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2).with_max_length(384),
     )
     .expect("Create model successfully");
 
@@ -528,7 +529,7 @@ fn test_batch_size_does_not_change_output() {
         .expect("create successfully");
 
     assert_eq!(single_batch.len(), small_batch.len());
-    for (a, b) in single_batch.into_iter().zip(small_batch.into_iter()) {
+    for (a, b) in single_batch.into_iter().zip(small_batch) {
         assert!(a == b, "Expect each sentence embedding are equal.");
     }
 }
@@ -536,7 +537,7 @@ fn test_batch_size_does_not_change_output() {
 #[test]
 fn test_bgesmallen1point5_match_python_counterpart() {
     let mut model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::BGESmallENV15).with_max_length(384),
+        TextInitOptions::new(EmbeddingModel::BGESmallENV15).with_max_length(384),
     )
     .expect("Create model successfully");
 
@@ -566,7 +567,7 @@ fn test_bgesmallen1point5_match_python_counterpart() {
         .clone()
         .into_iter()
         .take(baseline.len())
-        .zip(baseline.into_iter())
+        .zip(baseline)
     {
         assert!((expected - actual).abs() < tolerance);
     }
@@ -575,7 +576,7 @@ fn test_bgesmallen1point5_match_python_counterpart() {
 #[test]
 fn test_allminilml6v2_match_python_counterpart() {
     let mut model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_max_length(384),
+        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2).with_max_length(384),
     )
     .expect("Create model successfully");
 
@@ -605,7 +606,7 @@ fn test_allminilml6v2_match_python_counterpart() {
         .clone()
         .into_iter()
         .take(baseline.len())
-        .zip(baseline.into_iter())
+        .zip(baseline)
     {
         assert!((expected - actual).abs() < tolerance);
     }
@@ -615,19 +616,10 @@ fn test_allminilml6v2_match_python_counterpart() {
 #[test]
 fn clip_vit_b32_deterministic_across_calls() {
     let q = "red car";
-    let mut fe = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::ClipVitB32)).unwrap();
-    let mut first: Option<Vec<f32>> = None;
-    for i in 0..100 {
+    let mut fe = TextEmbedding::try_new(TextInitOptions::new(EmbeddingModel::ClipVitB32)).unwrap();
+    let first = fe.embed(vec![q], None).unwrap()[0].clone();
+    for i in 1..100 {
         let vecs = fe.embed(vec![q], None).unwrap();
-        if first.is_none() {
-            first = Some(vecs[0].clone());
-        } else {
-            assert_eq!(
-                vecs[0],
-                *first.as_ref().unwrap(),
-                "Embedding changed after {} iterations",
-                i
-            );
-        }
+        assert_eq!(vecs[0], first, "Embedding changed after {i} iterations");
     }
 }

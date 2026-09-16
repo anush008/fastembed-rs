@@ -92,7 +92,13 @@ jobs:
         run: cargo test --no-default-features --features image-models,ort-download-binaries-native-tls
 
       - name: Cargo Clippy
-        run: cargo clippy
+        run: cargo clippy --all-targets --no-default-features --features hf-hub-native-tls,image-models,ort-download-binaries-native-tls -- -D warnings
+
+      - name: Cargo Doc Tests
+        run: cargo test --doc --no-default-features --features hf-hub-native-tls,image-models,ort-download-binaries-native-tls
+
+      - name: Cargo Doc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features hf-hub-native-tls,image-models,ort-download-binaries-native-tls
 
       - name: Cargo FMT
         run: cargo fmt --all -- --check
@@ -124,4 +130,4 @@ jobs:
         with:
           key: ${{ matrix.name }}
       - name: Clippy
-        run: cargo clippy --no-default-features --features ${{ matrix.features }} -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} -- -D warnings

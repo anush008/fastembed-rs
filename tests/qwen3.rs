@@ -1,5 +1,6 @@
 #![cfg(feature = "hf-hub")]
 #![cfg(feature = "qwen3")]
+#![allow(clippy::excessive_precision)]
 
 use candle_core::{DType, Device};
 use fastembed::{Qwen3TextEmbedding, Qwen3VLEmbedding};

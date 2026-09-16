@@ -2,12 +2,15 @@
 //!
 
 use crate::{
-    common::TokenizerFiles,
+    common::{init_session_builder, Error, Result, TokenizerFiles},
     init::{HasMaxLength, InitOptionsWithLength},
     pooling::Pooling,
     EmbeddingModel, OutputKey, QuantizationMode,
 };
-use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
+use ort::{
+    execution_providers::ExecutionProviderDispatch,
+    session::{builder::SessionBuilder, Session},
+};
 use tokenizers::Tokenizer;
 
 use super::DEFAULT_MAX_LENGTH;
@@ -66,7 +69,7 @@ impl InitOptionsUserDefined {
     }
 
     /// Set the number of intra-op threads ONNX Runtime uses. By default
-    /// (`None`) all available CPU cores are used; capping this limits CPU
+    /// (`None`) all available CPU cores are used. Capping this limits CPU
     /// usage at the cost of per-inference throughput.
     pub fn with_intra_threads(mut self, intra_threads: usize) -> Self {
         self.intra_threads = Some(intra_threads);
@@ -89,6 +92,30 @@ impl InitOptionsUserDefined {
     pub fn with_session_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.session_config.push((key.into(), value.into()));
         self
+    }
+
+    /// A session builder with every option applied, plus the requested tokenizer max length.
+    pub(crate) fn into_session_builder(self) -> Result<(SessionBuilder, usize)> {
+        let Self {
+            execution_providers,
+            max_length,
+            intra_threads,
+            disable_cpu_fallback,
+            dimension_overrides,
+            session_config,
+        } = self;
+
+        let builder_error = |err: ort::Error<SessionBuilder>| Error::OrtBuilder(err.to_string());
+        let mut builder = init_session_builder(execution_providers, intra_threads, session_config)?;
+        if disable_cpu_fallback {
+            builder = builder.with_disable_cpu_fallback().map_err(builder_error)?;
+        }
+        for (name, size) in dimension_overrides {
+            builder = builder
+                .with_dimension_override(name, size)
+                .map_err(builder_error)?;
+        }
+        Ok((builder, max_length))
     }
 }
 
