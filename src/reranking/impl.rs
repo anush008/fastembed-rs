@@ -1,12 +1,12 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    common::{init_session_builder, load_tokenizer, Error, Result},
+    common::{encode_batch, init_session_builder, load_tokenizer, Error, Result},
     models::reranking::reranker_model_list,
     RerankerModel, RerankerModelInfo,
 };
-use ndarray::{s, Array};
-use ort::{session::Session, value::Value};
+use ndarray::s;
+use ort::session::Session;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "hf-hub")]
@@ -57,23 +57,21 @@ impl TextRerank {
 
         let model_repo = pull_from_hf(model_name.to_string(), cache_dir, show_download_progress)?;
 
-        let model_file_name = TextRerank::get_model_info(&model_name).model_file;
+        let model_info = TextRerank::get_model_info(&model_name);
         let model_file_reference =
             model_repo
-                .get(&model_file_name)
+                .get(&model_info.model_file)
                 .map_err(|e| Error::ModelRetrieval {
-                    file: model_file_name.clone(),
+                    file: model_info.model_file.clone(),
                     source: Box::new(e),
                 })?;
-        let additional_files = TextRerank::get_model_info(&model_name).additional_files;
-        for additional_file in additional_files {
-            let _additional_file_reference =
-                model_repo
-                    .get(&additional_file)
-                    .map_err(|e| Error::ModelRetrieval {
-                        file: additional_file.clone(),
-                        source: Box::new(e),
-                    })?;
+        for additional_file in &model_info.additional_files {
+            model_repo
+                .get(additional_file)
+                .map_err(|e| Error::ModelRetrieval {
+                    file: additional_file.clone(),
+                    source: Box::new(e),
+                })?;
         }
 
         let session = init_session_builder(execution_providers, intra_threads, session_config)?
@@ -145,52 +143,8 @@ impl TextRerank {
         let mut scores: Vec<f32> = Vec::with_capacity(documents.len());
         for batch in documents.chunks(batch_size) {
             let inputs = batch.iter().map(|d| (q, d.as_ref())).collect();
-            let encodings = self
-                .tokenizer
-                .encode_batch(inputs, true)
-                .map_err(|e| Error::Tokenization(format!("Failed to encode batch: {e}")))?;
-
-            let encoding_length = encodings.first().ok_or(Error::EmptyTokenizations)?.len();
-            let batch_size = batch.len();
-            let max_size = encoding_length * batch_size;
-
-            let mut ids_array = Vec::with_capacity(max_size);
-            let mut mask_array = Vec::with_capacity(max_size);
-            let mut type_ids_array = Vec::with_capacity(max_size);
-
-            encodings.iter().for_each(|encoding| {
-                let ids = encoding.get_ids();
-                let mask = encoding.get_attention_mask();
-                let type_ids = encoding.get_type_ids();
-
-                ids_array.extend(ids.iter().map(|x| *x as i64));
-                mask_array.extend(mask.iter().map(|x| *x as i64));
-                type_ids_array.extend(type_ids.iter().map(|x| *x as i64));
-            });
-
-            let inputs_ids_array = Array::from_shape_vec((batch_size, encoding_length), ids_array)
-                .map_err(|e| Error::InvalidShape(e.to_string()))?;
-            let attention_mask_array =
-                Array::from_shape_vec((batch_size, encoding_length), mask_array)
-                    .map_err(|e| Error::InvalidShape(e.to_string()))?;
-            let token_type_ids_array =
-                Array::from_shape_vec((batch_size, encoding_length), type_ids_array)
-                    .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-            let mut session_inputs = ort::inputs![
-                "input_ids" => Value::from_array(inputs_ids_array)
-                    .map_err(|e| Error::OrtSession(e.to_string()))?,
-                "attention_mask" => Value::from_array(attention_mask_array)
-                    .map_err(|e| Error::OrtSession(e.to_string()))?,
-            ];
-            if self.need_token_type_ids {
-                session_inputs.push((
-                    "token_type_ids".into(),
-                    Value::from_array(token_type_ids_array)
-                        .map_err(|e| Error::OrtSession(e.to_string()))?
-                        .into(),
-                ));
-            }
+            let mut encoded = encode_batch(&self.tokenizer, inputs)?;
+            let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
 
             let outputs = self
                 .session
@@ -201,17 +155,11 @@ impl TextRerank {
                 .ok_or_else(|| Error::OutputKeyMissing {
                     key: "logits".into(),
                 })?
-                .try_extract_array()
+                .try_extract_array::<f32>()
                 .map_err(|e| {
                     Error::TensorExtraction(format!("Failed to extract logits tensor: {e}"))
                 })?;
-            let batch_scores: Vec<f32> = outputs
-                .slice(s![.., 0])
-                .rows()
-                .into_iter()
-                .flat_map(|row| row.to_vec())
-                .collect();
-            scores.extend(batch_scores);
+            scores.extend(outputs.slice(s![.., 0]).iter().copied());
         }
 
         // Return top_n_result of type Vec<RerankResult> ordered by score in descending order, don't use binary heap

@@ -22,9 +22,8 @@ pub enum OutputKey {
 /// which is however not guaranteed. This trait allows the user to define the order of
 /// precedence for selecting the output.
 ///
-/// Any [`OutputPrecedence`] should be usable multiple times, and should not consume itself;
-/// this is due to use of [`rayon`] parallelism, which means
-/// [`OutputPrecedence::key_precedence`] will have to be called once per batch.
+/// Any [`OutputPrecedence`] should be usable multiple times, and should not consume itself.
+/// [`OutputPrecedence::key_precedence`] is called once per batch.
 pub trait OutputPrecedence {
     /// Get the precedence of the keys in the output.
     fn key_precedence(&self) -> impl Iterator<Item = &OutputKey>;

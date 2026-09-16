@@ -2,6 +2,7 @@
 name = "fastembed"
 version = "6.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Library for generating vector embeddings, reranking locally."
 license = "Apache-2.0"
 authors = [

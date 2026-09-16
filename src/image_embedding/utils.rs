@@ -40,15 +40,51 @@ impl Transform for ConvertToRGB {
     }
 }
 
+/// The `size` entry of a `preprocessor_config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeSize {
+    ShortestEdge(u32),
+    Exact { width: u32, height: u32 },
+}
+
 pub struct Resize {
-    pub size: (u32, u32),
+    pub size: ResizeSize,
     pub resample: FilterType,
+}
+
+impl Resize {
+    fn target_dimensions(&self, width: u32, height: u32) -> (u32, u32) {
+        match self.size {
+            ResizeSize::Exact { width, height } => (width, height),
+            ResizeSize::ShortestEdge(edge) => {
+                let (short, long) = if width <= height {
+                    (width, height)
+                } else {
+                    (height, width)
+                };
+                if short == edge {
+                    return (width, height);
+                }
+                let scaled_long = ((edge as f64 * long as f64) / short as f64) as u32;
+                if width <= height {
+                    (edge, scaled_long.max(1))
+                } else {
+                    (scaled_long.max(1), edge)
+                }
+            }
+        }
+    }
 }
 
 impl Transform for Resize {
     fn transform(&self, data: TransformData) -> Result<TransformData> {
         let image = data.image()?;
-        let image = image.resize_exact(self.size.0, self.size.1, self.resample);
+        let (width, height) = image.dimensions();
+        let (new_width, new_height) = self.target_dimensions(width, height);
+        if (new_width, new_height) == (width, height) {
+            return Ok(TransformData::Image(image));
+        }
+        let image = image.resize_exact(new_width, new_height, self.resample);
         Ok(TransformData::Image(image))
     }
 }
@@ -81,7 +117,7 @@ impl Transform for CenterCrop {
                 (origin_width, origin_height) = image.dimensions();
             }
             let mut pixels_array =
-                Array3::zeros((3usize, crop_width as usize, crop_height as usize));
+                Array3::zeros((3usize, crop_height as usize, crop_width as usize));
             let offset_x = (crop_width - origin_width) / 2;
             let offset_y = (crop_height - origin_height) / 2;
             // whc -> chw
@@ -213,80 +249,31 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
         .as_str()
         .unwrap_or("CLIPImageProcessor");
     match mode {
-        "CLIPImageProcessor" => {
+        "CLIPImageProcessor" | "BitImageProcessor" => {
             if config["do_resize"].as_bool().unwrap_or(false) {
-                let size = config["size"].clone();
-                let shortest_edge = size["shortest_edge"].as_u64();
-                let (height, width) = (size["height"].as_u64(), size["width"].as_u64());
-
-                if let Some(shortest_edge) = shortest_edge {
-                    let size = (shortest_edge as u32, shortest_edge as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
-                } else if let (Some(height), Some(width)) = (height, width) {
-                    let size = (height as u32, width as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
-                } else {
-                    return Err(Error::PreprocessorConfig(
-                        "Size must contain either 'shortest_edge' or 'height' and 'width'.".into(),
-                    ));
-                }
+                transformers.push(Box::new(Resize {
+                    size: parse_resize_size(&config["size"])?,
+                    resample: FilterType::CatmullRom,
+                }));
             }
 
             if config["do_center_crop"].as_bool().unwrap_or(false) {
-                let crop_size = config["crop_size"].clone();
-                let (height, width) = if crop_size.is_u64() {
-                    let size = crop_size.as_u64().ok_or_else(|| {
-                        Error::PreprocessorConfig("crop_size must be a valid u64".into())
-                    })? as u32;
-                    (size, size)
-                } else if crop_size.is_object() {
-                    (
-                        crop_size["height"]
-                            .as_u64()
-                            .map(|height| height as u32)
-                            .ok_or_else(|| {
-                                Error::PreprocessorConfig(
-                                    "crop_size height must be contained".into(),
-                                )
-                            })?,
-                        crop_size["width"]
-                            .as_u64()
-                            .map(|width| width as u32)
-                            .ok_or_else(|| {
-                                Error::PreprocessorConfig(
-                                    "crop_size width must be contained".into(),
-                                )
-                            })?,
-                    )
-                } else {
-                    return Err(Error::PreprocessorConfig(format!(
-                        "Invalid crop size: {crop_size:?}"
-                    )));
-                };
                 transformers.push(Box::new(CenterCrop {
-                    size: (width, height),
+                    size: parse_crop_size(&config["crop_size"])?,
                 }));
             }
         }
         "ConvNextFeatureExtractor" => {
-            let shortest_edge = config["size"]["shortest_edge"].as_u64();
-            if shortest_edge.is_none() {
-                return Err(Error::PreprocessorConfig(
+            let shortest_edge = config["size"]["shortest_edge"].as_u64().ok_or_else(|| {
+                Error::PreprocessorConfig(
                     "Size dictionary must contain 'shortest_edge' key.".into(),
-                ));
-            }
-            let shortest_edge = shortest_edge.unwrap() as u32;
+                )
+            })? as u32;
             let crop_pct = config["crop_pct"].as_f64().unwrap_or(0.875);
             if shortest_edge < 384 {
-                let resize_shortet_edge = shortest_edge as f64 / crop_pct;
+                let resize_shortest_edge = shortest_edge as f64 / crop_pct;
                 transformers.push(Box::new(Resize {
-                    size: (resize_shortet_edge as u32, resize_shortet_edge as u32),
+                    size: ResizeSize::ShortestEdge(resize_shortest_edge as u32),
                     resample: FilterType::CatmullRom,
                 }));
                 transformers.push(Box::new(CenterCrop {
@@ -294,72 +281,11 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 }))
             } else {
                 transformers.push(Box::new(Resize {
-                    size: (shortest_edge, shortest_edge),
+                    size: ResizeSize::Exact {
+                        width: shortest_edge,
+                        height: shortest_edge,
+                    },
                     resample: FilterType::CatmullRom,
-                }));
-            }
-        }
-        "BitImageProcessor" => {
-            if config["do_convert_rgb"].as_bool().unwrap_or(false) {
-                transformers.push(Box::new(ConvertToRGB));
-            }
-            if config["do_resize"].as_bool().unwrap_or(false) {
-                let size = config["size"].clone();
-                let shortest_edge = size["shortest_edge"].as_u64();
-                let (height, width) = (size["height"].as_u64(), size["width"].as_u64());
-
-                if let Some(shortest_edge) = shortest_edge {
-                    let size = (shortest_edge as u32, shortest_edge as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
-                } else if let (Some(height), Some(width)) = (height, width) {
-                    let size = (height as u32, width as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
-                } else {
-                    return Err(Error::PreprocessorConfig(
-                        "Size must contain either 'shortest_edge' or 'height' and 'width'.".into(),
-                    ));
-                }
-            }
-
-            if config["do_center_crop"].as_bool().unwrap_or(false) {
-                let crop_size = config["crop_size"].clone();
-                let (height, width) = if crop_size.is_u64() {
-                    let size = crop_size.as_u64().ok_or_else(|| {
-                        Error::PreprocessorConfig("crop_size must be a valid u64".into())
-                    })? as u32;
-                    (size, size)
-                } else if crop_size.is_object() {
-                    (
-                        crop_size["height"]
-                            .as_u64()
-                            .map(|height| height as u32)
-                            .ok_or_else(|| {
-                                Error::PreprocessorConfig(
-                                    "crop_size height must be contained".into(),
-                                )
-                            })?,
-                        crop_size["width"]
-                            .as_u64()
-                            .map(|width| width as u32)
-                            .ok_or_else(|| {
-                                Error::PreprocessorConfig(
-                                    "crop_size width must be contained".into(),
-                                )
-                            })?,
-                    )
-                } else {
-                    return Err(Error::PreprocessorConfig(format!(
-                        "Invalid crop size: {crop_size:?}"
-                    )));
-                };
-                transformers.push(Box::new(CenterCrop {
-                    size: (width, height),
                 }));
             }
         }
@@ -406,4 +332,106 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
     }
 
     Ok(Compose::new(transformers))
+}
+
+fn parse_resize_size(size: &serde_json::Value) -> Result<ResizeSize> {
+    if let Some(shortest_edge) = size["shortest_edge"].as_u64() {
+        return Ok(ResizeSize::ShortestEdge(shortest_edge as u32));
+    }
+    match (size["width"].as_u64(), size["height"].as_u64()) {
+        (Some(width), Some(height)) => Ok(ResizeSize::Exact {
+            width: width as u32,
+            height: height as u32,
+        }),
+        _ => Err(Error::PreprocessorConfig(
+            "Size must contain either 'shortest_edge' or 'height' and 'width'.".into(),
+        )),
+    }
+}
+
+/// `crop_size` as `(width, height)`.
+fn parse_crop_size(crop_size: &serde_json::Value) -> Result<(u32, u32)> {
+    if let Some(size) = crop_size.as_u64() {
+        return Ok((size as u32, size as u32));
+    }
+    if crop_size.is_object() {
+        let height = crop_size["height"].as_u64().ok_or_else(|| {
+            Error::PreprocessorConfig("crop_size height must be contained".into())
+        })?;
+        let width = crop_size["width"]
+            .as_u64()
+            .ok_or_else(|| Error::PreprocessorConfig("crop_size width must be contained".into()))?;
+        return Ok((width as u32, height as u32));
+    }
+    Err(Error::PreprocessorConfig(format!(
+        "Invalid crop size: {crop_size:?}"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::RgbImage;
+
+    fn image(width: u32, height: u32) -> TransformData {
+        TransformData::Image(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            width,
+            height,
+            image::Rgb([255, 0, 0]),
+        )))
+    }
+
+    #[test]
+    fn shortest_edge_resize_preserves_aspect_ratio() {
+        let resize = Resize {
+            size: ResizeSize::ShortestEdge(224),
+            resample: FilterType::Nearest,
+        };
+        let out = resize.transform(image(400, 200)).unwrap().image().unwrap();
+        assert_eq!(out.dimensions(), (448, 224));
+        let out = resize.transform(image(200, 400)).unwrap().image().unwrap();
+        assert_eq!(out.dimensions(), (224, 448));
+    }
+
+    #[test]
+    fn exact_resize_keeps_width_and_height_apart() {
+        let resize = Resize {
+            size: ResizeSize::Exact {
+                width: 320,
+                height: 240,
+            },
+            resample: FilterType::Nearest,
+        };
+        let out = resize.transform(image(100, 100)).unwrap().image().unwrap();
+        assert_eq!(out.dimensions(), (320, 240));
+    }
+
+    #[test]
+    fn center_crop_pads_smaller_non_square_images_as_chw() {
+        let crop = CenterCrop { size: (224, 100) };
+        let out = crop.transform(image(50, 40)).unwrap().array().unwrap();
+        assert_eq!(out.dim(), (3, 100, 224));
+        assert_eq!(out[[0, 50, 112]], 255.0);
+        assert_eq!(out[[0, 0, 0]], 0.0);
+    }
+
+    #[test]
+    fn clip_config_builds_shortest_edge_pipeline() {
+        let config = serde_json::json!({
+            "image_processor_type": "CLIPImageProcessor",
+            "do_resize": true,
+            "size": {"shortest_edge": 224},
+            "do_center_crop": true,
+            "crop_size": 224,
+            "do_rescale": true,
+            "do_normalize": true,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5]
+        });
+        let compose = load_preprocessor(config).unwrap();
+        let out = compose.transform(image(640, 480)).unwrap().array().unwrap();
+        assert_eq!(out.dim(), (3, 224, 224));
+        assert!((out[[0, 100, 100]] - 1.0).abs() < 1e-6);
+        assert!((out[[1, 100, 100]] + 1.0).abs() < 1e-6);
+    }
 }

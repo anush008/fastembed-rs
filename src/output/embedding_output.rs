@@ -69,7 +69,7 @@ impl SingleBatchOutput {
         // - [] Release major version because of breaking changes
         match pooling_opt.unwrap_or_default() {
             pooling::Pooling::Cls => pooling::cls(&tensor),
-            pooling::Pooling::Mean => pooling::mean(&tensor, self.attention_mask_array.clone()),
+            pooling::Pooling::Mean => pooling::mean(&tensor, &self.attention_mask_array),
         }
     }
 }
@@ -82,7 +82,7 @@ pub struct EmbeddingOutput {
 }
 
 impl EmbeddingOutput {
-    /// Create a new [`EmbeddingOutput`] from a [`ort::SessionOutputs`] object.
+    /// Create a new [`EmbeddingOutput`] from the per-batch session outputs.
     pub fn new(batches: impl IntoIterator<Item = SingleBatchOutput>) -> Self {
         Self {
             batches: batches.into_iter().collect(),

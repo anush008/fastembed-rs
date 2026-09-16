@@ -18,8 +18,8 @@
 //!
 //! Models download to `./.fastembed_cache` on first use, then load from there.
 //! Override the location with the `FASTEMBED_CACHE_DIR` env var or
-//! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both;
-//! set `HF_ENDPOINT` to pull from a mirror.
+//! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both.
+//! Set `HF_ENDPOINT` to pull from a mirror.
 //!
 #![cfg_attr(
     feature = "hf-hub",
@@ -101,11 +101,11 @@ pub use crate::models::ModelTrait;
 
 // For Text Embedding
 pub use crate::models::text_embedding::EmbeddingModel;
-#[deprecated(note = "use `TextInitOptions` instead")]
-pub use crate::text_embedding::TextInitOptions as InitOptions;
 pub use crate::text_embedding::{
     InitOptionsUserDefined, TextEmbedding, TextInitOptions, UserDefinedEmbeddingModel,
 };
+#[deprecated(note = "use `TextInitOptions` instead")]
+pub type InitOptions = TextInitOptions;
 
 // For Sparse Text Embedding
 pub use crate::models::sparse::SparseModel;
@@ -141,4 +141,4 @@ pub use crate::models::qwen3::{
 
 // For Nomic Embed Text v2 MoE (candle backend)
 #[cfg(feature = "nomic-v2-moe")]
-pub use crate::models::nomic_v2_moe::{NomicConfig, NomicV2MoeTextEmbedding};
+pub use crate::models::nomic_v2_moe::{NomicBertModel, NomicConfig, NomicV2MoeTextEmbedding};

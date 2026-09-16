@@ -1,7 +1,9 @@
 #![cfg(all(feature = "image-models", feature = "hf-hub"))]
 
-use fastembed::InitOptions;
-use fastembed::{ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, ModelInfo, TextEmbedding};
+use fastembed::{
+    ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, ModelInfo, TextEmbedding,
+    TextInitOptions,
+};
 
 #[test]
 fn test_image_embedding_model() {
@@ -60,7 +62,7 @@ fn test_nomic_embed_vision_v1_5() {
     let image_embeddings = image_model.embed(images.clone(), None).unwrap();
     assert_eq!(image_embeddings.len(), images.len());
 
-    let mut text_model = TextEmbedding::try_new(InitOptions::new(
+    let mut text_model = TextEmbedding::try_new(TextInitOptions::new(
         fastembed::EmbeddingModel::NomicEmbedTextV15,
     ))
     .unwrap();

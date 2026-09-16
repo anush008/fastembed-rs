@@ -1,4 +1,5 @@
 #![cfg(feature = "hf-hub")]
+#![allow(clippy::excessive_precision)]
 
 use fastembed::{SparseInitOptions, SparseModel, SparseTextEmbedding};
 

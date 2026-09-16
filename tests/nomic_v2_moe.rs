@@ -1,5 +1,6 @@
 #![cfg(feature = "hf-hub")]
 #![cfg(feature = "nomic-v2-moe")]
+#![allow(clippy::excessive_precision)]
 
 use candle_core::{DType, Device};
 use fastembed::NomicV2MoeTextEmbedding;

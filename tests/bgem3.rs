@@ -1,4 +1,5 @@
 #![cfg(feature = "hf-hub")]
+#![allow(clippy::excessive_precision)]
 
 use fastembed::{
     get_cache_dir, Bgem3Embedding, Bgem3InitOptions, Bgem3Model, InitOptionsUserDefined,
@@ -165,7 +166,7 @@ fn test_bgem3_user_defined_model() {
     let _guard = MODEL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     // We will verify the user-defined loader by pulling the files from HF and feeding them manually to simulate a local deployment
 
-    // Reuse fastembed's cache — model already downloaded by test_bgem3_joint_embeddings_match_python
+    // Reuse fastembed's cache, the model is already downloaded by test_bgem3_joint_embeddings_match_python
     let cache = hf_hub::Cache::new(std::path::PathBuf::from(get_cache_dir()));
     let model_repo = hf_hub::api::sync::ApiBuilder::from_cache(cache)
         .with_progress(false)

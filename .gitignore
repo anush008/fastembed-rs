@@ -1,80 +1,18 @@
-## File system
-.DS_Store
-desktop.ini
-
-## Editor
-*.swp
-*.swo
-Session.vim
-.cproject
-.idea
-*.iml
-.vscode
-.project
-.favorites.json
-.settings/
-.vs/
-.zed/
-
-## Tool
-.valgrindrc
-.cargo
-# Included because it is part of the test case
-!/tests/run-make/thumb-none-qemu/example/.cargo
-
-## Configuration
-/config.toml
-/Makefile
-config.mk
-config.stamp
-no_llvm_build
-
 ## Build
-/dl/
-/doc/
-/inst/
-/llvm/
-/mingw-build/
-build/
-!/compiler/rustc_mir_build/src/build/
-/build-rust-analyzer/
-/dist/
-/unicode-downloads
 /target
-/src/bootstrap/target
-/src/tools/x/target
-# Created by default with `src/ci/docker/run.sh`
-/obj/
 
-## Temporary files
-*~
-\#*
-\#*\#
-.#*
-
-## Tags
-tags
-tags.*
-TAGS
-TAGS.*
-
-## Python
-__pycache__/
-*.py[cod]
-*$py.class
-
-## Node
-node_modules
-
-## Rustdoc GUI tests
-tests/rustdoc-gui/src/**.lock
+## Rust
+Cargo.lock
 
 ## Model cache
 .fastembed_cache
 
-## Rust files
-main.rs
-Cargo.lock
+## Editors and OS
+.DS_Store
+.idea
+.vscode
+.zed
+*.swp
 
 ## Nix
 /.direnv
