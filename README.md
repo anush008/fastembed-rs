@@ -110,7 +110,7 @@ Or add the following line to your Cargo.toml:
 
 ```toml
 [dependencies]
-fastembed = "6"
+fastembed = "7"
 ```
 
 ### Text Embeddings
