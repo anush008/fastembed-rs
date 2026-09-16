@@ -260,7 +260,7 @@ Qwen3 embedding models are available behind the `qwen3` feature flag (candle bac
 
 ```toml
 [dependencies]
-fastembed = { version = "5", features = ["qwen3"] }
+fastembed = { version = "7", features = ["qwen3"] }
 ```
 
 ```rust
@@ -309,7 +309,7 @@ The [nomic-embed-text-v2-moe](https://huggingface.co/nomic-ai/nomic-embed-text-v
 
 ```toml
 [dependencies]
-fastembed = { version = "5", features = ["nomic-v2-moe"] }
+fastembed = { version = "7", features = ["nomic-v2-moe"] }
 ```
 
 ```rust
@@ -378,7 +378,7 @@ To run models on a GPU via DirectML on Windows, enable the `directml` feature:
 
 ```toml
 [dependencies]
-fastembed = { version = "5", features = ["directml"] }
+fastembed = { version = "7", features = ["directml"] }
 ```
 
 Then pass a DirectML execution provider when initializing a model:
