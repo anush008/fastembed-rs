@@ -122,7 +122,8 @@ pub use crate::models::bgem3::Bgem3Model;
 // For Image Embedding
 #[cfg(feature = "image-models")]
 pub use crate::image_embedding::{
-    ImageEmbedding, ImageInitOptions, ImageInitOptionsUserDefined, UserDefinedImageEmbeddingModel,
+    ImageEmbedding, ImageInitOptions, ImageInitOptionsUserDefined, ImagePreprocessor,
+    UserDefinedImageEmbeddingModel,
 };
 pub use crate::models::image_embedding::ImageEmbeddingModel;
 

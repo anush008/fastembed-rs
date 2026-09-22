@@ -1,6 +1,9 @@
-use super::utils::Compose;
+use super::utils::{Compose, ResizeFn};
 use crate::{init::InitOptions, ImageEmbeddingModel};
+use image::DynamicImage;
+use ndarray::Array3;
 use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
+use std::sync::Arc;
 
 /// Options for initializing the ImageEmbedding model
 pub type ImageInitOptions = InitOptions<ImageEmbeddingModel>;
@@ -84,8 +87,93 @@ impl UserDefinedImageEmbeddingModel {
     }
 }
 
-/// Rust representation of the ImageEmbedding model
+/// A model-specific image preprocessor that can be shared with CPU worker threads.
+///
+/// The returned arrays are ready to pass to [`ImageEmbedding::embed_preprocessed`].
+#[derive(Clone)]
+pub struct ImagePreprocessor {
+    inner: Arc<Compose>,
+    resize: Option<Arc<ResizeFn>>,
+}
+
+impl ImagePreprocessor {
+    pub(crate) fn new(inner: Compose) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            resize: None,
+        }
+    }
+
+    /// Resize, crop, rescale, and normalize an image according to this model's configuration.
+    pub fn preprocess(&self, image: DynamicImage) -> crate::Result<Array3<f32>> {
+        match &self.resize {
+            Some(resize) => self
+                .inner
+                .preprocess_image_with_resize(image, resize.as_ref()),
+            None => self.inner.preprocess_image(image),
+        }
+    }
+
+    /// Use a custom image resize implementation while retaining the model-specific geometry,
+    /// cropping, rescaling, and normalization stages.
+    pub fn with_resize<F>(mut self, resize: F) -> Self
+    where
+        F: Fn(DynamicImage, u32, u32, image::imageops::FilterType) -> crate::Result<DynamicImage>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.resize = Some(Arc::new(resize));
+        self
+    }
+}
+
 pub struct ImageEmbedding {
-    pub(crate) preprocessor: Compose,
+    pub(crate) preprocessor: ImagePreprocessor,
     pub(crate) session: Session,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use image::RgbImage;
+
+    use super::*;
+
+    #[test]
+    fn cloneable_preprocessor_supports_a_custom_resizer() {
+        let config = br#"{
+            "image_processor_type": "CLIPImageProcessor",
+            "do_resize": true,
+            "size": { "height": 4, "width": 5 },
+            "do_center_crop": true,
+            "crop_size": { "height": 2, "width": 3 },
+            "do_rescale": true,
+            "rescale_factor": 0.5,
+            "do_normalize": true,
+            "image_mean": [1.0, 1.0, 1.0],
+            "image_std": [2.0, 2.0, 2.0]
+        }"#;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap())
+            .with_resize(move |_, width, height, filter| {
+                assert_eq!((width, height), (5, 4));
+                assert_eq!(filter, image::imageops::FilterType::CatmullRom);
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok(RgbImage::from_pixel(width, height, image::Rgb([5, 7, 9])).into())
+            });
+
+        let pixels = preprocessor
+            .clone()
+            .preprocess(RgbImage::new(10, 20).into())
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(pixels.shape(), &[3, 2, 3]);
+        assert_eq!(pixels[[0, 0, 0]], 0.75);
+        assert_eq!(pixels[[1, 1, 1]], 1.25);
+        assert_eq!(pixels[[2, 0, 2]], 1.75);
+    }
 }

@@ -26,14 +26,34 @@ impl TransformData {
     }
 }
 
+pub(crate) type ResizeFn =
+    dyn Fn(DynamicImage, u32, u32, FilterType) -> Result<DynamicImage> + Send + Sync;
+
+fn default_resize(
+    image: DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> Result<DynamicImage> {
+    Ok(image.resize_exact(width, height, filter))
+}
+
 pub trait Transform: Send + Sync {
-    fn transform(&self, images: TransformData) -> Result<TransformData>;
+    fn transform(&self, data: TransformData) -> Result<TransformData> {
+        self.transform_with_resize(data, &default_resize)
+    }
+
+    fn transform_with_resize(
+        &self,
+        data: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData>;
 }
 
 struct ConvertToRGB;
 
 impl Transform for ConvertToRGB {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let image = data.image()?;
         let image = image.into_rgb8().into();
         Ok(TransformData::Image(image))
@@ -77,14 +97,18 @@ impl Resize {
 }
 
 impl Transform for Resize {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        data: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         let image = data.image()?;
         let (width, height) = image.dimensions();
         let (new_width, new_height) = self.target_dimensions(width, height);
         if (new_width, new_height) == (width, height) {
             return Ok(TransformData::Image(image));
         }
-        let image = image.resize_exact(new_width, new_height, self.resample);
+        let image = resize(image, new_width, new_height, self.resample)?;
         Ok(TransformData::Image(image))
     }
 }
@@ -94,7 +118,7 @@ pub struct CenterCrop {
 }
 
 impl Transform for CenterCrop {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let mut image = data.image()?;
         let (mut origin_width, mut origin_height) = image.dimensions();
         let (crop_width, crop_height) = self.size;
@@ -137,7 +161,7 @@ impl Transform for CenterCrop {
 struct PILToNDarray;
 
 impl Transform for PILToNDarray {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         match data {
             TransformData::Image(image) => {
                 let image = image.to_rgb8();
@@ -161,7 +185,7 @@ pub struct Rescale {
 }
 
 impl Transform for Rescale {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let array = data.array()?;
         let array = array * self.scale;
         Ok(TransformData::NdArray(array))
@@ -174,7 +198,7 @@ pub struct Normalize {
 }
 
 impl Transform for Normalize {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let array = data.array()?;
         let mean = Array::from_vec(self.mean.clone())
             .into_shape_with_order((3, 1, 1))
@@ -230,12 +254,29 @@ impl Compose {
             .map_err(|e| Error::PreprocessorConfig(format!("Invalid preprocessor JSON: {e}")))?;
         load_preprocessor(config)
     }
+
+    pub(crate) fn preprocess_image(&self, image: DynamicImage) -> Result<Array3<f32>> {
+        self.transform(TransformData::Image(image))?.array()
+    }
+
+    pub(crate) fn preprocess_image_with_resize(
+        &self,
+        image: DynamicImage,
+        resize: &ResizeFn,
+    ) -> Result<Array3<f32>> {
+        self.transform_with_resize(TransformData::Image(image), resize)?
+            .array()
+    }
 }
 
 impl Transform for Compose {
-    fn transform(&self, mut image: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        mut image: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         for transform in &self.transforms {
-            image = transform.transform(image)?;
+            image = transform.transform_with_resize(image, resize)?;
         }
         Ok(image)
     }
