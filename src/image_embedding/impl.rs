@@ -17,8 +17,8 @@ use crate::{
 use super::ImageInitOptions;
 use super::{
     init::{ImageInitOptionsUserDefined, UserDefinedImageEmbeddingModel},
-    utils::{Compose, Transform, TransformData},
-    ImageEmbedding, DEFAULT_BATCH_SIZE,
+    utils::Compose,
+    ImageEmbedding, ImagePreprocessor, DEFAULT_BATCH_SIZE,
 };
 
 impl ImageEmbedding {
@@ -51,7 +51,7 @@ impl ImageEmbedding {
                     file: "preprocessor_config.json".into(),
                     source: Box::new(e),
                 })?;
-        let preprocessor = Compose::from_file(preprocessor_file)?;
+        let preprocessor = ImagePreprocessor::new(Compose::from_file(preprocessor_file)?);
 
         let model_file_name = ImageEmbedding::get_model_info(&model_name).model_file;
         let model_file_reference =
@@ -81,7 +81,7 @@ impl ImageEmbedding {
             session_config,
         } = options;
 
-        let preprocessor = Compose::from_bytes(model.preprocessor_file)?;
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(model.preprocessor_file)?);
 
         let session = init_session_builder(execution_providers, intra_threads, session_config)?
             .commit_from_memory(&model.onnx_file)?;
@@ -90,7 +90,7 @@ impl ImageEmbedding {
     }
 
     /// Private method to return an instance
-    fn new(preprocessor: Compose, session: Session) -> Self {
+    fn new(preprocessor: ImagePreprocessor, session: Session) -> Self {
         Self {
             preprocessor,
             session,
@@ -120,6 +120,14 @@ impl ImageEmbedding {
             .into_iter()
             .find(|m| &m.model == model)
             .expect("Model not found in supported models list. This is a bug - please report it.")
+    }
+
+    /// Return a cloneable CPU preprocessor configured for this image model.
+    ///
+    /// Use it to preprocess images on worker threads, then pass the resulting arrays to
+    /// [`Self::embed_preprocessed`]. It deliberately does not include the mutable ONNX session.
+    pub fn preprocessor(&self) -> ImagePreprocessor {
+        self.preprocessor.clone()
     }
 
     /// Method to generate image embeddings for a Vec of image bytes
@@ -204,17 +212,16 @@ impl ImageEmbedding {
     pub fn embed_images(&mut self, imgs: Vec<DynamicImage>) -> Result<Vec<Embedding>> {
         let inputs = imgs
             .into_iter()
-            .map(|img| {
-                let pixels = self.preprocessor.transform(TransformData::Image(img))?;
-                match pixels {
-                    TransformData::NdArray(array) => Ok(array),
-                    _ => Err(Error::PreprocessorConfig(
-                        "Preprocessor configuration error!".into(),
-                    )),
-                }
-            })
+            .map(|img| self.preprocessor.preprocess(img))
             .collect::<Result<Vec<Array3<f32>>>>()?;
+        self.embed_preprocessed(inputs)
+    }
 
+    /// Embed images already prepared by this model's [`ImagePreprocessor`].
+    ///
+    /// This separates CPU image preprocessing from mutable ONNX Runtime inference, allowing
+    /// callers to prepare later batches while the accelerator processes the current batch.
+    pub fn embed_preprocessed(&mut self, inputs: Vec<Array3<f32>>) -> Result<Vec<Embedding>> {
         // Extract the batch size
         let inputs_view: Vec<ArrayView3<f32>> = inputs.iter().map(|img| img.view()).collect();
         let pixel_values_array = ndarray::stack(ndarray::Axis(0), &inputs_view)
