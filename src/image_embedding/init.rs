@@ -89,9 +89,7 @@ impl UserDefinedImageEmbeddingModel {
 
 /// A model-specific image preprocessor that can be shared with CPU worker threads.
 ///
-/// The returned arrays are ready to pass to [`ImageEmbedding::embed_preprocessed`]. Cloning this
-/// type is cheap and does not clone image data or ONNX Runtime state.
-#[derive(Clone)]
+/// The returned arrays are ready to pass to [`ImageEmbedding::embed_preprocessed`].
 pub struct ImagePreprocessor {
     inner: Arc<Compose>,
     resize: Option<Arc<ResizeFn>>,
@@ -129,7 +127,6 @@ impl ImagePreprocessor {
     }
 }
 
-/// Rust representation of the ImageEmbedding model.
 pub struct ImageEmbedding {
     pub(crate) preprocessor: ImagePreprocessor,
     pub(crate) session: Session,

@@ -125,7 +125,7 @@ impl ImageEmbedding {
     /// Return a cloneable CPU preprocessor configured for this image model.
     ///
     /// Use it to preprocess images on worker threads, then pass the resulting arrays to
-    /// [`Self::embed_preprocessed`]. It deliberately does not include the mutable ONNX session.
+    /// [`Self::embed_preprocessed`].
     pub fn preprocessor(&self) -> ImagePreprocessor {
         self.preprocessor.clone()
     }
