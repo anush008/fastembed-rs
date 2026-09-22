@@ -90,6 +90,7 @@ impl UserDefinedImageEmbeddingModel {
 /// A model-specific image preprocessor that can be shared with CPU worker threads.
 ///
 /// The returned arrays are ready to pass to [`ImageEmbedding::embed_preprocessed`].
+#[derive(Clone)]
 pub struct ImagePreprocessor {
     inner: Arc<Compose>,
     resize: Option<Arc<ResizeFn>>,
