@@ -32,7 +32,7 @@ pub fn reranker_model_list() -> Vec<RerankerModelInfo> {
         },
         RerankerModelInfo {
             model: RerankerModel::BGERerankerV2M3,
-            description: String::from("reranker model for multilingual"),
+            description: String::from("Multilingual reranker model"),
             model_code: String::from("rozgo/bge-reranker-v2-m3"),
             model_file: String::from("model.onnx"),
             additional_files: vec![String::from("model.onnx.data")],
@@ -46,7 +46,7 @@ pub fn reranker_model_list() -> Vec<RerankerModelInfo> {
         },
         RerankerModelInfo {
             model: RerankerModel::JINARerankerV2BaseMultilingual,
-            description: String::from("reranker model for multilingual"),
+            description: String::from("Multilingual reranker model"),
             model_code: String::from("jinaai/jina-reranker-v2-base-multilingual"),
             model_file: String::from("onnx/model.onnx"),
             additional_files: vec![],

@@ -23,7 +23,7 @@ pub type RerankInitOptions = InitOptionsWithLength<RerankerModel>;
 
 /// Options for initializing a user-defined reranking model.
 ///
-/// Model files are held by the UserDefinedRerankerModel struct
+/// Model files are held by the [`UserDefinedRerankingModel`] struct.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RerankInitOptionsUserDefined {
