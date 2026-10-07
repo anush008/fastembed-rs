@@ -144,7 +144,7 @@ impl Transform for CenterCrop {
                 Array3::zeros((3usize, crop_height as usize, crop_width as usize));
             let offset_x = (crop_width - origin_width) / 2;
             let offset_y = (crop_height - origin_height) / 2;
-            // whc -> chw
+            // HWC -> CHW
             for (x, y, pixel) in image.to_rgb8().enumerate_pixels() {
                 pixels_array[[0, (y + offset_y) as usize, (x + offset_x) as usize]] =
                     pixel[0] as f32;
@@ -166,7 +166,7 @@ impl Transform for PILToNDarray {
             TransformData::Image(image) => {
                 let image = image.to_rgb8();
                 let (width, height) = image.dimensions();
-                // whc -> chw
+                // HWC -> CHW
                 let mut pixels_array = Array3::zeros((3usize, height as usize, width as usize));
                 for (x, y, pixel) in image.enumerate_pixels() {
                     pixels_array[[0, y as usize, x as usize]] = pixel[0] as f32;

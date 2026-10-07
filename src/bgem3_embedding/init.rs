@@ -26,7 +26,7 @@ pub struct Bgem3EmbeddingOutput {
 
 /// Struct for "bring your own" BGE-M3 models
 ///
-/// The onnx_file and tokenizer_files expect the files' bytes
+/// The `onnx_file` and `tokenizer_files` fields contain the file contents as bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDefinedBgem3Model {
     pub onnx_file: Vec<u8>,

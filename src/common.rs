@@ -107,8 +107,8 @@ pub struct TokenizerFiles {
     pub tokenizer_config_file: Vec<u8>,
 }
 
-/// The procedure for loading tokenizer files from the hugging face hub is separated
-/// from the main load_tokenizer function (which is expecting bytes, from any source).
+/// Loading tokenizer files from the Hugging Face Hub is separate from the main
+/// `load_tokenizer` function, which expects bytes from any source.
 #[cfg(feature = "hf-hub")]
 pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<Tokenizer> {
     let tokenizer_files: TokenizerFiles = TokenizerFiles {
@@ -159,7 +159,8 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
             )
         })?;
 
-    //For BGEBaseSmall, the model_max_length value is set to 1000000000000000019884624838656. Which fits in a f64
+    // For BGEBaseSmall, model_max_length is set to 1000000000000000019884624838656.
+    // This value fits in an f64.
     let model_max_length = tokenizer_config["model_max_length"]
         .as_f64()
         .ok_or_else(|| {

@@ -22,7 +22,7 @@ impl HasMaxLength for EmbeddingModel {
 /// Options for initializing the TextEmbedding model
 pub type TextInitOptions = InitOptionsWithLength<EmbeddingModel>;
 
-/// Options for initializing UserDefinedEmbeddingModel
+/// Options for initializing a user-defined embedding model.
 ///
 /// Model files are held by the UserDefinedEmbeddingModel struct
 #[derive(Debug, Clone)]
@@ -150,7 +150,7 @@ impl From<TextInitOptions> for InitOptionsUserDefined {
 
 /// Struct for "bring your own" embedding models
 ///
-/// The onnx_file and tokenizer_files are expecting the files' bytes
+/// The `onnx_file` and `tokenizer_files` fields contain the file contents as bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDefinedEmbeddingModel {
     pub onnx_file: Vec<u8>,
@@ -163,8 +163,8 @@ pub struct UserDefinedEmbeddingModel {
 
 /// Struct for adding external initializers to "bring your own" embedding models
 ///
-/// The buffer is expecting the data of the external initializer and the file_name
-/// must match the one referenced by the model.
+/// The buffer contains the external initializer's data, and `file_name` must
+/// match the name referenced by the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalInitializerFile {
     pub file_name: String,

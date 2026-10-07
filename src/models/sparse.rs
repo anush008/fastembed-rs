@@ -31,7 +31,7 @@ pub fn models_list() -> Vec<ModelInfo<SparseModel>> {
             model: SparseModel::BGEM3,
             dim: 0,
             description: String::from(
-                "BGE-M3 sparse embedding model with 8192 context, supports 100+ languages",
+                "BGE-M3 sparse embedding model with an 8192-token context, supporting 100+ languages",
             ),
             model_code: String::from("BAAI/bge-m3"),
             model_file: String::from("onnx/model.onnx"),
