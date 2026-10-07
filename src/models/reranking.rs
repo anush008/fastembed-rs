@@ -12,7 +12,13 @@ pub enum RerankerModel {
     /// jinaai/jina-reranker-v1-turbo-en
     JINARerankerV1TurboEn,
     /// jinaai/jina-reranker-v2-base-multilingual
-    JINARerankerV2BaseMultiligual,
+    JINARerankerV2BaseMultilingual,
+}
+
+impl RerankerModel {
+    #[allow(non_upper_case_globals)]
+    #[deprecated(note = "use `JINARerankerV2BaseMultilingual` instead")]
+    pub const JINARerankerV2BaseMultiligual: Self = Self::JINARerankerV2BaseMultilingual;
 }
 
 pub fn reranker_model_list() -> Vec<RerankerModelInfo> {
@@ -39,7 +45,7 @@ pub fn reranker_model_list() -> Vec<RerankerModelInfo> {
             additional_files: vec![],
         },
         RerankerModelInfo {
-            model: RerankerModel::JINARerankerV2BaseMultiligual,
+            model: RerankerModel::JINARerankerV2BaseMultilingual,
             description: String::from("reranker model for multilingual"),
             model_code: String::from("jinaai/jina-reranker-v2-base-multilingual"),
             model_file: String::from("onnx/model.onnx"),
@@ -86,14 +92,14 @@ pub(crate) fn all_variants() -> Vec<RerankerModel> {
             RerankerModel::BGERerankerBase => (),
             RerankerModel::BGERerankerV2M3 => (),
             RerankerModel::JINARerankerV1TurboEn => (),
-            RerankerModel::JINARerankerV2BaseMultiligual => (),
+            RerankerModel::JINARerankerV2BaseMultilingual => (),
         }
     }
     vec![
         RerankerModel::BGERerankerBase,
         RerankerModel::BGERerankerV2M3,
         RerankerModel::JINARerankerV1TurboEn,
-        RerankerModel::JINARerankerV2BaseMultiligual,
+        RerankerModel::JINARerankerV2BaseMultilingual,
     ]
 }
 

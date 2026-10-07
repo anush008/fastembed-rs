@@ -174,7 +174,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn userdefined_builders_set_fields() {
+    fn user_defined_builders_set_fields() {
         let o = RerankInitOptionsUserDefined::new()
             .with_max_length(128)
             .with_intra_threads(2)
