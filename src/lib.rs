@@ -1,7 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-//! [FastEmbed](https://github.com/Anush008/fastembed-rs) - Fast, light, accurate library built for retrieval embedding generation.
-//!
-//! Local ONNX inference, synchronous, no Tokio. Models download once and run offline thereafter.
+//! [FastEmbed](https://github.com/Anush008/fastembed-rs) - Library for generating vector embeddings and reranking locally.
 //!
 //! # What's here
 //!
@@ -24,7 +22,7 @@
 #![cfg_attr(
     feature = "hf-hub",
     doc = r#"
- ### Instantiating [TextEmbedding](crate::TextEmbedding)
+ ### Instantiating [TextEmbedding]
  ```
  use fastembed::{TextEmbedding, TextInitOptions, EmbeddingModel};
 
@@ -44,7 +42,7 @@
  ```
 "#
 )]
-//! Find more info about the available options in the [TextInitOptions](crate::TextInitOptions) documentation.
+//! Find more info about the available options in the [TextInitOptions] documentation.
 //!
 #![cfg_attr(
     feature = "hf-hub",

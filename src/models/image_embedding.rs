@@ -40,7 +40,7 @@ pub fn models_list() -> Vec<ModelInfo<ImageEmbeddingModel>> {
         ModelInfo {
             model: ImageEmbeddingModel::UnicomVitB16,
             dim: 768,
-            description: String::from("Unicom Unicom-ViT-B-16 from open-metric-learning"),
+            description: String::from("Unicom-ViT-B-16 from Open Metric Learning"),
             model_code: String::from("Qdrant/Unicom-ViT-B-16"),
             model_file: String::from("model.onnx"),
             additional_files: Vec::new(),
@@ -49,7 +49,7 @@ pub fn models_list() -> Vec<ModelInfo<ImageEmbeddingModel>> {
         ModelInfo {
             model: ImageEmbeddingModel::UnicomVitB32,
             dim: 512,
-            description: String::from("Unicom Unicom-ViT-B-32 from open-metric-learning"),
+            description: String::from("Unicom-ViT-B-32 from Open Metric Learning"),
             model_code: String::from("Qdrant/Unicom-ViT-B-32"),
             model_file: String::from("model.onnx"),
             additional_files: Vec::new(),
@@ -58,7 +58,7 @@ pub fn models_list() -> Vec<ModelInfo<ImageEmbeddingModel>> {
         ModelInfo {
             model: ImageEmbeddingModel::NomicEmbedVisionV15,
             dim: 768,
-            description: String::from("Nomic NomicEmbedVisionV15"),
+            description: String::from("Nomic Embed Vision v1.5"),
             model_code: String::from("nomic-ai/nomic-embed-vision-v1.5"),
             model_file: String::from("onnx/model.onnx"),
             additional_files: Vec::new(),

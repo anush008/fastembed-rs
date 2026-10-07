@@ -70,7 +70,7 @@ impl From<ImageInitOptions> for ImageInitOptionsUserDefined {
 
 /// Struct for "bring your own" embedding models
 ///
-/// The onnx_file and preprocessor_files are expecting the files' bytes
+/// The `onnx_file` and `preprocessor_file` fields contain the file contents as bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UserDefinedImageEmbeddingModel {
