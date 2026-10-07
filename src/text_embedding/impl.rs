@@ -63,7 +63,7 @@ impl TextEmbedding {
             })?;
         }
 
-        // prioritise loading pooling config if available, if not (thanks qdrant!), look for it in hardcoded
+        // Prioritize loading the pooling config if available; otherwise, look for it in the hardcoded defaults.
         let post_processing = TextEmbedding::get_default_pooling_method(&model_name);
 
         let session = init_session_builder(execution_providers, intra_threads, session_config)?

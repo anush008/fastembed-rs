@@ -21,7 +21,7 @@ impl HasMaxLength for RerankerModel {
 /// Options for initializing the reranking models
 pub type RerankInitOptions = InitOptionsWithLength<RerankerModel>;
 
-/// Options for initializing UserDefinedRerankerModel
+/// Options for initializing a user-defined reranking model.
 ///
 /// Model files are held by the UserDefinedRerankerModel struct
 #[derive(Debug, Clone)]
@@ -144,7 +144,7 @@ impl From<PathBuf> for OnnxSource {
 
 /// Struct for "bring your own" reranking models
 ///
-/// The onnx_file and tokenizer_files are expecting the files' bytes
+/// The `onnx_file` and `tokenizer_files` fields contain the file contents as bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UserDefinedRerankingModel {
