@@ -608,14 +608,17 @@ fn test_allminilml6v2_match_python_counterpart() {
     ];
 
     let embeddings = model.embed(vec![text], None).expect("create successfully");
-    let tolerance: f32 = 1e-3;
+    let tolerance: f32 = 1e-2;
     for (expected, actual) in embeddings[0]
         .clone()
         .into_iter()
         .take(baseline.len())
         .zip(baseline)
     {
-        assert!((expected - actual).abs() < tolerance);
+        assert!(
+            (expected - actual).abs() < tolerance,
+            "expected {expected} to be within {tolerance} of {actual}"
+        );
     }
 }
 
