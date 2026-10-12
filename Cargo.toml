@@ -29,7 +29,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 thiserror = "2"
-hf-hub = { version = "0.5.0", default-features = false, optional = true }
+hf-hub = { version = "1.0.0", default-features = false, optional = true }
 image = { version = "0.25.10", optional = true }
 ndarray = { version = "0.17.2", default-features = false }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
