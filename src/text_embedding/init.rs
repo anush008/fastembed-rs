@@ -8,7 +8,8 @@ use crate::{
     EmbeddingModel, OutputKey, QuantizationMode,
 };
 use ort::{
-    execution_providers::ExecutionProviderDispatch,
+    environment::Environment,
+    ep::ExecutionProviderDispatch,
     session::{builder::SessionBuilder, Session},
 };
 use tokenizers::Tokenizer;
@@ -25,9 +26,10 @@ pub type TextInitOptions = InitOptionsWithLength<EmbeddingModel>;
 /// Options for initializing a user-defined embedding model.
 ///
 /// Model files are held by the UserDefinedEmbeddingModel struct
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct InitOptionsUserDefined {
+    pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     pub max_length: usize,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
@@ -53,6 +55,11 @@ impl InitOptionsUserDefined {
         Self {
             ..Default::default()
         }
+    }
+
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     pub fn with_execution_providers(
@@ -97,6 +104,7 @@ impl InitOptionsUserDefined {
     /// A session builder with every option applied, plus the requested tokenizer max length.
     pub(crate) fn into_session_builder(self) -> Result<(SessionBuilder, usize)> {
         let Self {
+            environment,
             execution_providers,
             max_length,
             intra_threads,
@@ -106,7 +114,12 @@ impl InitOptionsUserDefined {
         } = self;
 
         let builder_error = |err: ort::Error<SessionBuilder>| Error::OrtBuilder(err.to_string());
-        let mut builder = init_session_builder(execution_providers, intra_threads, session_config)?;
+        let mut builder = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?;
         if disable_cpu_fallback {
             builder = builder.with_disable_cpu_fallback().map_err(builder_error)?;
         }
@@ -122,6 +135,7 @@ impl InitOptionsUserDefined {
 impl Default for InitOptionsUserDefined {
     fn default() -> Self {
         Self {
+            environment: None,
             execution_providers: Default::default(),
             max_length: DEFAULT_MAX_LENGTH,
             intra_threads: None,
@@ -138,6 +152,7 @@ impl Default for InitOptionsUserDefined {
 impl From<TextInitOptions> for InitOptionsUserDefined {
     fn from(options: TextInitOptions) -> Self {
         InitOptionsUserDefined {
+            environment: None,
             execution_providers: options.execution_providers,
             max_length: options.max_length,
             intra_threads: options.intra_threads,

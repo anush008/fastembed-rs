@@ -2,7 +2,7 @@ use super::utils::{Compose, ResizeFn};
 use crate::{init::InitOptions, ImageEmbeddingModel};
 use image::DynamicImage;
 use ndarray::Array3;
-use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
+use ort::{environment::Environment, ep::ExecutionProviderDispatch, session::Session};
 use std::sync::Arc;
 
 /// Options for initializing the ImageEmbedding model
@@ -11,9 +11,10 @@ pub type ImageInitOptions = InitOptions<ImageEmbeddingModel>;
 /// Options for initializing UserDefinedImageEmbeddingModel
 ///
 /// Model files are held by the UserDefinedImageEmbeddingModel struct
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ImageInitOptionsUserDefined {
+    pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
     /// every available CPU core via `std::thread::available_parallelism`.
@@ -28,6 +29,11 @@ pub struct ImageInitOptionsUserDefined {
 impl ImageInitOptionsUserDefined {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     pub fn with_execution_providers(
@@ -61,6 +67,7 @@ impl ImageInitOptionsUserDefined {
 impl From<ImageInitOptions> for ImageInitOptionsUserDefined {
     fn from(options: ImageInitOptions) -> Self {
         ImageInitOptionsUserDefined {
+            environment: options.environment,
             execution_providers: options.execution_providers,
             intra_threads: options.intra_threads,
             session_config: options.session_config,

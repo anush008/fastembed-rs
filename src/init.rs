@@ -1,15 +1,16 @@
 use crate::get_cache_dir;
-use ort::execution_providers::ExecutionProviderDispatch;
+use ort::{environment::Environment, ep::ExecutionProviderDispatch};
 use std::path::PathBuf;
 
 pub trait HasMaxLength {
     const MAX_LENGTH: usize;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct InitOptionsWithLength<M> {
     pub model_name: M,
+    pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     pub cache_dir: PathBuf,
     pub show_download_progress: bool,
@@ -24,10 +25,11 @@ pub struct InitOptionsWithLength<M> {
     pub session_config: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct InitOptions<M> {
     pub model_name: M,
+    pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     pub cache_dir: PathBuf,
     pub show_download_progress: bool,
@@ -45,6 +47,7 @@ impl<M: Default + HasMaxLength> Default for InitOptionsWithLength<M> {
     fn default() -> Self {
         Self {
             model_name: M::default(),
+            environment: None,
             execution_providers: Default::default(),
             cache_dir: get_cache_dir().into(),
             show_download_progress: true,
@@ -59,6 +62,7 @@ impl<M: Default> Default for InitOptions<M> {
     fn default() -> Self {
         Self {
             model_name: M::default(),
+            environment: None,
             execution_providers: Default::default(),
             cache_dir: get_cache_dir().into(),
             show_download_progress: true,
@@ -86,6 +90,11 @@ impl<M: Default + HasMaxLength> InitOptionsWithLength<M> {
     /// Set the cache directory for the model file
     pub fn with_cache_dir(mut self, cache_dir: PathBuf) -> Self {
         self.cache_dir = cache_dir;
+        self
+    }
+
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
         self
     }
 
@@ -133,6 +142,11 @@ impl<M: Default> InitOptions<M> {
     /// Set the cache directory for the model file
     pub fn with_cache_dir(mut self, cache_dir: PathBuf) -> Self {
         self.cache_dir = cache_dir;
+        self
+    }
+
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
         self
     }
 

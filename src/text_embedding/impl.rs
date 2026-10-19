@@ -33,6 +33,7 @@ impl TextEmbedding {
         let TextInitOptions {
             max_length,
             model_name,
+            environment,
             execution_providers,
             cache_dir,
             show_download_progress,
@@ -66,8 +67,13 @@ impl TextEmbedding {
         // Prioritize loading the pooling config if available; otherwise, look for it in the hardcoded defaults.
         let post_processing = TextEmbedding::get_default_pooling_method(&model_name);
 
-        let session = init_session_builder(execution_providers, intra_threads, session_config)?
-            .commit_from_file(model_file_reference)?;
+        let session = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?
+        .commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(

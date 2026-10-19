@@ -1,15 +1,28 @@
 #![cfg(all(feature = "image-models", feature = "hf-hub"))]
 
+use std::sync::OnceLock;
+
+use ort::environment::Environment;
+
 use fastembed::{
     ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, ModelInfo, TextEmbedding,
     TextInitOptions,
 };
 
+fn environment() -> Environment {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| ort::init().build().unwrap())
+        .clone()
+}
+
 #[test]
 fn test_image_embedding_model() {
     let test_one_model = |supported_model: &ModelInfo<ImageEmbeddingModel>| {
-        let mut model: ImageEmbedding =
-            ImageEmbedding::try_new(ImageInitOptions::new(supported_model.model.clone())).unwrap();
+        let mut model: ImageEmbedding = ImageEmbedding::try_new(
+            ImageInitOptions::new(supported_model.model.clone()).with_environment(environment()),
+        )
+        .unwrap();
 
         let images = vec!["tests/assets/image_0.png", "tests/assets/image_1.png"];
 
@@ -51,9 +64,10 @@ fn test_nomic_embed_vision_v1_5() {
     // Test the NomicEmbedVisionV15 model specifically because it outputs a 3D tensor with a different
     // output key ('last_hidden_state') compared to other models. This test ensures our tensor extraction
     // logic can handle both standard output keys and this model's specific naming convention.
-    let mut image_model = ImageEmbedding::try_new(ImageInitOptions::new(
-        fastembed::ImageEmbeddingModel::NomicEmbedVisionV15,
-    ))
+    let mut image_model = ImageEmbedding::try_new(
+        ImageInitOptions::new(fastembed::ImageEmbeddingModel::NomicEmbedVisionV15)
+            .with_environment(environment()),
+    )
     .unwrap();
 
     // tests/assets/image_0.png is a blue cat
@@ -62,9 +76,10 @@ fn test_nomic_embed_vision_v1_5() {
     let image_embeddings = image_model.embed(images.clone(), None).unwrap();
     assert_eq!(image_embeddings.len(), images.len());
 
-    let mut text_model = TextEmbedding::try_new(TextInitOptions::new(
-        fastembed::EmbeddingModel::NomicEmbedTextV15,
-    ))
+    let mut text_model = TextEmbedding::try_new(
+        TextInitOptions::new(fastembed::EmbeddingModel::NomicEmbedTextV15)
+            .with_environment(environment()),
+    )
     .unwrap();
     let texts = vec!["green cat", "blue cat", "red cat", "yellow cat", "dog"];
     let text_embeddings = text_model.embed(texts.clone(), None).unwrap();

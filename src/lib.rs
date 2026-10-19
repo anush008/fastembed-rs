@@ -84,7 +84,7 @@ pub mod similarity;
 mod sparse_text_embedding;
 mod text_embedding;
 
-pub use ort::execution_providers::ExecutionProviderDispatch;
+pub use ort::ep::ExecutionProviderDispatch;
 
 pub use crate::common::{get_cache_dir, Embedding, Error, Result, SparseEmbedding, TokenizerFiles};
 pub use crate::models::{

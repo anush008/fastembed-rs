@@ -3,7 +3,7 @@ use crate::{
     init::{HasMaxLength, InitOptionsWithLength},
     RerankerModel, TokenizerFiles,
 };
-use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
+use ort::{environment::Environment, ep::ExecutionProviderDispatch, session::Session};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -24,9 +24,10 @@ pub type RerankInitOptions = InitOptionsWithLength<RerankerModel>;
 /// Options for initializing a user-defined reranking model.
 ///
 /// Model files are held by the [`UserDefinedRerankingModel`] struct.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct RerankInitOptionsUserDefined {
+    pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     pub max_length: usize,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
@@ -48,6 +49,7 @@ pub struct RerankInitOptionsUserDefined {
 impl Default for RerankInitOptionsUserDefined {
     fn default() -> Self {
         Self {
+            environment: None,
             execution_providers: Default::default(),
             max_length: DEFAULT_MAX_LENGTH,
             intra_threads: None,
@@ -61,6 +63,11 @@ impl Default for RerankInitOptionsUserDefined {
 impl RerankInitOptionsUserDefined {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     /// Set the execution providers for the model
@@ -111,6 +118,7 @@ impl RerankInitOptionsUserDefined {
 impl From<RerankInitOptions> for RerankInitOptionsUserDefined {
     fn from(options: RerankInitOptions) -> Self {
         RerankInitOptionsUserDefined {
+            environment: options.environment,
             execution_providers: options.execution_providers,
             max_length: options.max_length,
             intra_threads: options.intra_threads,

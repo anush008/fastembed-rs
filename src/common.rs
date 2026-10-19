@@ -2,7 +2,8 @@
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use ndarray::Array2;
 use ort::{
-    execution_providers::ExecutionProviderDispatch,
+    environment::Environment,
+    ep::ExecutionProviderDispatch,
     session::{
         builder::{GraphOptimizationLevel, SessionBuilder},
         SessionInputValue,
@@ -83,6 +84,9 @@ pub enum Error {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("`environment` must be specified if using multiple models per process")]
+    EnvironmentRequired,
 
     #[error("{0}")]
     Other(String),
@@ -397,6 +401,7 @@ fn encodings_to_batch(encodings: &[Encoding]) -> Result<EncodedBatch> {
 }
 
 pub(crate) fn init_session_builder(
+    environment: Option<Environment>,
     execution_providers: Vec<ExecutionProviderDispatch>,
     intra_threads: Option<usize>,
     session_config: Vec<(String, String)>,
@@ -409,13 +414,24 @@ pub(crate) fn init_session_builder(
     #[cfg(feature = "directml")]
     let has_directml = execution_providers
         .iter()
-        .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
+        .any(|ep| ep.name() == <ort::ep::DirectML as ort::ep::ExecutionProvider>::NAME);
     #[cfg(not(feature = "directml"))]
     let has_directml = false;
 
     let builder_error = |err: ort::Error<SessionBuilder>| Error::OrtBuilder(err.to_string());
 
-    let mut builder = ort::session::Session::builder()?
+    let environment = match environment {
+        Some(environment) => environment,
+        None => ort::init().build().map_err(|e| {
+            if e.message().contains("only one environment") {
+                Error::EnvironmentRequired
+            } else {
+                Error::Ort(e)
+            }
+        })?,
+    };
+
+    let mut builder = ort::session::Session::builder(&environment)?
         .with_execution_providers(execution_providers)
         .map_err(builder_error)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -531,6 +547,7 @@ mod tests {
     #[test]
     fn init_session_builder_applies_config_entry() {
         let builder = init_session_builder(
+            None,
             vec![],
             Some(1),
             vec![("session.disable_prepacking".into(), "1".into())],
