@@ -411,7 +411,7 @@ pub(crate) fn init_session_builder(
     #[cfg(feature = "directml")]
     let has_directml = execution_providers
         .iter()
-        .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
+        .any(|ep| ep.name() == <ort::ep::DirectML as ort::ep::ExecutionProvider>::NAME);
     #[cfg(not(feature = "directml"))]
     let has_directml = false;
 
