@@ -5,17 +5,27 @@ use fastembed::{
     get_cache_dir, Bgem3Embedding, Bgem3InitOptions, Bgem3Model, InitOptionsUserDefined,
     TokenizerFiles, UserDefinedBgem3Model,
 };
+use ort::environment::Environment;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 static MODEL_LOCK: Mutex<()> = Mutex::new(());
 const EPS: f32 = 2e-2;
 
+fn environment() -> Environment {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| ort::init().build().unwrap())
+        .clone()
+}
+
 #[test]
 fn test_bgem3_joint_embeddings_match_python() {
     let _guard = MODEL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-    let mut model = Bgem3Embedding::try_new(Bgem3InitOptions::new(Bgem3Model::BGEM3Q))
-        .expect("Failed to initialize BGEM3Q model");
+    let mut model = Bgem3Embedding::try_new(
+        Bgem3InitOptions::new(Bgem3Model::BGEM3Q).with_environment(environment()),
+    )
+    .expect("Failed to initialize BGEM3Q model");
 
     let sentences = vec![
         "fastembed-rs is licensed under Apache  2.0",
@@ -191,9 +201,11 @@ fn test_bgem3_user_defined_model() {
     };
 
     let user_model = UserDefinedBgem3Model::new(onnx_file, tokenizer_files);
-    let mut model =
-        Bgem3Embedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::default())
-            .expect("Failed to build user defined BGEM3 model");
+    let mut model = Bgem3Embedding::try_new_from_user_defined(
+        user_model,
+        InitOptionsUserDefined::default().with_environment(environment()),
+    )
+    .expect("Failed to build user defined BGEM3 model");
 
     let sentences = vec![
         "fastembed-rs is licensed under Apache  2.0",
@@ -223,9 +235,12 @@ fn test_bgem3_user_defined_model() {
 fn test_bgem3_custom_max_length() {
     let _guard = MODEL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     // Verify that the user can override the max length (e.g. to 5 tokens) and it successfully truncates
-    let mut model =
-        Bgem3Embedding::try_new(Bgem3InitOptions::new(Bgem3Model::BGEM3Q).with_max_length(5))
-            .expect("Failed to initialize BGEM3Q model with custom max length");
+    let mut model = Bgem3Embedding::try_new(
+        Bgem3InitOptions::new(Bgem3Model::BGEM3Q)
+            .with_environment(environment())
+            .with_max_length(5),
+    )
+    .expect("Failed to initialize BGEM3Q model with custom max length");
 
     let sentences = vec!["fastembed-rs is licensed under Apache 2.0 and is very cool"];
 

@@ -1,10 +1,11 @@
 #![cfg(feature = "hf-hub")]
 #![allow(clippy::excessive_precision)]
 
-use std::fs;
 use std::path::Path;
+use std::{fs, sync::OnceLock};
 
 use hf_hub::Repo;
+use ort::environment::Environment;
 
 use fastembed::{
     get_cache_dir, Embedding, EmbeddingModel, InitOptionsUserDefined, OnnxSource, Pooling,
@@ -12,6 +13,13 @@ use fastembed::{
     RerankerModelInfo, SparseInitOptions, SparseTextEmbedding, TextEmbedding, TextInitOptions,
     TextRerank, TokenizerFiles, UserDefinedEmbeddingModel, UserDefinedRerankingModel,
 };
+
+fn environment() -> Environment {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| ort::init().build().unwrap())
+        .clone()
+}
 
 /// A small epsilon value for floating point comparisons.
 const EPS: f32 = 2e-2;
@@ -121,7 +129,9 @@ macro_rules! create_embeddings_test {
             TextEmbedding::list_supported_models()
                 .iter()
                 .for_each(|supported_model| {
-                    let mut model: TextEmbedding = TextEmbedding::try_new(TextInitOptions::new(supported_model.model.clone()))
+                    let mut model: TextEmbedding = TextEmbedding::try_new(
+                        TextInitOptions::new(supported_model.model.clone()).with_environment(environment())
+                    )
                     .unwrap();
 
                     let documents = vec![
@@ -190,9 +200,11 @@ fn test_sparse_embeddings() {
                 .all(|f| f != "idf.json")
         })
         .for_each(|supported_model| {
-            let mut model: SparseTextEmbedding =
-                SparseTextEmbedding::try_new(SparseInitOptions::new(supported_model.model.clone()))
-                    .unwrap();
+            let mut model: SparseTextEmbedding = SparseTextEmbedding::try_new(
+                SparseInitOptions::new(supported_model.model.clone())
+                    .with_environment(environment()),
+            )
+            .unwrap();
 
             let documents = vec![
                 "Hello, World!",
@@ -226,7 +238,10 @@ fn test_user_defined_embedding_model() {
     // Constitute the model in order to ensure it's downloaded and cached
     let test_model_info = TextEmbedding::get_model_info(&EmbeddingModel::AllMiniLML6V2).unwrap();
 
-    TextEmbedding::try_new(TextInitOptions::new(test_model_info.model.clone())).unwrap();
+    TextEmbedding::try_new(
+        TextInitOptions::new(test_model_info.model.clone()).with_environment(environment()),
+    )
+    .unwrap();
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
@@ -310,8 +325,10 @@ fn test_rerank() {
     let test_one_model = |supported_model: &RerankerModelInfo| {
         println!("supported_model: {:?}", supported_model);
 
-        let mut result =
-            TextRerank::try_new(RerankInitOptions::new(supported_model.model.clone())).unwrap();
+        let mut result = TextRerank::try_new(
+            RerankInitOptions::new(supported_model.model.clone()).with_environment(environment()),
+        )
+        .unwrap();
 
         let documents = vec![
             "hi",
@@ -388,8 +405,11 @@ fn test_user_defined_reranking_large_model() {
 
     let model = UserDefinedRerankingModel::new(onnx_source, tokenizer_files);
 
-    let mut user_defined_reranker =
-        TextRerank::try_new_from_user_defined(model, Default::default()).unwrap();
+    let mut user_defined_reranker = TextRerank::try_new_from_user_defined(
+        model,
+        RerankInitOptionsUserDefined::default().with_environment(environment()),
+    )
+    .unwrap();
 
     let documents = vec![
         "Hello, World!",
@@ -412,7 +432,10 @@ fn test_user_defined_reranking_model() {
     let test_model_info: fastembed::RerankerModelInfo =
         TextRerank::get_model_info(&RerankerModel::JINARerankerV1TurboEn);
 
-    TextRerank::try_new(RerankInitOptions::new(test_model_info.model)).unwrap();
+    TextRerank::try_new(
+        RerankInitOptions::new(test_model_info.model).with_environment(environment()),
+    )
+    .unwrap();
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
@@ -470,7 +493,7 @@ fn test_user_defined_reranking_model() {
     // Try creating a TextEmbedding instance from the user-defined model
     let mut user_defined_reranker = TextRerank::try_new_from_user_defined(
         user_defined_model,
-        RerankInitOptionsUserDefined::default(),
+        RerankInitOptionsUserDefined::default().with_environment(environment()),
     )
     .unwrap();
 
@@ -505,7 +528,9 @@ fn get_sample_text() -> String {
 #[test]
 fn test_batch_size_does_not_change_output() {
     let mut model = TextEmbedding::try_new(
-        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2).with_max_length(384),
+        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            .with_environment(environment())
+            .with_max_length(384),
     )
     .expect("Create model successfully");
 
@@ -537,7 +562,9 @@ fn test_batch_size_does_not_change_output() {
 #[test]
 fn test_bgesmallen1point5_match_python_counterpart() {
     let mut model = TextEmbedding::try_new(
-        TextInitOptions::new(EmbeddingModel::BGESmallENV15).with_max_length(384),
+        TextInitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_environment(environment())
+            .with_max_length(384),
     )
     .expect("Create model successfully");
 
@@ -576,7 +603,9 @@ fn test_bgesmallen1point5_match_python_counterpart() {
 #[test]
 fn test_allminilml6v2_match_python_counterpart() {
     let mut model = TextEmbedding::try_new(
-        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2).with_max_length(384),
+        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            .with_environment(environment())
+            .with_max_length(384),
     )
     .expect("Create model successfully");
 
@@ -616,7 +645,10 @@ fn test_allminilml6v2_match_python_counterpart() {
 #[test]
 fn clip_vit_b32_deterministic_across_calls() {
     let q = "red car";
-    let mut fe = TextEmbedding::try_new(TextInitOptions::new(EmbeddingModel::ClipVitB32)).unwrap();
+    let mut fe = TextEmbedding::try_new(
+        TextInitOptions::new(EmbeddingModel::ClipVitB32).with_environment(environment()),
+    )
+    .unwrap();
     let first = fe.embed(vec![q], None).unwrap()[0].clone();
     for i in 1..100 {
         let vecs = fe.embed(vec![q], None).unwrap();
