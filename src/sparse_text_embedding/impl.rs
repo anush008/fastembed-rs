@@ -34,6 +34,7 @@ impl SparseTextEmbedding {
             model_name,
             cache_dir,
             show_download_progress,
+            environment,
             execution_providers,
             intra_threads,
             session_config,
@@ -67,8 +68,13 @@ impl SparseTextEmbedding {
             }
         }
 
-        let session = init_session_builder(execution_providers, intra_threads, session_config)?
-            .commit_from_file(model_file_reference)?;
+        let session = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?
+        .commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         // Models declaring an `idf.json` embed queries from a lookup table instead of

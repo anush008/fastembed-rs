@@ -31,6 +31,7 @@ impl ImageEmbedding {
     pub fn try_new(options: ImageInitOptions) -> Result<Self> {
         let ImageInitOptions {
             model_name,
+            environment,
             execution_providers,
             cache_dir,
             show_download_progress,
@@ -62,8 +63,13 @@ impl ImageEmbedding {
                     source: Box::new(e),
                 })?;
 
-        let session = init_session_builder(execution_providers, intra_threads, session_config)?
-            .commit_from_file(model_file_reference)?;
+        let session = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?
+        .commit_from_file(model_file_reference)?;
 
         Ok(Self::new(preprocessor, session))
     }
@@ -76,6 +82,7 @@ impl ImageEmbedding {
         options: ImageInitOptionsUserDefined,
     ) -> Result<Self> {
         let ImageInitOptionsUserDefined {
+            environment,
             execution_providers,
             intra_threads,
             session_config,
@@ -83,8 +90,13 @@ impl ImageEmbedding {
 
         let preprocessor = ImagePreprocessor::new(Compose::from_bytes(model.preprocessor_file)?);
 
-        let session = init_session_builder(execution_providers, intra_threads, session_config)?
-            .commit_from_memory(&model.onnx_file)?;
+        let session = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?
+        .commit_from_memory(&model.onnx_file)?;
 
         Ok(Self::new(preprocessor, session))
     }

@@ -48,6 +48,7 @@ impl TextRerank {
         let RerankInitOptions {
             max_length,
             model_name,
+            environment,
             execution_providers,
             cache_dir,
             show_download_progress,
@@ -74,8 +75,13 @@ impl TextRerank {
                 })?;
         }
 
-        let session = init_session_builder(execution_providers, intra_threads, session_config)?
-            .commit_from_file(model_file_reference)?;
+        let session = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?
+        .commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(tokenizer, session))
@@ -89,6 +95,7 @@ impl TextRerank {
         options: RerankInitOptionsUserDefined,
     ) -> Result<Self> {
         let RerankInitOptionsUserDefined {
+            environment,
             execution_providers,
             max_length,
             intra_threads,
@@ -97,8 +104,12 @@ impl TextRerank {
             session_config,
         } = options;
 
-        let mut session_builder =
-            init_session_builder(execution_providers, intra_threads, session_config)?;
+        let mut session_builder = init_session_builder(
+            environment,
+            execution_providers,
+            intra_threads,
+            session_config,
+        )?;
         let builder_error = |err: ort::Error<ort::session::builder::SessionBuilder>| {
             Error::OrtBuilder(err.to_string())
         };

@@ -2,7 +2,8 @@
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use ndarray::Array2;
 use ort::{
-    execution_providers::ExecutionProviderDispatch,
+    environment::Environment,
+    ep::ExecutionProviderDispatch,
     session::{
         builder::{GraphOptimizationLevel, SessionBuilder},
         SessionInputValue,
@@ -397,6 +398,7 @@ fn encodings_to_batch(encodings: &[Encoding]) -> Result<EncodedBatch> {
 }
 
 pub(crate) fn init_session_builder(
+    environment: Option<Environment>,
     execution_providers: Vec<ExecutionProviderDispatch>,
     intra_threads: Option<usize>,
     session_config: Vec<(String, String)>,
@@ -415,7 +417,12 @@ pub(crate) fn init_session_builder(
 
     let builder_error = |err: ort::Error<SessionBuilder>| Error::OrtBuilder(err.to_string());
 
-    let mut builder = ort::session::Session::builder()?
+    let environment = match environment {
+        Some(environment) => environment,
+        None => ort::init().build()?,
+    };
+
+    let mut builder = ort::session::Session::builder(&environment)?
         .with_execution_providers(execution_providers)
         .map_err(builder_error)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -531,6 +538,7 @@ mod tests {
     #[test]
     fn init_session_builder_applies_config_entry() {
         let builder = init_session_builder(
+            None,
             vec![],
             Some(1),
             vec![("session.disable_prepacking".into(), "1".into())],
