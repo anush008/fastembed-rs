@@ -299,7 +299,7 @@ fn test_user_defined_embedding_model() {
     // Try creating a TextEmbedding instance from the user-defined model
     let mut user_defined_text_embedding = TextEmbedding::try_new_from_user_defined(
         user_defined_model,
-        InitOptionsUserDefined::default(),
+        InitOptionsUserDefined::default().with_environment(environment()),
     )
     .unwrap();
 
