@@ -85,6 +85,9 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("`environment` must be specified if using multiple models per process")]
+    EnvironmentRequired,
+
     #[error("{0}")]
     Other(String),
 }
@@ -419,7 +422,13 @@ pub(crate) fn init_session_builder(
 
     let environment = match environment {
         Some(environment) => environment,
-        None => ort::init().build()?,
+        None => ort::init().build().map_err(|e| {
+            if e.message().contains("only one environment") {
+                Error::EnvironmentRequired
+            } else {
+                Error::Ort(e)
+            }
+        })?,
     };
 
     let mut builder = ort::session::Session::builder(&environment)?
