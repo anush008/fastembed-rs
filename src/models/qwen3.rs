@@ -838,7 +838,7 @@ impl Qwen3Attention {
         }
 
         // softmax over last dim
-        let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
 
         // attn_output = attn @ v -> [B,Nh,T,D]
         let out = attn.matmul(&v)?;
