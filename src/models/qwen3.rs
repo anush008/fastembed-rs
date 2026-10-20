@@ -894,15 +894,11 @@ impl Qwen3Attention {
             AttentionMask::None | AttentionMask::Additive(_) => None,
         };
         if let Some((fused_mask, causal)) = fused {
-            let out = candle_nn::ops::sdpa(
-                &q.contiguous()?,
-                &k.contiguous()?,
-                &v.contiguous()?,
-                fused_mask.as_ref(),
-                causal,
-                self.scaling,
-                1.0,
-            )?;
+            // q, k and v go in as the transposed views they are: the fused kernel reads them
+            // through their batch, head and sequence strides (the head dim stays contiguous), so
+            // no copy of any of them is made.
+            let out =
+                candle_nn::ops::sdpa(&q, &k, &v, fused_mask.as_ref(), causal, self.scaling, 1.0)?;
             let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * d))?;
             return out.apply(&self.o_proj);
         }
