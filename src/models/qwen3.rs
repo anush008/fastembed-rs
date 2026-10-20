@@ -152,6 +152,31 @@ fn build_attention_mask_4d(attention_mask_2d: &Tensor) -> Result<Tensor> {
     causal_broadcast.add(&pad_additive)
 }
 
+/// The mask `build_attention_mask_4d` builds, `[B, 1, T, T]` (causal plus left padding), in `dtype`,
+/// for the fused attention kernel, which reads its mask in the model's dtype. It is one broadcast
+/// add of a `[T, T]` causal part and a `[B, T]` padding part, so no other `[B, 1, T, T]` tensor is
+/// built on the way.
+fn build_attention_mask_fused(attention_mask_2d: &Tensor, dtype: DType) -> Result<Tensor> {
+    let (batch_size, seq_len) = attention_mask_2d.dims2()?;
+    let device = attention_mask_2d.device();
+    let mask_value = -1e4f64;
+    let positions = Tensor::arange(0f32, seq_len as f32, device)?;
+    let causal = positions
+        .reshape((1, seq_len))?
+        .broadcast_gt(&positions.reshape((seq_len, 1))?)?
+        .to_dtype(DType::F32)?
+        .affine(mask_value, 0.0)?
+        .to_dtype(dtype)?
+        .reshape((1, 1, seq_len, seq_len))?;
+    // (1 - mask) * mask_value: 0 on a token, mask_value on padding.
+    let padding = attention_mask_2d
+        .to_dtype(DType::F32)?
+        .affine(-mask_value, mask_value)?
+        .to_dtype(dtype)?
+        .reshape((batch_size, 1, 1, seq_len))?;
+    causal.broadcast_add(&padding)
+}
+
 fn l2_normalize(xs: &Tensor) -> Result<Tensor> {
     let sum_sq = xs.sqr()?.sum_keepdim(1)?;
     let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?
@@ -716,14 +741,16 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     x.reshape((b, n_kv * n_rep, t, d))
 }
 
-/// How attention is masked: by an additive mask, not at all, or causally over a batch with no
-/// padding. The causal case runs candle's fused attention kernel on Metal, which never builds the
-/// `[B, heads, T, T]` table.
+/// How attention is masked: by an additive mask, not at all, causally over a batch with no
+/// padding, or by a padded batch's `[B, 1, T, T]` mask in the model's dtype
+/// (`build_attention_mask_fused`). The last two run candle's fused attention kernel on Metal,
+/// which never builds the `[B, heads, T, T]` table.
 #[derive(Clone, Copy)]
 pub(crate) enum AttentionMask<'a> {
     None,
     Additive(&'a Tensor),
     Causal,
+    Fused(&'a Tensor),
 }
 
 // - q_norm/k_norm on head_dim after reshape
@@ -801,8 +828,8 @@ impl Qwen3Attention {
     /// hidden_states: [B,T,H]
     /// position_embeddings: (cos,sin) both [B,T,D]
     /// attention_mask: additive mask [B,1,T,T] (0 or -inf)
-    /// `AttentionMask::Causal` needs a Metal device: `Qwen3Model::forward_causal` passes it only
-    /// there.
+    /// `AttentionMask::Causal` and `AttentionMask::Fused` need a Metal device:
+    /// `Qwen3Model::forward_causal` and `Qwen3Model::forward_padded` pass them only there.
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
@@ -834,14 +861,22 @@ impl Qwen3Attention {
         let (cos, sin) = position_embeddings;
         let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin)?;
 
-        if let AttentionMask::Causal = mask {
-            // The fused kernel takes k and v with their own heads (GQA) and masks causally itself.
+        // The fused kernel takes k and v with their own heads (GQA). It masks causally itself, or
+        // reads a given mask through its strides, so the heads share one `[B, 1, T, T]` copy.
+        let fused = match mask {
+            AttentionMask::Causal => Some((None, true)),
+            AttentionMask::Fused(mask) => {
+                Some((Some(mask.broadcast_as((b, self.num_heads, t, t))?), false))
+            }
+            AttentionMask::None | AttentionMask::Additive(_) => None,
+        };
+        if let Some((fused_mask, causal)) = fused {
             let out = candle_nn::ops::sdpa(
                 &q.contiguous()?,
                 &k.contiguous()?,
                 &v.contiguous()?,
-                None,
-                true,
+                fused_mask.as_ref(),
+                causal,
                 self.scaling,
                 1.0,
             )?;
@@ -850,7 +885,7 @@ impl Qwen3Attention {
         }
         let attention_mask = match mask {
             AttentionMask::Additive(mask) => Some(mask),
-            AttentionMask::None | AttentionMask::Causal => None,
+            AttentionMask::None | AttentionMask::Causal | AttentionMask::Fused(_) => None,
         };
 
         // GQA expand
@@ -1039,6 +1074,24 @@ impl Qwen3Model {
         self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None)
     }
 
+    /// `forward` over a padded batch, `attention_mask_2d` being `[B, T]` (1 a token, 0 padding).
+    /// On Metal this runs the fused attention kernel with the padding mask, which never builds the
+    /// `[B, heads, T, T]` table; on any other device it is `forward` with the mask
+    /// `build_attention_mask_4d` builds.
+    pub(crate) fn forward_padded(
+        &self,
+        input_ids: &Tensor,
+        attention_mask_2d: &Tensor,
+    ) -> Result<Tensor> {
+        let hs = self.embed_tokens(input_ids)?;
+        if self.device.is_metal() {
+            let mask = build_attention_mask_fused(attention_mask_2d, hs.dtype())?;
+            return self.forward_embeds_masked(&hs, AttentionMask::Fused(&mask), None, None);
+        }
+        let mask = build_attention_mask_4d(attention_mask_2d)?;
+        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None)
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -1157,12 +1210,12 @@ impl Qwen3TextEmbedding {
         let input_ids = Tensor::from_vec(input_ids_vec, (batch_size, seq_len), device)?;
 
         // Forward pass -> [B, T, H]. With no padding the mask is purely causal, which the fused
-        // kernel applies itself, so neither the mask nor the attention table is built.
+        // kernel applies itself, so neither the mask nor the attention table is built. With
+        // padding the kernel reads one `[B, 1, T, T]` mask and still builds no table.
         let hidden = if padded {
             let attention_mask_2d =
                 Tensor::from_vec(attention_mask_vec, (batch_size, seq_len), device)?;
-            let attention_mask_4d = build_attention_mask_4d(&attention_mask_2d)?;
-            self.model.forward(&input_ids, Some(&attention_mask_4d))?
+            self.model.forward_padded(&input_ids, &attention_mask_2d)?
         } else {
             self.model.forward_causal(&input_ids)?
         };
@@ -1486,6 +1539,28 @@ mod tests {
         expand_image_token_placeholders, find_token_spans, parse_config_and_weight_prefix,
         round_ties_to_even,
     };
+
+    #[test]
+    fn fused_mask_matches_the_additive_mask() {
+        use super::{build_attention_mask_4d, build_attention_mask_fused};
+        use candle_core::{DType, Device, Tensor};
+
+        let device = Device::Cpu;
+        // Two left-padded rows: two pads, and none.
+        let mask_2d = Tensor::from_vec(
+            vec![0f32, 0., 1., 1., 1., 1., 1., 1., 1., 1.],
+            (2, 5),
+            &device,
+        )
+        .unwrap();
+        let additive = build_attention_mask_4d(&mask_2d).unwrap();
+        let fused = build_attention_mask_fused(&mask_2d, DType::F32).unwrap();
+        assert_eq!(fused.dims(), additive.dims());
+        assert_eq!(
+            fused.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            additive.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
 
     #[test]
     fn mrope_matches_plain_rope_for_identical_positions() {
