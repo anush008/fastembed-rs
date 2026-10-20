@@ -716,6 +716,16 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     x.reshape((b, n_kv * n_rep, t, d))
 }
 
+/// How attention is masked: by an additive mask, not at all, or causally over a batch with no
+/// padding. The causal case runs candle's fused attention kernel on Metal, which never builds the
+/// `[B, heads, T, T]` table.
+#[derive(Clone, Copy)]
+pub(crate) enum AttentionMask<'a> {
+    None,
+    Additive(&'a Tensor),
+    Causal,
+}
+
 // - q_norm/k_norm on head_dim after reshape
 // - RoPE on q,k
 // - repeat_kv for key/value (GQA)
@@ -791,11 +801,13 @@ impl Qwen3Attention {
     /// hidden_states: [B,T,H]
     /// position_embeddings: (cos,sin) both [B,T,D]
     /// attention_mask: additive mask [B,1,T,T] (0 or -inf)
-    pub fn forward(
+    /// `AttentionMask::Causal` needs a Metal device: `Qwen3Model::forward_causal` passes it only
+    /// there.
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         position_embeddings: (&Tensor, &Tensor),
-        attention_mask: Option<&Tensor>,
+        mask: AttentionMask<'_>,
     ) -> Result<Tensor> {
         let (b, t, _h) = hidden_states.dims3()?;
         let d = self.head_dim;
@@ -821,6 +833,25 @@ impl Qwen3Attention {
 
         let (cos, sin) = position_embeddings;
         let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin)?;
+
+        if let AttentionMask::Causal = mask {
+            // The fused kernel takes k and v with their own heads (GQA) and masks causally itself.
+            let out = candle_nn::ops::sdpa(
+                &q.contiguous()?,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                None,
+                true,
+                self.scaling,
+                1.0,
+            )?;
+            let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * d))?;
+            return out.apply(&self.o_proj);
+        }
+        let attention_mask = match mask {
+            AttentionMask::Additive(mask) => Some(mask),
+            AttentionMask::None | AttentionMask::Causal => None,
+        };
 
         // GQA expand
         let k = repeat_kv(&k, self.num_kv_groups)?; // [B,Nh,T,D]
@@ -873,18 +904,16 @@ impl Qwen3DecoderLayer {
         })
     }
 
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
-        attention_mask: Option<&Tensor>,
+        mask: AttentionMask<'_>,
         position_embeddings: (&Tensor, &Tensor),
     ) -> Result<Tensor> {
         // Pre-norm
         let residual = hidden_states.clone();
         let hs = hidden_states.apply(&self.input_layernorm)?;
-        let hs = self
-            .self_attn
-            .forward(&hs, position_embeddings, attention_mask)?;
+        let hs = self.self_attn.forward(&hs, position_embeddings, mask)?;
         let hs = (residual + hs)?;
 
         // MLP
@@ -939,6 +968,17 @@ impl Qwen3Model {
         deepstack_additions: Option<&[Tensor]>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let mask = attention_mask_4d.map_or(AttentionMask::None, AttentionMask::Additive);
+        self.forward_embeds_masked(inputs_embeds, mask, deepstack_additions, position_ids)
+    }
+
+    fn forward_embeds_masked(
+        &self,
+        inputs_embeds: &Tensor,
+        mask: AttentionMask<'_>,
+        deepstack_additions: Option<&[Tensor]>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, t, _) = inputs_embeds.dims3()?;
         let mut hs = inputs_embeds.clone();
 
@@ -961,7 +1001,7 @@ impl Qwen3Model {
 
         // layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hs = layer.forward(&hs, attention_mask_4d, (&cos, &sin))?;
+            hs = layer.forward(&hs, mask, (&cos, &sin))?;
             if let Some(additions) = deepstack_additions {
                 if let Some(visual_add) = additions.get(layer_idx) {
                     hs = hs.add(visual_add)?;
@@ -983,6 +1023,20 @@ impl Qwen3Model {
     ) -> Result<Tensor> {
         let hs = self.embed_tokens(input_ids)?;
         self.forward_with_inputs_embeds(&hs, attention_mask_4d, None, None)
+    }
+
+    /// `forward` with causal attention over a batch that has no padding. On Metal this runs the
+    /// fused attention kernel, which never builds the `[B, heads, T, T]` table or the mask; on any
+    /// other device it builds the same causal mask `forward` would get for an unpadded batch.
+    pub(crate) fn forward_causal(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let hs = self.embed_tokens(input_ids)?;
+        if self.device.is_metal() {
+            return self.forward_embeds_masked(&hs, AttentionMask::Causal, None, None);
+        }
+        let (b, t) = input_ids.dims2()?;
+        let no_padding = Tensor::ones((b, t), DType::F32, &self.device)?;
+        let mask = build_attention_mask_4d(&no_padding)?;
+        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None)
     }
 
     pub fn config(&self) -> &Config {
@@ -1099,14 +1153,19 @@ impl Qwen3TextEmbedding {
         }
 
         let device = self.model.device();
+        let padded = attention_mask_vec.contains(&0.0);
         let input_ids = Tensor::from_vec(input_ids_vec, (batch_size, seq_len), device)?;
-        let attention_mask_2d =
-            Tensor::from_vec(attention_mask_vec, (batch_size, seq_len), device)?;
 
-        let attention_mask_4d = build_attention_mask_4d(&attention_mask_2d)?;
-
-        // Forward pass -> [B, T, H]
-        let hidden = self.model.forward(&input_ids, Some(&attention_mask_4d))?;
+        // Forward pass -> [B, T, H]. With no padding the mask is purely causal, which the fused
+        // kernel applies itself, so neither the mask nor the attention table is built.
+        let hidden = if padded {
+            let attention_mask_2d =
+                Tensor::from_vec(attention_mask_vec, (batch_size, seq_len), device)?;
+            let attention_mask_4d = build_attention_mask_4d(&attention_mask_2d)?;
+            self.model.forward(&input_ids, Some(&attention_mask_4d))?
+        } else {
+            self.model.forward_causal(&input_ids)?
+        };
 
         // Last token pooling: with left padding, the last position is always the real last token
         let pooled = hidden.i((.., seq_len - 1))?; // [B, H]
