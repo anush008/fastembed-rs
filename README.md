@@ -303,6 +303,25 @@ println!("Image embeddings: {}", image_embeddings.len());
 println!("Text embeddings: {}", text_embeddings.len());
 ```
 
+Quantized GGUF files (for example from `Qwen/Qwen3-Embedding-4B-GGUF` or `Qwen/Qwen3-Embedding-8B-GGUF`) load with the same `qwen3` feature. The weights stay quantized in memory, and the tokenizer comes from the original model's repo:
+
+```rust
+use candle_core::Device;
+use fastembed::Qwen3TextEmbedding;
+
+let device = Device::Cpu;
+let model = Qwen3TextEmbedding::from_hf_gguf(
+    "Qwen/Qwen3-Embedding-4B-GGUF",
+    "Qwen3-Embedding-4B-Q8_0.gguf",
+    "Qwen/Qwen3-Embedding-4B",
+    &device,
+    512,
+)?;
+
+let embeddings = model.embed(&["query: ...", "passage: ..."])?;
+println!("Embeddings length: {}", embeddings.len());
+```
+
 ### Nomic Embed Text v2 MoE
 
 The [nomic-embed-text-v2-moe](https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe) model is available behind the `nomic-v2-moe` feature flag (candle backend). First general-purpose MoE embedding model with 100+ language support.
