@@ -24,9 +24,19 @@ fn environment() -> Environment {
 /// A small epsilon value for floating point comparisons.
 const EPS: f32 = 2e-2;
 
-/// The int4 matmul kernel in ONNX Runtime picks a different code path per CPU,
-/// so the embedding sums of the 4-bit models move by up to about 0.05 between CI runners.
+/// int4 kernels give different sums on different CPUs.
 const EPS_Q4: f32 = 1e-1;
+
+/// `FASTEMBED_TEST_SHARD=<index>/<count>` runs every `count`-th model, starting at `index`.
+fn in_shard(position: usize) -> bool {
+    match std::env::var("FASTEMBED_TEST_SHARD") {
+        Ok(shard) if !shard.is_empty() => {
+            let (index, count) = shard.split_once('/').expect("<index>/<count>");
+            position % count.parse::<usize>().unwrap() == index.parse::<usize>().unwrap()
+        }
+        _ => true,
+    }
+}
 
 /// Precalculated embeddings for the supported models using #99
 /// (4f09b6842ce1fcfaf6362678afcad9a176e05304).
@@ -135,9 +145,14 @@ macro_rules! create_embeddings_test {
     ) => {
         #[test]
         fn $name() {
-            TextEmbedding::list_supported_models()
+            let mut supported_models = TextEmbedding::list_supported_models();
+            // HashMap order differs per process, shards need a fixed one.
+            supported_models.sort_by_key(|m| m.model.to_string());
+            supported_models
                 .iter()
-                .for_each(|supported_model| {
+                .enumerate()
+                .filter(|(position, _)| in_shard(*position))
+                .for_each(|(_, supported_model)| {
                     let mut model: TextEmbedding = TextEmbedding::try_new(
                         TextInitOptions::new(supported_model.model.clone()).with_environment(environment())
                     )
@@ -620,9 +635,8 @@ fn test_allminilml6v2_match_python_counterpart() {
 
     let text = get_sample_text();
 
-    // baseline is generated in python using Qdrant/all-MiniLM-L6-v2-onnx model.onnx
-    // Tokenized with the repo's tokenizer.json, truncated to 256 tokens, the model's
-    // `model_max_length`. Mean pooled over the attention mask and normalized.
+    // baseline is generated in python using Qdrant/all-MiniLM-L6-v2-onnx and its tokenizer.json,
+    // truncated to 256 tokens, mean pooled and normalized.
     // We only take 10 items to keep the test file small.
     let baseline: Vec<f32> = vec![
         2.613_225_4e-2,

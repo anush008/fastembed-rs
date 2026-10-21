@@ -1,8 +1,6 @@
 name: "Cargo Tests"
 on:
   pull_request:
-  push:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,21 +50,20 @@ jobs:
         suite:
           - { name: bgem3, filter: "--test bgem3 --test bgem3_comparison" }
           - { name: if-splade, filter: "--test if_splade" }
-          - { name: text,  filter: "--test text-embeddings" }
+          - { name: text,  filter: "--test text-embeddings -- --skip test_batch_size_default" }
+          - { name: text-models-0, filter: "--test text-embeddings test_batch_size_default", shard: "0/4" }
+          - { name: text-models-1, filter: "--test text-embeddings test_batch_size_default", shard: "1/4" }
+          - { name: text-models-2, filter: "--test text-embeddings test_batch_size_default", shard: "2/4" }
+          - { name: text-models-3, filter: "--test text-embeddings test_batch_size_default", shard: "3/4" }
           - { name: image, filter: "--test image-embeddings" }
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
-        with:
-          tool-cache: false
-
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: test-${{ matrix.suite.name }}
+          shared-key: test
 
       - name: Restore ONNX Build
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -75,6 +72,8 @@ jobs:
           path: onnxruntime/build/Linux/Release/
 
       - name: Cargo Test
+        env:
+          FASTEMBED_TEST_SHARD: ${{ matrix.suite.shard }}
         run: ORT_LIB_LOCATION="$(pwd)/onnxruntime/build/Linux/Release" cargo test --release --no-default-features --features hf-hub-native-tls,image-models ${{ matrix.suite.filter }}
 
   lint:
