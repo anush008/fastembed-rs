@@ -11,14 +11,30 @@ const REPO_8B: &str = "Qwen/Qwen3-Embedding-8B";
 const REPO_VL_2B: &str = "Qwen/Qwen3-VL-Embedding-2B";
 const MAX_LENGTH: usize = 512;
 
+/// Held around every model download in this file. The tests run in parallel and several fetch
+/// the same repo; hf-hub 0.5 waits only about 5 seconds for another download's file lock and
+/// then fails with `LockAcquisition`, so on a cold cache all but the first would fail.
+static HF_DOWNLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `f` with the download lock held. A test that panicked while holding it leaves nothing half
+/// done that the next load could see, so a poisoned lock is taken as it is.
+fn one_download_at_a_time<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = HF_DOWNLOAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f()
+}
+
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 fn run_embed_test(repo_id: &str) {
     let device = Device::Cpu;
-    let model =
-        Qwen3TextEmbedding::from_hf(repo_id, &device, DType::F32, MAX_LENGTH).expect("load model");
+    let model = one_download_at_a_time(|| {
+        Qwen3TextEmbedding::from_hf(repo_id, &device, DType::F32, MAX_LENGTH)
+    })
+    .expect("load model");
 
     let queries = ["What is the capital of China?", "Explain gravity"];
     let documents = [
@@ -64,7 +80,8 @@ fn qwen3_06b_embed() {
 fn qwen3_06b_reference_scores() {
     let device = Device::Cpu;
     let model =
-        Qwen3TextEmbedding::from_hf(REPO_06B, &device, DType::F32, 8192).expect("load model");
+        one_download_at_a_time(|| Qwen3TextEmbedding::from_hf(REPO_06B, &device, DType::F32, 8192))
+            .expect("load model");
 
     let task = "Given a web search query, retrieve relevant passages that answer the query";
     let queries = [
@@ -125,16 +142,20 @@ fn qwen3_06b_gguf_matches_python_on_metal() {
 /// transformers loading the same file in f32, with last-token pooling and L2 normalization. Each
 /// full vector is also compared with the f32 safetensors model.
 fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolerance: f32) {
-    let model = Qwen3TextEmbedding::from_hf_gguf(
-        "Qwen/Qwen3-Embedding-0.6B-GGUF",
-        "Qwen3-Embedding-0.6B-Q8_0.gguf",
-        REPO_06B,
-        device,
-        8192,
-    )
+    let model = one_download_at_a_time(|| {
+        Qwen3TextEmbedding::from_hf_gguf(
+            "Qwen/Qwen3-Embedding-0.6B-GGUF",
+            "Qwen3-Embedding-0.6B-Q8_0.gguf",
+            REPO_06B,
+            device,
+            8192,
+        )
+    })
     .expect("load model");
-    let reference =
-        Qwen3TextEmbedding::from_hf(REPO_06B, &Device::Cpu, DType::F32, 8192).expect("load model");
+    let reference = one_download_at_a_time(|| {
+        Qwen3TextEmbedding::from_hf(REPO_06B, &Device::Cpu, DType::F32, 8192)
+    })
+    .expect("load model");
 
     let task = "Given a web search query, retrieve relevant passages that answer the query";
     let texts = [
@@ -261,7 +282,9 @@ fn qwen3_vl_2b_image_embed() {
     }
 
     let device = Device::Cpu;
-    let model = Qwen3VLEmbedding::from_hf(REPO_VL_2B, &device, DType::F32, 2048).expect("load");
+    let model =
+        one_download_at_a_time(|| Qwen3VLEmbedding::from_hf(REPO_VL_2B, &device, DType::F32, 2048))
+            .expect("load");
 
     let images = ["tests/assets/image_0.png", "tests/assets/image_1.png"];
     let embeddings = model.embed_images(&images).expect("embed images");
