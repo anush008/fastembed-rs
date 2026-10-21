@@ -109,6 +109,128 @@ fn qwen3_06b_reference_scores() {
     }
 }
 
+/// The official Q8_0 GGUF of Qwen3-Embedding-0.6B on the CPU against Python. candle's CPU
+/// quantized matmul rounds each activation row to 8-bit blocks before the dot products (as
+/// llama.cpp's CPU path does), which moves single values by up to about 7e-3 and a vector's sum
+/// by up to about 4e-2.
+#[test]
+fn qwen3_06b_gguf_matches_python() {
+    check_06b_gguf_against_python(&Device::Cpu, 1e-2, 6e-2);
+}
+
+/// The same check on Metal, whose quantized matmul keeps the activations in f32: values agree with
+/// Python to about 1e-4.
+#[cfg(feature = "metal")]
+#[test]
+fn qwen3_06b_gguf_matches_python_on_metal() {
+    check_06b_gguf_against_python(&Device::new_metal(0).expect("metal"), 5e-4, 5e-3);
+}
+
+/// The official Q8_0 GGUF of Qwen3-Embedding-0.6B, each text embedded alone, against reference
+/// values from Python: transformers loading the same GGUF file (it dequantizes the weights to
+/// f32), the original model's tokenizer, last-token pooling and L2 normalization, f32 on the CPU.
+fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolerance: f32) {
+    use fastembed::GgufMatmul;
+
+    let model = Qwen3TextEmbedding::from_hf_gguf(
+        "Qwen/Qwen3-Embedding-0.6B-GGUF",
+        "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        REPO_06B,
+        device,
+        8192,
+        GgufMatmul::default(),
+    )
+    .expect("load model");
+
+    let task = "Given a web search query, retrieve relevant passages that answer the query";
+    let texts = [
+        format!("Instruct: {task}\nQuery:What is the capital of China?"),
+        format!("Instruct: {task}\nQuery:Explain gravity"),
+        "The capital of China is Beijing.".to_string(),
+        "Gravity is a force that attracts two bodies towards each other. \
+         It gives weight to physical objects and is responsible for the movement of planets around the sun."
+            .to_string(),
+    ];
+    let expected_first8_from_python = [
+        [
+            -0.05209115_f32,
+            -0.03108022,
+            -0.00009076,
+            -0.02695240,
+            -0.03562966,
+            -0.05211519,
+            0.04888062,
+            0.02313953,
+        ],
+        [
+            -0.01199439,
+            -0.03724955,
+            -0.00091878,
+            0.04037875,
+            0.02750070,
+            0.05807723,
+            0.00280154,
+            -0.02796479,
+        ],
+        [
+            -0.04752747,
+            -0.02216994,
+            0.00374661,
+            -0.03286595,
+            -0.05911085,
+            -0.00602503,
+            0.01416930,
+            0.05129674,
+        ],
+        [
+            -0.05318979,
+            -0.01622364,
+            -0.00109899,
+            0.00721747,
+            0.03609022,
+            0.03295489,
+            0.01974075,
+            -0.00920590,
+        ],
+    ];
+    let expected_sum_from_python = [-0.4117671_f32, 0.8972959, -0.3112229, 1.5693551];
+
+    let mut embeddings = Vec::new();
+    for text in &texts {
+        embeddings.extend(model.embed(std::slice::from_ref(text)).expect("embed"));
+    }
+    for (idx, emb) in embeddings.iter().enumerate() {
+        assert_eq!(emb.len(), model.config().hidden_size);
+        let sum = emb.iter().sum::<f32>();
+        assert!(
+            (sum - expected_sum_from_python[idx]).abs() < sum_tolerance,
+            "text {idx} sum mismatch: got {sum}, expected {}",
+            expected_sum_from_python[idx]
+        );
+        for dim in 0..8 {
+            let got = emb[dim];
+            let expected = expected_first8_from_python[idx][dim];
+            assert!(
+                (got - expected).abs() < dim_tolerance,
+                "text {idx} dim {dim} mismatch: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    // The model card's scores for these texts, as `qwen3_06b_reference_scores` checks them.
+    let expected = [[0.7646f32, 0.1414f32], [0.1355f32, 0.6000f32]];
+    for i in 0..2 {
+        for j in 0..2 {
+            let score = cosine_sim(&embeddings[i], &embeddings[2 + j]);
+            assert!(
+                (score - expected[i][j]).abs() < 0.05,
+                "score[{i}][{j}]: got {score:.4}, expected {:.4}",
+                expected[i][j]
+            );
+        }
+    }
+}
+
 #[test]
 fn qwen3_4b_embed() {
     if std::env::var("RUN_QWEN3_4B").is_err() {
