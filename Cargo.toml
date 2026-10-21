@@ -41,6 +41,9 @@ serde = { version = "1", features = ["derive"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 candle-nn = { version = "0.11.0", optional = true }
 candle-core = { version = "0.11.0", optional = true }
+# The metal feature compiles candle-metal-kernels already (through candle-core); the qwen3
+# q/k norm-and-rope kernel names its encoder and pipeline types directly.
+candle-metal-kernels = { version = "0.11.0", optional = true }
 
 intel-mkl-src = { version = "0.8.1", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
@@ -67,7 +70,7 @@ directml = ["ort/directml"]
 webgpu = ["ort/webgpu"]
 cuda = ["qwen3", "nomic-v2-moe", "candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["qwen3", "nomic-v2-moe", "candle-core/cudnn", "candle-nn/cudnn", "cuda"]
-metal = ["qwen3", "nomic-v2-moe", "candle-core/metal", "candle-nn/metal"]
+metal = ["qwen3", "nomic-v2-moe", "candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
 
 # This feature does not change any code, but is used to limit tests if
 # the user does not have `optimum-cli` or even python installed.

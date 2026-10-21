@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
 
+use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
+use crate::models::qwen3_sdpa_bthd::sdpa_bthd;
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
 fn default_true() -> bool {
@@ -544,8 +546,22 @@ impl Module for Projection {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Projection::Dense(linear) => linear.forward(xs),
-            Projection::Quantized(matrix, GgufMatmul::Quantized) => matrix.forward(xs),
-            Projection::Quantized(matrix, GgufMatmul::DequantizeF16) => matrix.forward_via_f16(xs),
+            Projection::Quantized(matrix, matmul) => {
+                // candle's quantized matmul on Metal reads a contiguous input from its buffer's
+                // start and ignores a view's offset, so a view (the last position's rows under
+                // `Rows::Last`) is copied first.
+                let copied;
+                let xs = if xs.is_contiguous() && xs.layout().start_offset() == 0 {
+                    xs
+                } else {
+                    copied = xs.force_contiguous()?;
+                    &copied
+                };
+                match matmul {
+                    GgufMatmul::Quantized => matrix.forward(xs),
+                    GgufMatmul::DequantizeF16 => matrix.forward_via_f16(xs),
+                }
+            }
         }
     }
 }
@@ -863,19 +879,12 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&nx2, &x1], x.rank() - 1)
 }
 
-fn apply_rotary_pos_emb(
-    q: &Tensor,   // [B, Hq, T, D]
-    k: &Tensor,   // [B, Hk, T, D]
-    cos: &Tensor, // [B, T, D]
-    sin: &Tensor, // [B, T, D]
-) -> Result<(Tensor, Tensor)> {
+/// HF's apply_rotary_pos_emb for one of q or k: `x` `[B, heads, T, D]`, cos and sin `[B, T, D]`.
+fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     // unsqueeze_dim=1 -> [B,1,T,D] then broadcast
     let cos_u = cos.unsqueeze(1)?;
     let sin_u = sin.unsqueeze(1)?;
-
-    let q_embed = (q.broadcast_mul(&cos_u)? + rotate_half(q)?.broadcast_mul(&sin_u)?)?;
-    let k_embed = (k.broadcast_mul(&cos_u)? + rotate_half(k)?.broadcast_mul(&sin_u)?)?;
-    Ok((q_embed, k_embed))
+    x.broadcast_mul(&cos_u)? + rotate_half(x)?.broadcast_mul(&sin_u)?
 }
 
 // repeat_kv (HF): [B, Nkv, T, D] -> [B, Nh, T, D]
@@ -902,6 +911,15 @@ pub(crate) enum AttentionMask<'a> {
     Additive(&'a Tensor),
     Causal,
     Fused(&'a Tensor),
+}
+
+/// The positions a layer computes its output for. Every layer needs k and v at every position,
+/// but the embedding keeps only the last position's vector (left padding puts every row's last
+/// real token there), so the last layer computes q, attention, o_proj and the MLP for it alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Rows {
+    All,
+    Last,
 }
 
 // - q_norm/k_norm on head_dim after reshape
@@ -1011,27 +1029,31 @@ impl Qwen3Attention {
     /// attention_mask: additive mask [B,1,T,T] (0 or -inf)
     /// `AttentionMask::Causal` and `AttentionMask::Fused` need a Metal device:
     /// `Qwen3Model::forward_causal` and `Qwen3Model::forward_padded` pass them only there.
+    /// `rows` picks the query positions: every one (`[B,T,H]` out), or the last alone
+    /// (`[B,1,H]` out), which attends to every key as the last row of the full attention does.
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         rotary: RotaryTables<'_>,
         mask: AttentionMask<'_>,
+        rows: Rows,
     ) -> Result<Tensor> {
         let (b, t, _h) = hidden_states.dims3()?;
         let d = self.head_dim;
+        // The query positions, `tq` of them, ending at the last.
+        let (q_start, tq) = match rows {
+            Rows::All => (0, t),
+            Rows::Last => (t - 1, 1),
+        };
 
-        // hidden_shape = [B,T,-1,D]
-        // q: [B,T,Nh*D] -> [B,T,Nh,D] -> q_norm
+        // hidden_shape = [B,T,-1,D]: q [B,Tq,Nh,D] and k [B,T,Nkv,D], before q_norm and k_norm
         let q = hidden_states
+            .narrow(1, q_start, tq)?
             .apply(&self.q_proj)?
-            .reshape((b, t, self.num_heads, d))?
-            .apply(&self.q_norm)?;
-
-        // k: [B,T,Nkv*D] -> [B,T,Nkv,D] -> k_norm
+            .reshape((b, tq, self.num_heads, d))?;
         let k = hidden_states
             .apply(&self.k_proj)?
-            .reshape((b, t, self.num_kv_heads, d))?
-            .apply(&self.k_norm)?;
+            .reshape((b, t, self.num_kv_heads, d))?;
 
         // v: [B,Nkv,T,D]
         let v = hidden_states
@@ -1039,37 +1061,64 @@ impl Qwen3Attention {
             .reshape((b, t, self.num_kv_heads, d))?
             .transpose(1, 2)?;
 
-        // RoPE, then q: [B,Nh,T,D] and k: [B,Nkv,T,D]
+        // q_norm/k_norm and RoPE, then q: [B,Nh,Tq,D] and k: [B,Nkv,T,D]. With the plain tables
+        // the two run as one pass over q and one over k (one kernel each on Metal). q's rows of
+        // the tables are its own positions.
         let (q, k) = match rotary {
-            RotaryTables::Plain(cos, sin) => (
-                candle_nn::rotary_emb::rope_thd(&q, cos, sin)?.transpose(1, 2)?,
-                candle_nn::rotary_emb::rope_thd(&k, cos, sin)?.transpose(1, 2)?,
-            ),
-            RotaryTables::PerRow(cos, sin) => {
-                apply_rotary_pos_emb(&q.transpose(1, 2)?, &k.transpose(1, 2)?, cos, sin)?
+            RotaryTables::Plain(cos, sin) => {
+                let norm_rope = |xs: &Tensor, norm: &Qwen3RMSNorm, start: usize, len: usize| {
+                    rms_norm_rope_thd(
+                        xs,
+                        &norm.weight,
+                        &cos.narrow(0, start, len)?,
+                        &sin.narrow(0, start, len)?,
+                        norm.eps as f32,
+                    )
+                };
+                (
+                    norm_rope(&q, &self.q_norm, q_start, tq)?.transpose(1, 2)?,
+                    norm_rope(&k, &self.k_norm, 0, t)?.transpose(1, 2)?,
+                )
             }
+            RotaryTables::PerRow(cos, sin) => (
+                apply_rotary_pos_emb(
+                    &q.apply(&self.q_norm)?.transpose(1, 2)?,
+                    &cos.narrow(1, q_start, tq)?,
+                    &sin.narrow(1, q_start, tq)?,
+                )?,
+                apply_rotary_pos_emb(&k.apply(&self.k_norm)?.transpose(1, 2)?, cos, sin)?,
+            ),
         };
 
         // The fused kernel takes k and v with their own heads (GQA). It masks causally itself, or
         // reads a given mask through its strides, so the heads share one `[B, 1, T, T]` copy.
+        // The last position alone sees every key, so it needs no causal mask, and a padding mask
+        // keeps its last row, copied out (`[B, 1, 1, T]`) because the kernel reads the mask from
+        // its buffer's start.
         let fused = match mask {
-            AttentionMask::Causal => Some((None, true)),
-            AttentionMask::Fused(mask) => {
-                Some((Some(mask.broadcast_as((b, self.num_heads, t, t))?), false))
-            }
+            AttentionMask::Causal => Some((None, rows == Rows::All)),
+            AttentionMask::Fused(mask) => Some((
+                Some(mask.narrow(2, q_start, tq)?.contiguous()?.broadcast_as((
+                    b,
+                    self.num_heads,
+                    tq,
+                    t,
+                ))?),
+                false,
+            )),
             AttentionMask::None | AttentionMask::Additive(_) => None,
         };
         if let Some((fused_mask, causal)) = fused {
             // q, k and v go in as the transposed views they are: the fused kernel reads them
             // through their batch, head and sequence strides (the head dim stays contiguous), so
-            // no copy of any of them is made.
-            let out =
-                candle_nn::ops::sdpa(&q, &k, &v, fused_mask.as_ref(), causal, self.scaling, 1.0)?;
-            let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * d))?;
+            // no copy of any of them is made. It writes `[B, Tq, Nh, D]`, so the reshape for
+            // o_proj is a view too.
+            let out = sdpa_bthd(&q, &k, &v, fused_mask.as_ref(), causal, self.scaling)?;
+            let out = out.reshape((b, tq, self.num_heads * d))?;
             return out.apply(&self.o_proj);
         }
         let attention_mask = match mask {
-            AttentionMask::Additive(mask) => Some(mask),
+            AttentionMask::Additive(mask) => Some(mask.narrow(2, q_start, tq)?),
             AttentionMask::None | AttentionMask::Causal | AttentionMask::Fused(_) => None,
         };
 
@@ -1083,7 +1132,7 @@ impl Qwen3Attention {
 
         // attn_weights = q @ k^T * scaling
         let kt = k.transpose(2, 3)?; // [B,Nh,D,T]
-        let mut attn = q.matmul(&kt)?; // [B,Nh,T,T]
+        let mut attn = q.matmul(&kt)?; // [B,Nh,Tq,T]
 
         let scale = scalar_f32(attn.device(), self.scaling)?.to_dtype(attn.dtype())?;
         attn = attn.broadcast_mul(&scale)?;
@@ -1095,10 +1144,10 @@ impl Qwen3Attention {
         // softmax over last dim
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
 
-        // attn_output = attn @ v -> [B,Nh,T,D]
+        // attn_output = attn @ v -> [B,Nh,Tq,D]
         let out = attn.matmul(&v)?;
-        // transpose back -> [B,T,Nh,D] -> reshape [B,T,Nh*D] -> o_proj -> [B,T,H]
-        let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * d))?;
+        // transpose back -> [B,Tq,Nh,D] -> reshape [B,Tq,Nh*D] -> o_proj -> [B,Tq,H]
+        let out = out.transpose(1, 2)?.reshape((b, tq, self.num_heads * d))?;
         out.apply(&self.o_proj)
     }
 }
@@ -1144,16 +1193,21 @@ impl Qwen3DecoderLayer {
         })
     }
 
+    /// `[B,T,H]` in; `[B,T,H]` out for `Rows::All`, the last position's `[B,1,H]` for `Rows::Last`.
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         mask: AttentionMask<'_>,
         rotary: RotaryTables<'_>,
+        rows: Rows,
     ) -> Result<Tensor> {
         // Pre-norm
-        let residual = hidden_states.clone();
+        let residual = match rows {
+            Rows::All => hidden_states.clone(),
+            Rows::Last => hidden_states.narrow(1, hidden_states.dim(1)? - 1, 1)?,
+        };
         let hs = hidden_states.apply(&self.input_layernorm)?;
-        let hs = self.self_attn.forward(&hs, rotary, mask)?;
+        let hs = self.self_attn.forward(&hs, rotary, mask, rows)?;
         let hs = (residual + hs)?;
 
         // MLP
@@ -1267,16 +1321,28 @@ impl Qwen3Model {
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         let mask = attention_mask_4d.map_or(AttentionMask::None, AttentionMask::Additive);
-        self.forward_embeds_masked(inputs_embeds, mask, deepstack_additions, position_ids)
+        self.forward_embeds_masked(
+            inputs_embeds,
+            mask,
+            deepstack_additions,
+            position_ids,
+            Rows::All,
+        )
     }
 
+    /// `rows` is the positions the last layer computes, and so the positions returned: `[B,T,H]`
+    /// for `Rows::All`, the last position's `[B,1,H]` for `Rows::Last`.
     fn forward_embeds_masked(
         &self,
         inputs_embeds: &Tensor,
         mask: AttentionMask<'_>,
         deepstack_additions: Option<&[Tensor]>,
         position_ids: Option<&Tensor>,
+        rows: Rows,
     ) -> Result<Tensor> {
+        if rows == Rows::Last && deepstack_additions.is_some() {
+            candle_core::bail!("the deepstack additions need every position of every layer")
+        }
         let (_, t, _) = inputs_embeds.dims3()?;
         let mut hs = inputs_embeds.clone();
 
@@ -1292,8 +1358,14 @@ impl Qwen3Model {
         };
 
         // layers
+        let last_layer = self.layers.len().saturating_sub(1);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hs = layer.forward(&hs, mask, rotary)?;
+            let layer_rows = if layer_idx == last_layer {
+                rows
+            } else {
+                Rows::All
+            };
+            hs = layer.forward(&hs, mask, rotary, layer_rows)?;
             if let Some(additions) = deepstack_additions {
                 if let Some(visual_add) = additions.get(layer_idx) {
                     hs = hs.add(visual_add)?;
@@ -1320,33 +1392,37 @@ impl Qwen3Model {
     /// `forward` with causal attention over a batch that has no padding. On Metal this runs the
     /// fused attention kernel, which never builds the `[B, heads, T, T]` table or the mask; on any
     /// other device it builds the same causal mask `forward` would get for an unpadded batch.
-    pub(crate) fn forward_causal(&self, input_ids: &Tensor) -> Result<Tensor> {
+    /// `rows` as in `forward_embeds_masked`.
+    pub(crate) fn forward_causal(&self, input_ids: &Tensor, rows: Rows) -> Result<Tensor> {
         let hs = self.embed_tokens(input_ids)?;
         if self.device.is_metal() {
-            return self.forward_embeds_masked(&hs, AttentionMask::Causal, None, None);
+            return self.forward_embeds_masked(&hs, AttentionMask::Causal, None, None, rows);
         }
         let (b, t) = input_ids.dims2()?;
         let no_padding = Tensor::ones((b, t), DType::F32, &self.device)?;
         let mask = build_attention_mask_4d(&no_padding)?;
-        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None)
+        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None, rows)
     }
 
     /// `forward` over a padded batch, `attention_mask_2d` being `[B, T]` (1 a token, 0 padding).
     /// On Metal this runs the fused attention kernel with the padding mask, which never builds the
     /// `[B, heads, T, T]` table; on any other device it is `forward` with the mask
     /// `build_attention_mask_4d` builds.
+    /// `rows` as in `forward_embeds_masked`; with left padding the last position is every row's
+    /// last real token.
     pub(crate) fn forward_padded(
         &self,
         input_ids: &Tensor,
         attention_mask_2d: &Tensor,
+        rows: Rows,
     ) -> Result<Tensor> {
         let hs = self.embed_tokens(input_ids)?;
         if self.device.is_metal() {
             let mask = build_attention_mask_fused(attention_mask_2d, hs.dtype())?;
-            return self.forward_embeds_masked(&hs, AttentionMask::Fused(&mask), None, None);
+            return self.forward_embeds_masked(&hs, AttentionMask::Fused(&mask), None, None, rows);
         }
         let mask = build_attention_mask_4d(attention_mask_2d)?;
-        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None)
+        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None, rows)
     }
 
     pub fn config(&self) -> &Config {
@@ -1515,13 +1591,15 @@ impl Qwen3TextEmbedding {
         let hidden = if padded {
             let attention_mask_2d =
                 Tensor::from_vec(attention_mask_vec, (batch_size, seq_len), device)?;
-            self.model.forward_padded(&input_ids, &attention_mask_2d)?
+            self.model
+                .forward_padded(&input_ids, &attention_mask_2d, Rows::Last)?
         } else {
-            self.model.forward_causal(&input_ids)?
+            self.model.forward_causal(&input_ids, Rows::Last)?
         };
 
-        // Last token pooling: with left padding, the last position is always the real last token
-        let pooled = hidden.i((.., seq_len - 1))?; // [B, H]
+        // Last token pooling: with left padding, the last position is always the real last
+        // token, and it is the one position the last layer computed: [B, 1, H].
+        let pooled = hidden.i((.., 0))?; // [B, H]
 
         // L2 normalize (add epsilon for numerical stability)
         let normalized = l2_normalize(&pooled)?;
@@ -1945,13 +2023,8 @@ mod tests {
         let positions: Vec<u32> = (0..b).flat_map(|_| 0..t as u32).collect();
         let position_ids = Tensor::from_vec(positions, (b, t), &device).unwrap();
         let (cos, sin) = rotary.forward(&xs, &position_ids).unwrap();
-        let (q_ref, k_ref) = apply_rotary_pos_emb(
-            &q.transpose(1, 2).unwrap(),
-            &k.transpose(1, 2).unwrap(),
-            &cos,
-            &sin,
-        )
-        .unwrap();
+        let q_ref = apply_rotary_pos_emb(&q.transpose(1, 2).unwrap(), &cos, &sin).unwrap();
+        let k_ref = apply_rotary_pos_emb(&k.transpose(1, 2).unwrap(), &cos, &sin).unwrap();
 
         let (cos, sin) = rotary.plain_tables(t, DType::F32, &device).unwrap();
         assert_eq!(cos.dims(), &[t, d / 2]);
@@ -2001,7 +2074,7 @@ mod tests {
         let input_ids = Tensor::from_vec(ids, (b, t), &device).unwrap();
 
         // On the CPU this is the additive-mask attention with the plain `[T, D/2]` tables.
-        let plain = model.forward_causal(&input_ids).unwrap();
+        let plain = model.forward_causal(&input_ids, super::Rows::All).unwrap();
 
         // The same forward with the positions given, which takes the per-row tables.
         let no_padding = Tensor::ones((b, t), DType::F32, &device).unwrap();
@@ -2028,6 +2101,138 @@ mod tests {
             max_abs_diff(&plain, &zeros) > 1e-2,
             "hidden states are zero"
         );
+    }
+
+    /// A random model of `layers` layers whose norms start near 1 (a VarMap starts them at 0).
+    fn random_model(
+        mut cfg: super::Config,
+        layers: usize,
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> super::Qwen3Model {
+        use candle_nn::{Init, VarBuilder, VarMap};
+        cfg.num_hidden_layers = layers;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, dtype, device);
+        let near_one = Init::Randn {
+            mean: 1.0,
+            stdev: 0.1,
+        };
+        vb.pp("norm")
+            .get_with_hints(cfg.hidden_size, "weight", near_one)
+            .unwrap();
+        for i in 0..layers {
+            for (name, dim) in [
+                ("input_layernorm", cfg.hidden_size),
+                ("post_attention_layernorm", cfg.hidden_size),
+                ("self_attn.q_norm", cfg.head_dim()),
+                ("self_attn.k_norm", cfg.head_dim()),
+            ] {
+                vb.pp(format!("layers.{i}.{name}"))
+                    .get_with_hints(dim, "weight", near_one)
+                    .unwrap();
+            }
+        }
+        super::Qwen3Model::new(cfg, vb).unwrap()
+    }
+
+    /// The last layer run for the last position alone gives the last row the full run gives:
+    /// causal, left-padded, and with explicit position ids (the per-row tables).
+    fn assert_last_row_matches(model: &super::Qwen3Model, tolerance: f32) {
+        use super::{AttentionMask, Rows};
+        use candle_core::{DType, IndexOp, Tensor};
+
+        let device = model.device().clone();
+        let (b, t) = (2usize, 37usize);
+        let ids: Vec<u32> = (0..(b * t) as u32).map(|i| (i * 13) % 1000).collect();
+        let input_ids = Tensor::from_vec(ids, (b, t), &device).unwrap();
+        let check = |all: Tensor, last: Tensor, what: &str| {
+            assert_eq!(all.dims(), &[b, t, model.config().hidden_size], "{what}");
+            assert_eq!(last.dims(), &[b, 1, model.config().hidden_size], "{what}");
+            let all_last = all.i((.., t - 1..t)).unwrap();
+            let diff = max_abs_diff(
+                &all_last.to_dtype(DType::F32).unwrap(),
+                &last.to_dtype(DType::F32).unwrap(),
+            );
+            assert!(diff <= tolerance, "{what}: the last row differs by {diff}");
+            // The last row is not the first: positions really differ, so a wrong row shows.
+            let first = all.i((.., 0..1)).unwrap();
+            assert!(
+                max_abs_diff(
+                    &first.to_dtype(DType::F32).unwrap(),
+                    &last.to_dtype(DType::F32).unwrap()
+                ) > 1e-2,
+                "{what}"
+            );
+        };
+
+        check(
+            model.forward_causal(&input_ids, Rows::All).unwrap(),
+            model.forward_causal(&input_ids, Rows::Last).unwrap(),
+            "causal",
+        );
+
+        // The second row left-padded by eleven.
+        let mut mask = vec![1f32; b * t];
+        mask[t..t + 11].fill(0.0);
+        let mask_2d = Tensor::from_vec(mask, (b, t), &device).unwrap();
+        check(
+            model
+                .forward_padded(&input_ids, &mask_2d, Rows::All)
+                .unwrap(),
+            model
+                .forward_padded(&input_ids, &mask_2d, Rows::Last)
+                .unwrap(),
+            "padded",
+        );
+
+        if !device.is_metal() {
+            let mask = super::build_attention_mask_4d(&mask_2d).unwrap();
+            let positions = Tensor::arange(0u32, t as u32, &device)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap()
+                .expand((b, t))
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let embeds = model.embed_tokens(&input_ids).unwrap();
+            let run = |rows| {
+                model
+                    .forward_embeds_masked(
+                        &embeds,
+                        AttentionMask::Additive(&mask),
+                        None,
+                        Some(&positions),
+                        rows,
+                    )
+                    .unwrap()
+            };
+            check(run(Rows::All), run(Rows::Last), "per-row tables");
+        }
+    }
+
+    #[test]
+    fn last_position_alone_matches_the_full_last_layer_on_the_cpu() {
+        let model = random_model(
+            small_config(),
+            2,
+            &candle_core::Device::Cpu,
+            candle_core::DType::F32,
+        );
+        assert_last_row_matches(&model, 1e-5);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn last_position_alone_matches_the_full_last_layer_on_metal() {
+        // Head dim 64, one the fused attention kernel takes.
+        let mut cfg = small_config();
+        cfg.head_dim = Some(64);
+        cfg.hidden_size = 256;
+        let device = candle_core::Device::new_metal(0).unwrap();
+        let model = random_model(cfg, 2, &device, candle_core::DType::F32);
+        assert_last_row_matches(&model, 1e-4);
     }
 
     #[test]
@@ -2096,54 +2301,70 @@ mod tests {
         assert!(late_cos.iter().any(|&c| (c - 1.0).abs() > 1e-3));
     }
 
-    /// A small random model with its norms near 1, and the VarMap that holds its weights.
-    fn small_model() -> (super::Qwen3Model, candle_nn::VarMap) {
+    /// A random f32 model on the CPU (as `random_model` builds it) and the VarMap holding its
+    /// weights, so the same weights can be written to a GGUF file.
+    fn random_model_and_weights(
+        mut cfg: super::Config,
+        layers: usize,
+    ) -> (super::Qwen3Model, candle_nn::VarMap) {
         use candle_core::{DType, Device};
         use candle_nn::{Init, VarBuilder, VarMap};
 
-        let cfg = small_config();
+        cfg.num_hidden_layers = layers;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
         let near_one = Init::Randn {
             mean: 1.0,
             stdev: 0.1,
         };
-        for (name, dim) in [
-            ("norm", cfg.hidden_size),
-            ("layers.0.input_layernorm", cfg.hidden_size),
-            ("layers.0.post_attention_layernorm", cfg.hidden_size),
-            ("layers.0.self_attn.q_norm", cfg.head_dim()),
-            ("layers.0.self_attn.k_norm", cfg.head_dim()),
-        ] {
-            vb.pp(name).get_with_hints(dim, "weight", near_one).unwrap();
+        vb.pp("norm")
+            .get_with_hints(cfg.hidden_size, "weight", near_one)
+            .unwrap();
+        for i in 0..layers {
+            for (name, dim) in [
+                ("input_layernorm", cfg.hidden_size),
+                ("post_attention_layernorm", cfg.hidden_size),
+                ("self_attn.q_norm", cfg.head_dim()),
+                ("self_attn.k_norm", cfg.head_dim()),
+            ] {
+                vb.pp(format!("layers.{i}.{name}"))
+                    .get_with_hints(dim, "weight", near_one)
+                    .unwrap();
+            }
         }
         (super::Qwen3Model::new(cfg, vb).unwrap(), varmap)
     }
 
-    /// The model's weights as a GGUF file in llama.cpp's `qwen3` layout, every matrix and the
-    /// token table in `matrix_dtype`, the norms in f32.
-    fn small_gguf(
+    /// The weights as a GGUF file in llama.cpp's `qwen3` layout, every matrix and the token
+    /// table in `matrix_dtype`, the norms in f32.
+    fn gguf_bytes(
+        cfg: &super::Config,
         varmap: &candle_nn::VarMap,
         matrix_dtype: candle_core::quantized::GgmlDType,
     ) -> Vec<u8> {
         use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 
-        let cfg = small_config();
-        let renames = [
-            ("embed_tokens", "token_embd"),
-            ("norm", "output_norm"),
-            ("layers.0.self_attn.q_proj", "blk.0.attn_q"),
-            ("layers.0.self_attn.k_proj", "blk.0.attn_k"),
-            ("layers.0.self_attn.v_proj", "blk.0.attn_v"),
-            ("layers.0.self_attn.o_proj", "blk.0.attn_output"),
-            ("layers.0.self_attn.q_norm", "blk.0.attn_q_norm"),
-            ("layers.0.self_attn.k_norm", "blk.0.attn_k_norm"),
-            ("layers.0.mlp.gate_proj", "blk.0.ffn_gate"),
-            ("layers.0.mlp.up_proj", "blk.0.ffn_up"),
-            ("layers.0.mlp.down_proj", "blk.0.ffn_down"),
-            ("layers.0.input_layernorm", "blk.0.attn_norm"),
-            ("layers.0.post_attention_layernorm", "blk.0.ffn_norm"),
+        let mut renames = vec![
+            ("embed_tokens".to_string(), "token_embd".to_string()),
+            ("norm".to_string(), "output_norm".to_string()),
         ];
+        for i in 0..cfg.num_hidden_layers {
+            for (from, to) in [
+                ("self_attn.q_proj", "attn_q"),
+                ("self_attn.k_proj", "attn_k"),
+                ("self_attn.v_proj", "attn_v"),
+                ("self_attn.o_proj", "attn_output"),
+                ("self_attn.q_norm", "attn_q_norm"),
+                ("self_attn.k_norm", "attn_k_norm"),
+                ("mlp.gate_proj", "ffn_gate"),
+                ("mlp.up_proj", "ffn_up"),
+                ("mlp.down_proj", "ffn_down"),
+                ("input_layernorm", "attn_norm"),
+                ("post_attention_layernorm", "ffn_norm"),
+            ] {
+                renames.push((format!("layers.{i}.{from}"), format!("blk.{i}.{to}")));
+            }
+        }
         let data = varmap.data().lock().unwrap();
         assert_eq!(data.len(), renames.len(), "a weight has no GGUF name");
         let tensors: Vec<(String, QTensor)> = renames
@@ -2200,13 +2421,34 @@ mod tests {
         out.into_inner()
     }
 
-    fn load_small_gguf(bytes: Vec<u8>, matmul: super::GgufMatmul) -> super::Qwen3Model {
+    fn load_gguf(
+        bytes: Vec<u8>,
+        device: &candle_core::Device,
+        matmul: super::GgufMatmul,
+    ) -> super::Qwen3Model {
         use candle_core::quantized::gguf_file;
-        use candle_core::Device;
 
         let mut reader = std::io::Cursor::new(bytes);
         let content = gguf_file::Content::read(&mut reader).unwrap();
-        super::Qwen3Model::from_gguf(&content, &mut reader, &Device::Cpu, matmul).unwrap()
+        super::Qwen3Model::from_gguf(&content, &mut reader, device, matmul).unwrap()
+    }
+
+    /// The small one-layer model and its weights.
+    fn small_model() -> (super::Qwen3Model, candle_nn::VarMap) {
+        random_model_and_weights(small_config(), 1)
+    }
+
+    /// The small model's weights as a GGUF file, loaded on the CPU.
+    fn small_gguf_model(
+        varmap: &candle_nn::VarMap,
+        matrix_dtype: candle_core::quantized::GgmlDType,
+        matmul: super::GgufMatmul,
+    ) -> super::Qwen3Model {
+        load_gguf(
+            gguf_bytes(&small_config(), varmap, matrix_dtype),
+            &candle_core::Device::Cpu,
+            matmul,
+        )
     }
 
     /// The smallest row cosine between two flattened `[.., hidden]` state sets.
@@ -2223,17 +2465,17 @@ mod tests {
             .fold(f32::MAX, f32::min)
     }
 
-    /// The hidden states of a causal batch and a left-padded batch, flattened.
-    fn small_forwards(model: &super::Qwen3Model) -> (Vec<f32>, Vec<f32>) {
+    /// The hidden states of a causal batch and a left-padded batch, flattened, for `rows`.
+    fn small_forwards(model: &super::Qwen3Model, rows: super::Rows) -> (Vec<f32>, Vec<f32>) {
         use candle_core::{Device, Tensor};
 
         let (b, t) = (2usize, 7usize);
         let ids: Vec<u32> = (0..(b * t) as u32).map(|i| (i * 13) % 1000).collect();
         let input_ids = Tensor::from_vec(ids, (b, t), &Device::Cpu).unwrap();
-        let causal = model.forward_causal(&input_ids).unwrap();
+        let causal = model.forward_causal(&input_ids, rows).unwrap();
         let mask: Vec<f32> = (0..b * t).map(|i| if i < 3 { 0.0 } else { 1.0 }).collect();
         let mask = Tensor::from_vec(mask, (b, t), &Device::Cpu).unwrap();
-        let padded = model.forward_padded(&input_ids, &mask).unwrap();
+        let padded = model.forward_padded(&input_ids, &mask, rows).unwrap();
         let flat = |x: Tensor| x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         (flat(causal), flat(padded))
     }
@@ -2243,10 +2485,7 @@ mod tests {
         use candle_core::quantized::GgmlDType;
 
         let (_, varmap) = small_model();
-        let model = load_small_gguf(
-            small_gguf(&varmap, GgmlDType::F32),
-            super::GgufMatmul::default(),
-        );
+        let model = small_gguf_model(&varmap, GgmlDType::F32, super::GgufMatmul::default());
         let (got, want) = (model.config(), small_config());
         assert_eq!(got.hidden_size, want.hidden_size);
         assert_eq!(got.intermediate_size, want.intermediate_size);
@@ -2261,38 +2500,48 @@ mod tests {
 
     #[test]
     fn gguf_f32_model_is_bit_identical_to_the_safetensors_model() {
+        use super::Rows;
         use candle_core::quantized::GgmlDType;
 
         let (dense, varmap) = small_model();
         // An f32 matrix stays a plain tensor, and `Quantized` multiplies it as `Linear` does.
-        let gguf = load_small_gguf(
-            small_gguf(&varmap, GgmlDType::F32),
-            super::GgufMatmul::Quantized,
-        );
-        let (dense_causal, dense_padded) = small_forwards(&dense);
-        let (gguf_causal, gguf_padded) = small_forwards(&gguf);
+        let gguf = small_gguf_model(&varmap, GgmlDType::F32, super::GgufMatmul::Quantized);
+        let (dense_causal, dense_padded) = small_forwards(&dense, Rows::All);
+        let (gguf_causal, gguf_padded) = small_forwards(&gguf, Rows::All);
         assert_eq!(gguf_causal, dense_causal);
         assert_eq!(gguf_padded, dense_padded);
         assert!(
             dense_causal.iter().any(|v| v.abs() > 1e-2),
             "states are zero"
         );
+        // For the last position alone the dense path multiplies the strided row view and the
+        // GGUF path a contiguous copy of it, so the sums round differently, within 1e-5.
+        let (dense_causal, dense_padded) = small_forwards(&dense, Rows::Last);
+        let (gguf_causal, gguf_padded) = small_forwards(&gguf, Rows::Last);
+        for (a, b) in [(&dense_causal, &gguf_causal), (&dense_padded, &gguf_padded)] {
+            let diff = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(diff < 1e-5, "the last position differs by {diff}");
+        }
     }
 
     #[test]
     fn gguf_q8_0_model_stays_close_to_the_safetensors_model() {
+        use super::Rows;
         use candle_core::quantized::GgmlDType;
 
         let (dense, varmap) = small_model();
-        let (dense_causal, dense_padded) = small_forwards(&dense);
-        let bytes = small_gguf(&varmap, GgmlDType::Q8_0);
+        let (dense_causal, dense_padded) = small_forwards(&dense, Rows::All);
         let mut outputs = Vec::new();
         for matmul in [
             super::GgufMatmul::Quantized,
             super::GgufMatmul::DequantizeF16,
         ] {
-            let q8 = load_small_gguf(bytes.clone(), matmul);
-            let (q8_causal, q8_padded) = small_forwards(&q8);
+            let q8 = small_gguf_model(&varmap, GgmlDType::Q8_0, matmul);
+            let (q8_causal, q8_padded) = small_forwards(&q8, Rows::All);
             for (a, b) in [(&dense_causal, &q8_causal), (&dense_padded, &q8_padded)] {
                 assert_ne!(a, b, "{matmul:?}: Q8_0 changed nothing");
                 let cosine = min_row_cosine(a, b);
@@ -2305,12 +2554,62 @@ mod tests {
     }
 
     #[test]
+    fn gguf_last_position_alone_matches_the_full_last_layer_on_the_cpu() {
+        use candle_core::quantized::GgmlDType;
+
+        let cfg = small_config();
+        let (_, varmap) = random_model_and_weights(cfg.clone(), 2);
+        let mut cfg2 = cfg;
+        cfg2.num_hidden_layers = 2;
+        let model = load_gguf(
+            gguf_bytes(&cfg2, &varmap, GgmlDType::Q8_0),
+            &candle_core::Device::Cpu,
+            super::GgufMatmul::Quantized,
+        );
+        assert_last_row_matches(&model, 1e-5);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn gguf_last_position_alone_matches_the_full_last_layer_on_metal() {
+        use super::Rows;
+        use candle_core::quantized::GgmlDType;
+        use candle_core::{IndexOp, Tensor};
+
+        // Head dim 64, one the fused attention kernel takes.
+        let mut cfg = small_config();
+        cfg.head_dim = Some(64);
+        cfg.hidden_size = 256;
+        let (_, varmap) = random_model_and_weights(cfg.clone(), 2);
+        cfg.num_hidden_layers = 2;
+        let device = candle_core::Device::new_metal(0).unwrap();
+        let model = load_gguf(
+            gguf_bytes(&cfg, &varmap, GgmlDType::Q8_0),
+            &device,
+            super::GgufMatmul::Quantized,
+        );
+        // One position runs candle's quantized mat-vec kernel and the full layer its mat-mat
+        // kernel, which round differently: about 1e-3 on states of size 1.
+        assert_last_row_matches(&model, 5e-3);
+
+        // One row: its last position is a contiguous view with an offset, which candle's
+        // quantized matmul on Metal would read from the buffer's start.
+        let t = 23usize;
+        let ids: Vec<u32> = (0..t as u32).map(|i| (i * 17) % 1000).collect();
+        let input_ids = Tensor::from_vec(ids, (1, t), &device).unwrap();
+        let all = model.forward_causal(&input_ids, Rows::All).unwrap();
+        let last = model.forward_causal(&input_ids, Rows::Last).unwrap();
+        let diff = max_abs_diff(&all.i((.., t - 1..t)).unwrap(), &last);
+        assert!(diff < 5e-3, "one row: the last position differs by {diff}");
+    }
+
+    #[test]
     fn gguf_rejects_another_architecture() {
         use candle_core::quantized::{gguf_file, GgmlDType};
         use candle_core::Device;
 
         let (_, varmap) = small_model();
-        let bytes = small_gguf(&varmap, GgmlDType::F32);
+        let bytes = gguf_bytes(&small_config(), &varmap, GgmlDType::F32);
         let mut reader = std::io::Cursor::new(bytes);
         let mut content = gguf_file::Content::read(&mut reader).unwrap();
         content.metadata.insert(
