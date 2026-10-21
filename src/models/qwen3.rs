@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use hf_hub::api::sync::ApiRepo;
 
 use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
+use crate::models::qwen3_sdpa_bthd::sdpa_bthd;
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
 fn default_true() -> bool {
@@ -901,10 +902,10 @@ impl Qwen3Attention {
         if let Some((fused_mask, causal)) = fused {
             // q, k and v go in as the transposed views they are: the fused kernel reads them
             // through their batch, head and sequence strides (the head dim stays contiguous), so
-            // no copy of any of them is made.
-            let out =
-                candle_nn::ops::sdpa(&q, &k, &v, fused_mask.as_ref(), causal, self.scaling, 1.0)?;
-            let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * d))?;
+            // no copy of any of them is made. It writes `[B, T, Nh, D]`, so the reshape for
+            // o_proj is a view too.
+            let out = sdpa_bthd(&q, &k, &v, fused_mask.as_ref(), causal, self.scaling)?;
+            let out = out.reshape((b, t, self.num_heads * d))?;
             return out.apply(&self.o_proj);
         }
         let attention_mask = match mask {
