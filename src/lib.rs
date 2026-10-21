@@ -73,6 +73,7 @@
 mod common;
 
 mod bgem3_embedding;
+mod heads;
 #[cfg(feature = "image-models")]
 mod image_embedding;
 mod init;
@@ -87,6 +88,7 @@ mod text_embedding;
 pub use ort::ep::ExecutionProviderDispatch;
 
 pub use crate::common::{get_cache_dir, Embedding, Error, Result, SparseEmbedding, TokenizerFiles};
+pub use crate::heads::EmbeddingHeads;
 pub use crate::models::{
     model_info::ModelInfo, model_info::RerankerModelInfo, quantization::QuantizationMode,
 };
