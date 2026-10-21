@@ -1336,9 +1336,39 @@ impl Qwen3Model {
         position_ids: Option<&Tensor>,
         rows: Rows,
     ) -> Result<Tensor> {
+        let (hs, _) = self.forward_embeds_tapped(
+            inputs_embeds,
+            mask,
+            deepstack_additions,
+            position_ids,
+            rows,
+            &[],
+        )?;
+        Ok(hs)
+    }
+
+    /// `forward_embeds_masked`, also returning the last position's hidden state `[B, 1, H]`
+    /// after each layer count in `taps` (1 is after the first layer), in the order given: the
+    /// residual stream before the final norm. A tap at the last layer is its output, unnormed.
+    fn forward_embeds_tapped(
+        &self,
+        inputs_embeds: &Tensor,
+        mask: AttentionMask<'_>,
+        deepstack_additions: Option<&[Tensor]>,
+        position_ids: Option<&Tensor>,
+        rows: Rows,
+        taps: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         if rows == Rows::Last && deepstack_additions.is_some() {
             candle_core::bail!("the deepstack additions need every position of every layer")
         }
+        if let Some(&bad) = taps.iter().find(|&&l| l == 0 || l > self.layers.len()) {
+            candle_core::bail!(
+                "layer {bad} is not between 1 and the model's {} layers",
+                self.layers.len()
+            )
+        }
+        let mut tapped: Vec<Option<Tensor>> = vec![None; taps.len()];
         let (_, t, _) = inputs_embeds.dims3()?;
         let mut hs = inputs_embeds.clone();
 
@@ -1367,10 +1397,19 @@ impl Qwen3Model {
                     hs = hs.add(visual_add)?;
                 }
             }
+            for (slot, _) in taps.iter().enumerate().filter(|(_, &l)| l == layer_idx + 1) {
+                // A copy, so the tap does not keep the whole `[B, T, H]` buffer alive.
+                let last = hs.narrow(1, hs.dim(1)? - 1, 1)?.force_contiguous()?;
+                tapped[slot] = Some(last);
+            }
         }
 
+        let tapped = tapped
+            .into_iter()
+            .map(|t| t.ok_or_else(|| candle_core::Error::Msg("a layer tap was not taken".into())))
+            .collect::<Result<Vec<_>>>()?;
         // final norm
-        hs.apply(&self.norm)
+        Ok((hs.apply(&self.norm)?, tapped))
     }
 
     /// input_ids: [B,T]
@@ -1390,14 +1429,24 @@ impl Qwen3Model {
     /// other device it builds the same causal mask `forward` would get for an unpadded batch.
     /// `rows` as in `forward_embeds_masked`.
     pub(crate) fn forward_causal(&self, input_ids: &Tensor, rows: Rows) -> Result<Tensor> {
+        Ok(self.forward_causal_tapped(input_ids, rows, &[])?.0)
+    }
+
+    /// `forward_causal` with the layer taps of `forward_embeds_tapped`.
+    pub(crate) fn forward_causal_tapped(
+        &self,
+        input_ids: &Tensor,
+        rows: Rows,
+        taps: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let hs = self.embed_tokens(input_ids)?;
         if self.device.is_metal() {
-            return self.forward_embeds_masked(&hs, AttentionMask::Causal, None, None, rows);
+            return self.forward_embeds_tapped(&hs, AttentionMask::Causal, None, None, rows, taps);
         }
         let (b, t) = input_ids.dims2()?;
         let no_padding = Tensor::ones((b, t), DType::F32, &self.device)?;
         let mask = build_attention_mask_4d(&no_padding)?;
-        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None, rows)
+        self.forward_embeds_tapped(&hs, AttentionMask::Additive(&mask), None, None, rows, taps)
     }
 
     /// `forward` over a padded batch, `attention_mask_2d` being `[B, T]` (1 a token, 0 padding).
@@ -1412,13 +1461,33 @@ impl Qwen3Model {
         attention_mask_2d: &Tensor,
         rows: Rows,
     ) -> Result<Tensor> {
+        Ok(self
+            .forward_padded_tapped(input_ids, attention_mask_2d, rows, &[])?
+            .0)
+    }
+
+    /// `forward_padded` with the layer taps of `forward_embeds_tapped`.
+    pub(crate) fn forward_padded_tapped(
+        &self,
+        input_ids: &Tensor,
+        attention_mask_2d: &Tensor,
+        rows: Rows,
+        taps: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let hs = self.embed_tokens(input_ids)?;
         if self.device.is_metal() {
             let mask = build_attention_mask_fused(attention_mask_2d, hs.dtype())?;
-            return self.forward_embeds_masked(&hs, AttentionMask::Fused(&mask), None, None, rows);
+            return self.forward_embeds_tapped(
+                &hs,
+                AttentionMask::Fused(&mask),
+                None,
+                None,
+                rows,
+                taps,
+            );
         }
         let mask = build_attention_mask_4d(attention_mask_2d)?;
-        self.forward_embeds_masked(&hs, AttentionMask::Additive(&mask), None, None, rows)
+        self.forward_embeds_tapped(&hs, AttentionMask::Additive(&mask), None, None, rows, taps)
     }
 
     pub fn config(&self) -> &Config {
@@ -1588,8 +1657,51 @@ impl Qwen3TextEmbedding {
     /// so every forward takes the causal path and every text's vector is the one it gets
     /// embedded alone, whatever else is in the call.
     pub fn embed<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.embed_tapped(texts, &[])?.0)
+    }
+
+    /// The pooled vector of each layer count in `layers` (1 is after the first decoder layer,
+    /// `num_hidden_layers` the model's output), every one from the same single pass, returned in
+    /// the order of `layers`, each holding one vector per text. The model's output is exactly what
+    /// [`Self::embed`] returns. An earlier layer's vector is the last position's residual stream
+    /// after that layer (before the final norm, which belongs to the output), L2-normalized.
+    /// [`Self::with_output_dim`] shortens the model's output only: an earlier layer's vector keeps
+    /// the full hidden size, since the shorter sizes are trained on the output alone.
+    pub fn embed_layers<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        layers: &[usize],
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        let last = self.model.config().num_hidden_layers;
+        if let Some(&bad) = layers.iter().find(|&&l| l == 0 || l > last) {
+            return Err(candle_core::Error::Msg(format!(
+                "layer {bad} is not between 1 and the model's {last} layers"
+            )));
+        }
+        let taps: Vec<usize> = layers.iter().copied().filter(|&l| l < last).collect();
+        let (output, mut tapped) = self.embed_tapped(texts, &taps)?;
+        let mut tapped = tapped.drain(..);
+        Ok(layers
+            .iter()
+            .map(|&l| {
+                if l == last {
+                    output.clone()
+                } else {
+                    tapped.next().unwrap_or_default()
+                }
+            })
+            .collect())
+    }
+
+    /// `embed`, also returning the normalized pooled vectors of the layer counts in `taps`.
+    #[allow(clippy::type_complexity)]
+    fn embed_tapped<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        taps: &[usize],
+    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>)> {
         if texts.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], vec![vec![]; taps.len()]));
         }
         let encodings = self
             .tokenizer
@@ -1612,6 +1724,7 @@ impl Qwen3TextEmbedding {
 
         let device = self.model.device();
         let mut out = vec![Vec::new(); texts.len()];
+        let mut out_tapped = vec![vec![Vec::new(); texts.len()]; taps.len()];
         for (len, members) in groups {
             let ids: Vec<u32> = members
                 .iter()
@@ -1619,15 +1732,19 @@ impl Qwen3TextEmbedding {
                 .collect();
             let input_ids = Tensor::from_vec(ids, (members.len(), len), device)?;
             // [k, 1, H]: the last layer computes the last position alone.
-            let hidden = self.model.forward_causal(&input_ids, Rows::Last)?;
-            let pooled = l2_normalize(&self.shorten(hidden.i((.., 0))?)?)?
-                .to_dtype(DType::F32)?
-                .to_vec2::<f32>()?;
-            for (i, v) in members.into_iter().zip(pooled) {
-                out[i] = v;
+            let (hidden, tapped) =
+                self.model
+                    .forward_causal_tapped(&input_ids, Rows::Last, taps)?;
+            for (i, v) in members.iter().zip(pool_last(&hidden, self.output_dim)?) {
+                out[*i] = v;
+            }
+            for (slot, hidden) in out_tapped.iter_mut().zip(&tapped) {
+                for (i, v) in members.iter().zip(pool_last(hidden, None)?) {
+                    slot[*i] = v;
+                }
             }
         }
-        Ok(out)
+        Ok((out, out_tapped))
     }
 
     /// Embed every text in one left-padded batch: one forward for the whole call, but each
@@ -1665,36 +1782,34 @@ impl Qwen3TextEmbedding {
         // Forward pass -> [B, T, H]. With no padding the mask is purely causal, which the fused
         // kernel applies itself, so neither the mask nor the attention table is built. With
         // padding the kernel reads one `[B, 1, T, T]` mask and still builds no table.
-        let hidden = if padded {
+        let (hidden, _) = if padded {
             let attention_mask_2d =
                 Tensor::from_vec(attention_mask_vec, (batch_size, seq_len), device)?;
             self.model
-                .forward_padded(&input_ids, &attention_mask_2d, Rows::Last)?
+                .forward_padded_tapped(&input_ids, &attention_mask_2d, Rows::Last, &[])?
         } else {
-            self.model.forward_causal(&input_ids, Rows::Last)?
+            self.model
+                .forward_causal_tapped(&input_ids, Rows::Last, &[])?
         };
 
         // Last token pooling: with left padding, the last position is always the real last
-        // token, and it is the one position the last layer computed: [B, 1, H].
-        let pooled = self.shorten(hidden.i((.., 0))?)?; // [B, H]
-
-        // L2 normalize (add epsilon for numerical stability)
-        let normalized = l2_normalize(&pooled)?;
-
-        // Convert to Vec<Vec<f32>>
-        let normalized = normalized.to_dtype(DType::F32)?;
-        let data = normalized.to_vec2::<f32>()?;
-        Ok(data)
+        // token, and it is the one position the last layer computed.
+        pool_last(&hidden, self.output_dim)
     }
+}
 
-    /// A shorter output keeps the leading dimensions of the pooled `[B, H]` rows, which are
-    /// then normalized as the full vector is.
-    fn shorten(&self, pooled: Tensor) -> Result<Tensor> {
-        match self.output_dim {
-            Some(dim) => pooled.narrow(1, 0, dim),
-            None => Ok(pooled),
-        }
-    }
+/// The L2-normalized last-position rows of `hidden` `[B, 1, H]`, one vector per batch row.
+/// With `dim`, each row keeps its leading `dim` dimensions before it is normalized, as the full
+/// vector is.
+fn pool_last(hidden: &Tensor, dim: Option<usize>) -> Result<Vec<Vec<f32>>> {
+    let pooled = hidden.i((.., 0))?;
+    let pooled = match dim {
+        Some(dim) => pooled.narrow(1, 0, dim)?,
+        None => pooled,
+    };
+    l2_normalize(&pooled)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()
 }
 
 /// The instruction the Qwen3-Reranker model card uses when none is given.
@@ -2537,6 +2652,82 @@ mod tests {
         assert_eq!(scores.len(), 2);
         let model = random_model(small_config(), 1, &Device::Cpu, DType::F32);
         assert!(super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 4).is_err());
+    }
+
+    #[test]
+    fn embed_layers_returns_the_output_and_earlier_layers_from_one_pass() {
+        use super::{build_attention_mask_4d, l2_normalize, AttentionMask, RotaryTables, Rows};
+        use candle_core::{DType, Device, IndexOp, Tensor};
+
+        let layers = 3;
+        let model = super::Qwen3TextEmbedding::new(
+            random_model(small_config(), layers, &Device::Cpu, DType::F32),
+            word_tokenizer(),
+        );
+        let texts = ["w1 w2 w3 w4 w5", "w6 w7"];
+        let got = model.embed_layers(&texts, &[layers, 1, 2]).unwrap();
+        assert_eq!(got.len(), 3);
+
+        // The model's output is `embed`'s, bit for bit.
+        assert_eq!(got[0], model.embed(&texts).unwrap());
+
+        // Layer 1 of the unpadded first text is the first layer run by hand, its last position
+        // normalized.
+        let alone = model.embed_layers(&texts[..1], &[1]).unwrap();
+        let ids = Tensor::new(&[[2u32, 3, 4, 5, 6]], &Device::Cpu).unwrap();
+        let hs = model.model.embed_tokens(&ids).unwrap();
+        let mask =
+            build_attention_mask_4d(&Tensor::ones((1, 5), DType::F32, &Device::Cpu).unwrap())
+                .unwrap();
+        let (cos, sin) = model
+            .model
+            .rotary_emb
+            .plain_tables(5, DType::F32, &Device::Cpu)
+            .unwrap();
+        let hs = model.model.layers[0]
+            .forward(
+                &hs,
+                AttentionMask::Additive(&mask),
+                RotaryTables::Plain(&cos, &sin),
+                Rows::All,
+            )
+            .unwrap();
+        let by_hand = l2_normalize(&hs.i((.., 4)).unwrap())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_eq!(alone[0], by_hand);
+
+        // In the padded batch every layer's vector matches the text alone to rounding.
+        for (layer, vs) in [layers, 1, 2].iter().zip(&got) {
+            for (i, text) in texts.iter().enumerate() {
+                let one = model
+                    .embed_layers(std::slice::from_ref(text), &[*layer])
+                    .unwrap();
+                let diff = vs[i]
+                    .iter()
+                    .zip(&one[0][0])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(diff < 1e-5, "layer {layer} text {i} differs by {diff}");
+            }
+        }
+        // The layers differ, so a tap taken at the wrong layer would show.
+        assert_ne!(got[1], got[2]);
+        assert_ne!(got[2], got[0]);
+
+        assert!(model.embed_layers(&texts, &[0]).is_err());
+        assert!(model.embed_layers(&texts, &[layers + 1]).is_err());
+
+        // A shorter output shortens the model's output, as `embed` does, and leaves earlier
+        // layers at the full hidden size.
+        let hidden = small_config().hidden_size;
+        let model = model.with_output_dim(16).unwrap();
+        let short = model.embed_layers(&texts, &[layers, 1]).unwrap();
+        assert_eq!(short[0], model.embed(&texts).unwrap());
+        assert!(short[0].iter().all(|v| v.len() == 16));
+        assert!(short[1].iter().all(|v| v.len() == hidden));
+        assert_eq!(short[1], got[1]);
     }
 
     /// The last layer run for the last position alone gives the last row the full run gives:
