@@ -251,6 +251,38 @@ fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolera
     }
 }
 
+/// Qwen3-Reranker-0.6B on the model card's queries and documents, f32 on the CPU, against the
+/// model card's own Python code (transformers, f32 on the CPU, each pair alone). Each query's
+/// documents run here as one left-padded batch.
+#[test]
+fn qwen3_reranker_06b_matches_python() {
+    use fastembed::Qwen3Reranker;
+
+    let model = Qwen3Reranker::from_hf("Qwen/Qwen3-Reranker-0.6B", &Device::Cpu, DType::F32, 8192)
+        .expect("load model");
+    let documents = [
+        "The capital of China is Beijing.",
+        "Gravity is a force that attracts two bodies towards each other. It gives weight to physical \
+         objects and is responsible for the movement of planets around the sun.",
+    ];
+    let expected_from_python = [
+        (
+            "What is the capital of China?",
+            [0.99949825_f32, 0.00000507],
+        ),
+        ("Explain gravity", [0.00004957, 0.99936193]),
+    ];
+    for (query, expected) in expected_from_python {
+        let scores = model.score(None, query, &documents).expect("score");
+        for (got, want) in scores.iter().zip(expected) {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{query:?}: got {got}, expected {want}"
+            );
+        }
+    }
+}
+
 #[test]
 fn qwen3_4b_embed() {
     if std::env::var("RUN_QWEN3_4B").is_err() {

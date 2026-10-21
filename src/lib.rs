@@ -135,7 +135,8 @@ pub use crate::reranking::{
 // For Qwen3 (candle backend)
 #[cfg(feature = "qwen3")]
 pub use crate::models::qwen3::{
-    Config as Qwen3Config, Qwen3Model, Qwen3TextEmbedding, Qwen3VLEmbedding,
+    Config as Qwen3Config, Qwen3Model, Qwen3Reranker, Qwen3TextEmbedding, Qwen3VLEmbedding,
+    QWEN3_RERANKER_DEFAULT_INSTRUCTION,
 };
 
 // For Nomic Embed Text v2 MoE (candle backend)
