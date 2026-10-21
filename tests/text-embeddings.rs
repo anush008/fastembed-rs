@@ -24,6 +24,10 @@ fn environment() -> Environment {
 /// A small epsilon value for floating point comparisons.
 const EPS: f32 = 2e-2;
 
+/// The int4 matmul kernel in ONNX Runtime picks a different code path per CPU,
+/// so the embedding sums of the 4-bit models move by up to about 0.05 between CI runners.
+const EPS_Q4: f32 = 1e-1;
+
 /// Precalculated embeddings for the supported models using #99
 /// (4f09b6842ce1fcfaf6362678afcad9a176e05304).
 ///
@@ -91,13 +95,18 @@ fn verify_embeddings(model: &EmbeddingModel, embeddings: &[Embedding]) -> Result
         _ => panic!("Model {model} not found. If you have just inserted this `EmbeddingModel` variant, please update the expected embeddings."),
     };
 
+    let eps = match model {
+        EmbeddingModel::EmbeddingGemma300MQ4 => EPS_Q4,
+        _ => EPS,
+    };
+
     let mismatched_indices = embeddings
         .iter()
         .map(|embedding| embedding.iter().sum::<f32>())
         .zip(expected.iter())
         .enumerate()
         .filter_map(|(i, (sum, &expected))| {
-            if (sum - expected).abs() > EPS {
+            if (sum - expected).abs() > eps {
                 eprintln!(
                     "Mismatched embeddings for model {model:?} at index {i}: {sum} != {expected} (expected)",
                     model = model,
@@ -605,28 +614,27 @@ fn test_allminilml6v2_match_python_counterpart() {
     let mut model = TextEmbedding::try_new(
         TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
             .with_environment(environment())
-            .with_max_length(384),
+            .with_max_length(256),
     )
     .expect("Create model successfully");
 
     let text = get_sample_text();
 
-    // baseline is generated in python using qdrant/all-mini-lm-l6-v2.onnx
-    // Tokenizer with python SentenceTransformer("all-mini-lm-l6-v2") default tokenizer
-    // with (text, padding="max_length",max_length=384,truncation=True, return_tensors="np").
-    // Normalized and pooled with SentenceTransformer("all-mini-lm-l6-v2") default pooling settings.
+    // baseline is generated in python using Qdrant/all-MiniLM-L6-v2-onnx model.onnx
+    // Tokenized with the repo's tokenizer.json, truncated to 256 tokens, the model's
+    // `model_max_length`. Mean pooled over the attention mask and normalized.
     // We only take 10 items to keep the test file small.
     let baseline: Vec<f32> = vec![
-        3.510_517_6e-2,
-        1.046_043e-2,
-        3.767_998_5e-2,
-        7.073_633_4e-2,
-        9.097_775e-2,
-        -2.507_714_7e-2,
-        -2.214_382e-2,
-        -1.016_435_9e-2,
-        4.660_127_3e-2,
-        7.431_366e-2,
+        2.613_225_4e-2,
+        4.206_721_9e-2,
+        5.250_316_5e-2,
+        7.876_656_2e-2,
+        4.569_453e-2,
+        2.103_071_7e-3,
+        -2.805_861_8e-2,
+        -2.223_155_3e-2,
+        2.083_954e-3,
+        2.926_192e-2,
     ];
 
     let embeddings = model.embed(vec![text], None).expect("create successfully");
