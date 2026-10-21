@@ -111,10 +111,6 @@ fn scalar_f32(device: &Device, v: f32) -> Result<Tensor> {
     Tensor::from_slice(&[v], (1,), device)?.to_dtype(DType::F32)
 }
 
-fn scalar_f64_as_f32(device: &Device, v: f64) -> Result<Tensor> {
-    scalar_f32(device, v as f32)
-}
-
 #[cfg(feature = "hf-hub")]
 fn hf_repo(repo_id: &str) -> Result<ApiRepo> {
     crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
@@ -505,7 +501,7 @@ fn load_image_from_path(path: &Path) -> Result<DynamicImage> {
 }
 
 pub struct Qwen3RMSNorm {
-    weight: Tensor, // [dim]
+    weight: Tensor, // [dim], in the dtype the weights were loaded in
     eps: f64,
 }
 
@@ -517,24 +513,12 @@ impl Qwen3RMSNorm {
 }
 
 impl Module for Qwen3RMSNorm {
+    /// `xs * rsqrt(mean(xs^2) + eps) * weight` as one kernel. On Metal it sums the squares in
+    /// f32 and rounds once, at the end, to the input's dtype.
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let in_dtype = xs.dtype();
-        let dev = xs.device();
-
-        let xs_f = xs.to_dtype(DType::F32)?;
-        let var = xs_f.powf(2.0)?.mean_keepdim(D::Minus1)?; // [..., 1]
-
-        let eps_t = scalar_f64_as_f32(dev, self.eps)?;
-        let var_eps = var.broadcast_add(&eps_t)?;
-
-        // xs * rsqrt(var + eps)  == xs * (1/sqrt(...))
-        let inv_rms = var_eps.sqrt()?.recip()?; // [..., 1]
-        let normed = xs_f.broadcast_mul(&inv_rms)?; // [..., dim]
-
-        // weight * back_to_input_dtype
-        let normed = normed.to_dtype(in_dtype)?;
-        let w = self.weight.to_dtype(in_dtype)?;
-        normed.broadcast_mul(&w)
+        // A no-op when the input is in the weights' dtype, which is how the model runs.
+        let weight = self.weight.to_dtype(xs.dtype())?;
+        candle_nn::ops::rms_norm(&xs.contiguous()?, &weight, self.eps as f32)
     }
 }
 
@@ -692,6 +676,37 @@ impl Qwen3RotaryEmbedding {
         let out_dtype = xs.dtype();
         Ok((cos.to_dtype(out_dtype)?, sin.to_dtype(out_dtype)?))
     }
+
+    /// The (cos, sin) `forward` returns for positions `0..seq_len` in every row, as `[T, D/2]`
+    /// each (the half `forward` repeats), in `dtype`: the tables candle's fused rope kernel reads.
+    pub(crate) fn plain_tables(
+        &self,
+        seq_len: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let inv_freq = self.inv_freq.to_device(device)?.to_dtype(DType::F32)?;
+        let d2 = inv_freq.dims1()?;
+        let positions = Tensor::arange(0u32, seq_len as u32, device)?.to_dtype(DType::F32)?;
+        let freqs = positions
+            .reshape((seq_len, 1))?
+            .broadcast_mul(&inv_freq.reshape((1, d2))?)?;
+        let scale = scalar_f32(device, self.attention_factor)?;
+        let cos = freqs.cos()?.broadcast_mul(&scale)?.to_dtype(dtype)?;
+        let sin = freqs.sin()?.broadcast_mul(&scale)?.to_dtype(dtype)?;
+        Ok((cos, sin))
+    }
+}
+
+/// The rotary tables every layer applies to q and k.
+#[derive(Clone, Copy)]
+pub(crate) enum RotaryTables<'a> {
+    /// `[B, T, D]` cos and sin from `Qwen3RotaryEmbedding::forward`, for any position ids
+    /// (MRoPE included), applied by `apply_rotary_pos_emb`.
+    PerRow(&'a Tensor, &'a Tensor),
+    /// `[T, D/2]` cos and sin from `Qwen3RotaryEmbedding::plain_tables`, for positions `0..T` in
+    /// every row, applied by candle's fused rope kernel.
+    Plain(&'a Tensor, &'a Tensor),
 }
 
 // rotate_half + apply_rotary_pos_emb (HF)
@@ -826,31 +841,31 @@ impl Qwen3Attention {
     }
 
     /// hidden_states: [B,T,H]
-    /// position_embeddings: (cos,sin) both [B,T,D]
+    /// rotary: the cos and sin tables, `RotaryTables`
     /// attention_mask: additive mask [B,1,T,T] (0 or -inf)
     /// `AttentionMask::Causal` and `AttentionMask::Fused` need a Metal device:
     /// `Qwen3Model::forward_causal` and `Qwen3Model::forward_padded` pass them only there.
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
-        position_embeddings: (&Tensor, &Tensor),
+        rotary: RotaryTables<'_>,
         mask: AttentionMask<'_>,
     ) -> Result<Tensor> {
         let (b, t, _h) = hidden_states.dims3()?;
         let d = self.head_dim;
 
         // hidden_shape = [B,T,-1,D]
-        // q: [B,T,Nh*D] -> [B,T,Nh,D] -> q_norm -> transpose -> [B,Nh,T,D]
+        // q: [B,T,Nh*D] -> [B,T,Nh,D] -> q_norm
         let q = hidden_states
             .apply(&self.q_proj)?
-            .reshape((b, t, self.num_heads, d))?;
-        let q = q.apply(&self.q_norm)?.transpose(1, 2)?;
+            .reshape((b, t, self.num_heads, d))?
+            .apply(&self.q_norm)?;
 
-        // k: [B,T,Nkv*D] -> [B,T,Nkv,D] -> k_norm -> [B,Nkv,T,D]
+        // k: [B,T,Nkv*D] -> [B,T,Nkv,D] -> k_norm
         let k = hidden_states
             .apply(&self.k_proj)?
-            .reshape((b, t, self.num_kv_heads, d))?;
-        let k = k.apply(&self.k_norm)?.transpose(1, 2)?;
+            .reshape((b, t, self.num_kv_heads, d))?
+            .apply(&self.k_norm)?;
 
         // v: [B,Nkv,T,D]
         let v = hidden_states
@@ -858,8 +873,16 @@ impl Qwen3Attention {
             .reshape((b, t, self.num_kv_heads, d))?
             .transpose(1, 2)?;
 
-        let (cos, sin) = position_embeddings;
-        let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin)?;
+        // RoPE, then q: [B,Nh,T,D] and k: [B,Nkv,T,D]
+        let (q, k) = match rotary {
+            RotaryTables::Plain(cos, sin) => (
+                candle_nn::rotary_emb::rope_thd(&q, cos, sin)?.transpose(1, 2)?,
+                candle_nn::rotary_emb::rope_thd(&k, cos, sin)?.transpose(1, 2)?,
+            ),
+            RotaryTables::PerRow(cos, sin) => {
+                apply_rotary_pos_emb(&q.transpose(1, 2)?, &k.transpose(1, 2)?, cos, sin)?
+            }
+        };
 
         // The fused kernel takes k and v with their own heads (GQA). It masks causally itself, or
         // reads a given mask through its strides, so the heads share one `[B, 1, T, T]` copy.
@@ -887,6 +910,10 @@ impl Qwen3Attention {
             AttentionMask::Additive(mask) => Some(mask),
             AttentionMask::None | AttentionMask::Causal | AttentionMask::Fused(_) => None,
         };
+
+        // The fused rope leaves q and k transposed views; the matmuls below read them contiguous.
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
 
         // GQA expand
         let k = repeat_kv(&k, self.num_kv_groups)?; // [B,Nh,T,D]
@@ -943,12 +970,12 @@ impl Qwen3DecoderLayer {
         &self,
         hidden_states: &Tensor,
         mask: AttentionMask<'_>,
-        position_embeddings: (&Tensor, &Tensor),
+        rotary: RotaryTables<'_>,
     ) -> Result<Tensor> {
         // Pre-norm
         let residual = hidden_states.clone();
         let hs = hidden_states.apply(&self.input_layernorm)?;
-        let hs = self.self_attn.forward(&hs, position_embeddings, mask)?;
+        let hs = self.self_attn.forward(&hs, rotary, mask)?;
         let hs = (residual + hs)?;
 
         // MLP
@@ -1014,29 +1041,23 @@ impl Qwen3Model {
         deepstack_additions: Option<&[Tensor]>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (b, t, _) = inputs_embeds.dims3()?;
+        let (_, t, _) = inputs_embeds.dims3()?;
         let mut hs = inputs_embeds.clone();
 
-        let default_position_ids = if position_ids.is_none() {
-            let pos_1d = Tensor::arange(0u32, t as u32, hs.device())?;
-            Some(pos_1d.unsqueeze(0)?.expand((b, t))?.contiguous()?)
-        } else {
-            None
+        // (cos, sin) once. With no position ids every row's positions are 0..T, which the fused
+        // rope kernel takes as one `[T, D/2]` table; given ids (MRoPE) take the per-row tables.
+        let (cos, sin) = match position_ids {
+            Some(position_ids) => self.rotary_emb.forward(&hs, position_ids)?,
+            None => self.rotary_emb.plain_tables(t, hs.dtype(), hs.device())?,
         };
-        let position_ids = if let Some(position_ids) = position_ids {
-            position_ids
-        } else {
-            default_position_ids.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg("missing default position ids".to_string())
-            })?
+        let rotary = match position_ids {
+            Some(_) => RotaryTables::PerRow(&cos, &sin),
+            None => RotaryTables::Plain(&cos, &sin),
         };
-
-        // position_embeddings = (cos,sin) once
-        let (cos, sin) = self.rotary_emb.forward(&hs, position_ids)?;
 
         // layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hs = layer.forward(&hs, mask, (&cos, &sin))?;
+            hs = layer.forward(&hs, mask, rotary)?;
             if let Some(additions) = deepstack_additions {
                 if let Some(visual_add) = additions.get(layer_idx) {
                     hs = hs.add(visual_add)?;
@@ -1559,6 +1580,174 @@ mod tests {
         assert_eq!(
             fused.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             additive.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    fn max_abs_diff(a: &candle_core::Tensor, b: &candle_core::Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    fn small_config() -> super::Config {
+        let config = r#"{
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "head_dim": 16,
+            "hidden_act": "silu",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "max_position_embeddings": 4096,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 1,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "rope_scaling": null,
+            "rope_theta": 10000,
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "vocab_size": 1000
+        }"#;
+        parse_config_and_weight_prefix(config.as_bytes()).unwrap().0
+    }
+
+    #[test]
+    fn fused_rms_norm_matches_the_f32_formula() {
+        use super::Qwen3RMSNorm;
+        use candle_core::{DType, Device, Module, Tensor, D};
+
+        let device = Device::Cpu;
+        let eps = 1e-6f64;
+        let xs = Tensor::randn(0f32, 3.0, (2, 5, 3, 16), &device).unwrap();
+        let weight = Tensor::randn(1f32, 0.5, (16,), &device).unwrap();
+        let norm = Qwen3RMSNorm {
+            weight: weight.clone(),
+            eps,
+        };
+
+        // The unfused form: xs * 1/sqrt(mean(xs^2) + eps) * weight, in f32.
+        let var = xs.sqr().unwrap().mean_keepdim(D::Minus1).unwrap();
+        let inv_rms = (var + eps).unwrap().sqrt().unwrap().recip().unwrap();
+        let expected = xs
+            .broadcast_mul(&inv_rms)
+            .unwrap()
+            .broadcast_mul(&weight)
+            .unwrap();
+
+        let fused = norm.forward(&xs).unwrap();
+        assert_eq!(fused.dims(), expected.dims());
+        assert_eq!(fused.dtype(), DType::F32);
+        assert!(max_abs_diff(&fused, &expected) < 1e-5, "rms norm differs");
+    }
+
+    #[test]
+    fn fused_rope_matches_rotate_half_for_plain_positions() {
+        use super::{apply_rotary_pos_emb, Qwen3RotaryEmbedding};
+        use candle_core::{DType, Device, Tensor};
+
+        let cfg = small_config();
+        let device = Device::Cpu;
+        let rotary = Qwen3RotaryEmbedding::new(&cfg, &device).unwrap();
+        let (b, t, d) = (2usize, 9usize, cfg.head_dim());
+        let (heads, kv_heads) = (cfg.num_attention_heads, cfg.num_key_value_heads);
+
+        // q and k as the attention holds them after q_norm and k_norm: [B, T, heads, D].
+        let q = Tensor::randn(0f32, 1.0, (b, t, heads, d), &device).unwrap();
+        let k = Tensor::randn(0f32, 1.0, (b, t, kv_heads, d), &device).unwrap();
+
+        let xs = Tensor::zeros((b, t, d), DType::F32, &device).unwrap();
+        let positions: Vec<u32> = (0..b).flat_map(|_| 0..t as u32).collect();
+        let position_ids = Tensor::from_vec(positions, (b, t), &device).unwrap();
+        let (cos, sin) = rotary.forward(&xs, &position_ids).unwrap();
+        let (q_ref, k_ref) = apply_rotary_pos_emb(
+            &q.transpose(1, 2).unwrap(),
+            &k.transpose(1, 2).unwrap(),
+            &cos,
+            &sin,
+        )
+        .unwrap();
+
+        let (cos, sin) = rotary.plain_tables(t, DType::F32, &device).unwrap();
+        assert_eq!(cos.dims(), &[t, d / 2]);
+        let q_fused = candle_nn::rotary_emb::rope_thd(&q, &cos, &sin)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        let k_fused = candle_nn::rotary_emb::rope_thd(&k, &cos, &sin)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+
+        assert!(max_abs_diff(&q_fused, &q_ref) < 1e-5, "q differs");
+        assert!(max_abs_diff(&k_fused, &k_ref) < 1e-5, "k differs");
+        // A late position is rotated, so the comparison is not of two identities.
+        assert!(max_abs_diff(&q_ref, &q.transpose(1, 2).unwrap()) > 1e-2);
+    }
+
+    #[test]
+    fn plain_rope_tables_match_explicit_positions_through_the_model() {
+        use super::{build_attention_mask_4d, Qwen3Model};
+        use candle_core::{DType, Device, Tensor};
+        use candle_nn::{Init, VarBuilder, VarMap};
+
+        let cfg = small_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        // A VarMap starts a plain `get` at zero, which would zero every norm; start them near 1.
+        let near_one = Init::Randn {
+            mean: 1.0,
+            stdev: 0.1,
+        };
+        for (name, dim) in [
+            ("norm", cfg.hidden_size),
+            ("layers.0.input_layernorm", cfg.hidden_size),
+            ("layers.0.post_attention_layernorm", cfg.hidden_size),
+            ("layers.0.self_attn.q_norm", cfg.head_dim()),
+            ("layers.0.self_attn.k_norm", cfg.head_dim()),
+        ] {
+            vb.pp(name).get_with_hints(dim, "weight", near_one).unwrap();
+        }
+        let model = Qwen3Model::new(cfg, vb).unwrap();
+
+        let (b, t) = (2usize, 7usize);
+        let ids: Vec<u32> = (0..(b * t) as u32).map(|i| (i * 13) % 1000).collect();
+        let input_ids = Tensor::from_vec(ids, (b, t), &device).unwrap();
+
+        // On the CPU this is the additive-mask attention with the plain `[T, D/2]` tables.
+        let plain = model.forward_causal(&input_ids).unwrap();
+
+        // The same forward with the positions given, which takes the per-row tables.
+        let no_padding = Tensor::ones((b, t), DType::F32, &device).unwrap();
+        let mask = build_attention_mask_4d(&no_padding).unwrap();
+        let positions = Tensor::arange(0u32, t as u32, &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .expand((b, t))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let embeds = model.embed_tokens(&input_ids).unwrap();
+        let per_row = model
+            .forward_with_inputs_embeds(&embeds, Some(&mask), None, Some(&positions))
+            .unwrap();
+
+        assert!(
+            max_abs_diff(&plain, &per_row) < 1e-4,
+            "hidden states differ"
+        );
+        let zeros = plain.zeros_like().unwrap();
+        assert!(
+            max_abs_diff(&plain, &zeros) > 1e-2,
+            "hidden states are zero"
         );
     }
 
