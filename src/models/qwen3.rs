@@ -1456,12 +1456,18 @@ fn embedding_tokenizer(path: &Path, max_length: usize) -> Result<tokenizers::Tok
 pub struct Qwen3TextEmbedding {
     model: Qwen3Model,
     tokenizer: tokenizers::Tokenizer,
+    /// Keep this many leading dimensions of each vector before normalizing; `None` keeps all.
+    output_dim: Option<usize>,
 }
 
 impl Qwen3TextEmbedding {
     /// Build from an already loaded model and tokenizer.
     pub fn new(model: Qwen3Model, tokenizer: tokenizers::Tokenizer) -> Self {
-        Self { model, tokenizer }
+        Self {
+            model,
+            tokenizer,
+            output_dim: None,
+        }
     }
 
     /// Load from a Hugging Face repo.
@@ -1504,7 +1510,31 @@ impl Qwen3TextEmbedding {
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
         let tokenizer = embedding_tokenizer(&tok_path, max_length)?;
 
-        Ok(Self { model, tokenizer })
+        Ok(Self {
+            model,
+            tokenizer,
+            output_dim: None,
+        })
+    }
+
+    /// Return vectors of `dim` numbers: each vector's leading `dim` dimensions, L2-normalized
+    /// again. Qwen3-Embedding is trained so that these shorter vectors still work (its model card
+    /// lists output sizes from 32 up to the hidden size). `dim` equal to the hidden size gives
+    /// the full vectors unchanged.
+    pub fn with_output_dim(mut self, dim: usize) -> Result<Self> {
+        let hidden = self.model.config().hidden_size;
+        if dim == 0 || dim > hidden {
+            return Err(candle_core::Error::Msg(format!(
+                "output dim {dim} must be between 1 and the hidden size {hidden}"
+            )));
+        }
+        self.output_dim = (dim < hidden).then_some(dim);
+        Ok(self)
+    }
+
+    /// The length of the vectors `embed` returns.
+    pub fn output_dim(&self) -> usize {
+        self.output_dim.unwrap_or(self.model.config().hidden_size)
     }
 
     /// Loads a GGUF file, such as `Qwen3-Embedding-4B-Q8_0.gguf`, with the original model's
@@ -1520,7 +1550,11 @@ impl Qwen3TextEmbedding {
         let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(gguf_path))?;
         let model = Qwen3Model::from_gguf(&content, &mut file, device)?;
         let tokenizer = embedding_tokenizer(tokenizer_path, max_length)?;
-        Ok(Self { model, tokenizer })
+        Ok(Self {
+            model,
+            tokenizer,
+            output_dim: None,
+        })
     }
 
     /// [`Self::from_gguf`] with `gguf_file` from `gguf_repo_id` and `tokenizer.json` from
@@ -1586,7 +1620,7 @@ impl Qwen3TextEmbedding {
             let input_ids = Tensor::from_vec(ids, (members.len(), len), device)?;
             // [k, 1, H]: the last layer computes the last position alone.
             let hidden = self.model.forward_causal(&input_ids, Rows::Last)?;
-            let pooled = l2_normalize(&hidden.i((.., 0))?)?
+            let pooled = l2_normalize(&self.shorten(hidden.i((.., 0))?)?)?
                 .to_dtype(DType::F32)?
                 .to_vec2::<f32>()?;
             for (i, v) in members.into_iter().zip(pooled) {
@@ -1642,7 +1676,7 @@ impl Qwen3TextEmbedding {
 
         // Last token pooling: with left padding, the last position is always the real last
         // token, and it is the one position the last layer computed: [B, 1, H].
-        let pooled = hidden.i((.., 0))?; // [B, H]
+        let pooled = self.shorten(hidden.i((.., 0))?)?; // [B, H]
 
         // L2 normalize (add epsilon for numerical stability)
         let normalized = l2_normalize(&pooled)?;
@@ -1651,6 +1685,15 @@ impl Qwen3TextEmbedding {
         let normalized = normalized.to_dtype(DType::F32)?;
         let data = normalized.to_vec2::<f32>()?;
         Ok(data)
+    }
+
+    /// A shorter output keeps the leading dimensions of the pooled `[B, H]` rows, which are
+    /// then normalized as the full vector is.
+    fn shorten(&self, pooled: Tensor) -> Result<Tensor> {
+        match self.output_dim {
+            Some(dim) => pooled.narrow(1, 0, dim),
+            None => Ok(pooled),
+        }
     }
 }
 
@@ -2251,6 +2294,44 @@ mod tests {
         let padded = model.embed_padded(&texts).unwrap();
         let alone = model.embed(&texts[1..2]).unwrap();
         assert_ne!(padded[1], alone[0], "padding changed nothing");
+    }
+
+    #[test]
+    fn output_dim_keeps_the_leading_dimensions_normalized() {
+        let model = super::Qwen3TextEmbedding::new(
+            random_model(
+                small_config(),
+                2,
+                &candle_core::Device::Cpu,
+                candle_core::DType::F32,
+            ),
+            word_tokenizer(),
+        );
+        let texts = ["w1 w2 w3", "w4 w5", "w6 w7 w8 w9"];
+        let hidden = small_config().hidden_size;
+        let full = model.embed(&texts).unwrap();
+        assert_eq!(model.output_dim(), hidden);
+
+        // The hidden size itself is the full vector, bit for bit.
+        let model = model.with_output_dim(hidden).unwrap();
+        assert_eq!(model.embed(&texts).unwrap(), full);
+
+        let dim = 16;
+        let model = model.with_output_dim(dim).unwrap();
+        assert_eq!(model.output_dim(), dim);
+        let short = model.embed(&texts).unwrap();
+        for padded in model.embed_padded(&texts).unwrap() {
+            assert_eq!(padded.len(), dim);
+        }
+        for (s, f) in short.iter().zip(&full) {
+            assert_eq!(s.len(), dim);
+            let norm: f32 = f[..dim].iter().map(|x| x * x).sum::<f32>().sqrt();
+            for (a, b) in s.iter().zip(&f[..dim]) {
+                assert!((a - b / norm).abs() < 1e-6, "{a} against {}", b / norm);
+            }
+        }
+
+        assert!(model.with_output_dim(hidden + 1).is_err());
     }
 
     /// The last layer run for the last position alone gives the last row the full run gives:
