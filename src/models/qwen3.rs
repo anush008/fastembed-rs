@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
 
+use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
 fn default_true() -> bool {
@@ -854,18 +855,13 @@ impl Qwen3Attention {
         let (b, t, _h) = hidden_states.dims3()?;
         let d = self.head_dim;
 
-        // hidden_shape = [B,T,-1,D]
-        // q: [B,T,Nh*D] -> [B,T,Nh,D] -> q_norm
+        // hidden_shape = [B,T,-1,D]: q [B,T,Nh,D] and k [B,T,Nkv,D], before q_norm and k_norm
         let q = hidden_states
             .apply(&self.q_proj)?
-            .reshape((b, t, self.num_heads, d))?
-            .apply(&self.q_norm)?;
-
-        // k: [B,T,Nkv*D] -> [B,T,Nkv,D] -> k_norm
+            .reshape((b, t, self.num_heads, d))?;
         let k = hidden_states
             .apply(&self.k_proj)?
-            .reshape((b, t, self.num_kv_heads, d))?
-            .apply(&self.k_norm)?;
+            .reshape((b, t, self.num_kv_heads, d))?;
 
         // v: [B,Nkv,T,D]
         let v = hidden_states
@@ -873,15 +869,24 @@ impl Qwen3Attention {
             .reshape((b, t, self.num_kv_heads, d))?
             .transpose(1, 2)?;
 
-        // RoPE, then q: [B,Nh,T,D] and k: [B,Nkv,T,D]
+        // q_norm/k_norm and RoPE, then q: [B,Nh,T,D] and k: [B,Nkv,T,D]. With the plain tables
+        // the two run as one pass over q and one over k (one kernel each on Metal).
         let (q, k) = match rotary {
-            RotaryTables::Plain(cos, sin) => (
-                candle_nn::rotary_emb::rope_thd(&q, cos, sin)?.transpose(1, 2)?,
-                candle_nn::rotary_emb::rope_thd(&k, cos, sin)?.transpose(1, 2)?,
-            ),
-            RotaryTables::PerRow(cos, sin) => {
-                apply_rotary_pos_emb(&q.transpose(1, 2)?, &k.transpose(1, 2)?, cos, sin)?
+            RotaryTables::Plain(cos, sin) => {
+                let norm_rope = |xs: &Tensor, norm: &Qwen3RMSNorm| {
+                    rms_norm_rope_thd(xs, &norm.weight, cos, sin, norm.eps as f32)
+                };
+                (
+                    norm_rope(&q, &self.q_norm)?.transpose(1, 2)?,
+                    norm_rope(&k, &self.k_norm)?.transpose(1, 2)?,
+                )
             }
+            RotaryTables::PerRow(cos, sin) => apply_rotary_pos_emb(
+                &q.apply(&self.q_norm)?.transpose(1, 2)?,
+                &k.apply(&self.k_norm)?.transpose(1, 2)?,
+                cos,
+                sin,
+            )?,
         };
 
         // The fused kernel takes k and v with their own heads (GQA). It masks causally itself, or
