@@ -1548,8 +1548,58 @@ impl Qwen3TextEmbedding {
         self.model.device()
     }
 
-    /// Embed a batch of texts, returning normalized embeddings.
+    /// Embed a batch of texts, returning normalized embeddings in the order of `texts`.
+    ///
+    /// The texts are grouped by token length and each group runs as one batch with no padding,
+    /// so every forward takes the causal path and every text's vector is the one it gets
+    /// embedded alone, whatever else is in the call.
     pub fn embed<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), true)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        // Each text's tokens without the left padding, grouped by their count.
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        let mut tokens: Vec<&[u32]> = Vec::with_capacity(encodings.len());
+        for (i, enc) in encodings.iter().enumerate() {
+            let pad = enc
+                .get_attention_mask()
+                .iter()
+                .take_while(|&&m| m == 0)
+                .count();
+            let ids = &enc.get_ids()[pad..];
+            groups.entry(ids.len()).or_default().push(i);
+            tokens.push(ids);
+        }
+
+        let device = self.model.device();
+        let mut out = vec![Vec::new(); texts.len()];
+        for (len, members) in groups {
+            let ids: Vec<u32> = members
+                .iter()
+                .flat_map(|&i| tokens[i].iter().copied())
+                .collect();
+            let input_ids = Tensor::from_vec(ids, (members.len(), len), device)?;
+            // [k, 1, H]: the last layer computes the last position alone.
+            let hidden = self.model.forward_causal(&input_ids, Rows::Last)?;
+            let pooled = l2_normalize(&hidden.i((.., 0))?)?
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?;
+            for (i, v) in members.into_iter().zip(pooled) {
+                out[i] = v;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Embed every text in one left-padded batch: one forward for the whole call, but each
+    /// text's vector depends a little on how much its batch pads it. [`Self::embed`] runs
+    /// equal-length groups without padding instead.
+    pub fn embed_padded<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
@@ -2127,6 +2177,80 @@ mod tests {
             }
         }
         super::Qwen3Model::new(cfg, vb).unwrap()
+    }
+
+    /// A word-level tokenizer over `w0`..`w99` that splits on whitespace and pads on the left,
+    /// as the embedding tokenizer does.
+    fn word_tokenizer() -> tokenizers::Tokenizer {
+        use std::str::FromStr;
+        let vocab: Vec<String> = std::iter::once("\"[UNK]\": 0".to_string())
+            .chain((0..100).map(|i| format!("\"w{i}\": {}", i + 1)))
+            .collect();
+        let json = format!(
+            r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {{"type": "WhitespaceSplit"}},
+                "post_processor": null, "decoder": null,
+                "model": {{"type": "WordLevel", "vocab": {{{}}}, "unk_token": "[UNK]"}}}}"#,
+            vocab.join(", ")
+        );
+        let mut tokenizer = tokenizers::Tokenizer::from_str(&json).unwrap();
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: tokenizers::PaddingDirection::Left,
+            ..Default::default()
+        }));
+        tokenizer
+    }
+
+    /// Texts of 5, 2, 9, 5, 1, 9 and 5 words: three lengths repeat, one stands alone.
+    fn mixed_texts() -> Vec<String> {
+        [5usize, 2, 9, 5, 1, 9, 5]
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                (0..n)
+                    .map(|w| format!("w{}", (i * 31 + w * 7) % 100))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn embed_gives_each_text_its_vector_alone_in_the_callers_order() {
+        let model = super::Qwen3TextEmbedding::new(
+            random_model(
+                small_config(),
+                2,
+                &candle_core::Device::Cpu,
+                candle_core::DType::F32,
+            ),
+            word_tokenizer(),
+        );
+        let texts = mixed_texts();
+        let together = model.embed(&texts).unwrap();
+        assert_eq!(together.len(), texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let alone = model.embed(std::slice::from_ref(text)).unwrap();
+            if [1, 4].contains(&i) {
+                // The only text of its length runs as a batch of one, exactly as alone.
+                assert_eq!(together[i], alone[0], "text {i} differs from alone");
+            } else {
+                // In a group of equal-length texts the matmuls sum in another order.
+                let diff = together[i]
+                    .iter()
+                    .zip(&alone[0])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(diff < 1e-5, "text {i} differs from alone by {diff}");
+            }
+        }
+        // Different texts give different vectors, so a mixed-up order would show.
+        assert_ne!(together[0], together[1]);
+        // One padded batch (today's `embed`) does not give a text its vector alone bit for bit.
+        let padded = model.embed_padded(&texts).unwrap();
+        let alone = model.embed(&texts[1..2]).unwrap();
+        assert_ne!(padded[1], alone[0], "padding changed nothing");
     }
 
     /// The last layer run for the last position alone gives the last row the full run gives:
