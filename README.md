@@ -307,7 +307,7 @@ Quantized GGUF files (for example from `Qwen/Qwen3-Embedding-4B-GGUF` or `Qwen/Q
 
 ```rust
 use candle_core::Device;
-use fastembed::{GgufMatmul, Qwen3TextEmbedding};
+use fastembed::Qwen3TextEmbedding;
 
 let device = Device::Cpu;
 let model = Qwen3TextEmbedding::from_hf_gguf(
@@ -316,7 +316,6 @@ let model = Qwen3TextEmbedding::from_hf_gguf(
     "Qwen/Qwen3-Embedding-4B",
     &device,
     512,
-    GgufMatmul::default(),
 )?;
 
 let embeddings = model.embed(&["query: ...", "passage: ..."])?;

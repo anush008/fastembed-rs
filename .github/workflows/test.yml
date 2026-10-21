@@ -56,6 +56,7 @@ jobs:
           - { name: text-models-2, filter: "--test text-embeddings test_batch_size_default", shard: "2/4" }
           - { name: text-models-3, filter: "--test text-embeddings test_batch_size_default", shard: "3/4" }
           - { name: image, filter: "--test image-embeddings" }
+          - { name: qwen3, filter: "--features qwen3 --lib --test qwen3" }
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,7 +64,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: test
+          # The qwen3 suite also builds candle.
+          shared-key: ${{ matrix.suite.name == 'qwen3' && 'test-qwen3' || 'test' }}
 
       - name: Restore ONNX Build
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0

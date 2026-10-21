@@ -109,38 +109,32 @@ fn qwen3_06b_reference_scores() {
     }
 }
 
-/// The official Q8_0 GGUF of Qwen3-Embedding-0.6B on the CPU against Python. candle's CPU
-/// quantized matmul rounds each activation row to 8-bit blocks before the dot products (as
-/// llama.cpp's CPU path does), which moves single values by up to about 7e-3 and a vector's sum
-/// by up to about 4e-2.
+/// candle's CPU quantized matmul rounds the activations to 8-bit blocks, as llama.cpp does.
 #[test]
 fn qwen3_06b_gguf_matches_python() {
     check_06b_gguf_against_python(&Device::Cpu, 1e-2, 6e-2);
 }
 
-/// The same check on Metal, whose quantized matmul keeps the activations in f32: values agree with
-/// Python to about 1e-4.
 #[cfg(feature = "metal")]
 #[test]
 fn qwen3_06b_gguf_matches_python_on_metal() {
     check_06b_gguf_against_python(&Device::new_metal(0).expect("metal"), 5e-4, 5e-3);
 }
 
-/// The official Q8_0 GGUF of Qwen3-Embedding-0.6B, each text embedded alone, against reference
-/// values from Python: transformers loading the same GGUF file (it dequantizes the weights to
-/// f32), the original model's tokenizer, last-token pooling and L2 normalization, f32 on the CPU.
+/// The Q8_0 GGUF of Qwen3-Embedding-0.6B, each text embedded alone. The Python values come from
+/// transformers loading the same file in f32, with last-token pooling and L2 normalization. Each
+/// full vector is also compared with the f32 safetensors model.
 fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolerance: f32) {
-    use fastembed::GgufMatmul;
-
     let model = Qwen3TextEmbedding::from_hf_gguf(
         "Qwen/Qwen3-Embedding-0.6B-GGUF",
         "Qwen3-Embedding-0.6B-Q8_0.gguf",
         REPO_06B,
         device,
         8192,
-        GgufMatmul::default(),
     )
     .expect("load model");
+    let reference =
+        Qwen3TextEmbedding::from_hf(REPO_06B, &Device::Cpu, DType::F32, 8192).expect("load model");
 
     let task = "Given a web search query, retrieve relevant passages that answer the query";
     let texts = [
@@ -197,7 +191,12 @@ fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolera
 
     let mut embeddings = Vec::new();
     for text in &texts {
-        embeddings.extend(model.embed(std::slice::from_ref(text)).expect("embed"));
+        let emb = model.embed(std::slice::from_ref(text)).expect("embed");
+        let want = reference.embed(std::slice::from_ref(text)).expect("embed");
+        let cosine = cosine_sim(&emb[0], &want[0]);
+        // Q8_0 weights and 8-bit activations give 0.9988 to 0.9994 on the CPU.
+        assert!(cosine > 0.998, "cosine to safetensors: {cosine}");
+        embeddings.extend(emb);
     }
     for (idx, emb) in embeddings.iter().enumerate() {
         assert_eq!(emb.len(), model.config().hidden_size);
@@ -217,7 +216,7 @@ fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolera
         }
     }
 
-    // The model card's scores for these texts, as `qwen3_06b_reference_scores` checks them.
+    // The model card's scores.
     let expected = [[0.7646f32, 0.1414f32], [0.1355f32, 0.6000f32]];
     for i in 0..2 {
         for j in 0..2 {

@@ -514,82 +514,63 @@ impl Qwen3RMSNorm {
         Ok(Self { weight, eps })
     }
 
-    /// A norm over an already loaded weight, as a GGUF file holds it.
     fn from_weight(weight: Tensor, eps: f64) -> Self {
         Self { weight, eps }
     }
 }
 
-/// How a model loaded from a GGUF file multiplies by its quantized matrices. The matrices stay
-/// quantized in memory either way.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GgufMatmul {
-    /// candle's quantized matmul kernels, reading the quantized blocks directly. The faster
-    /// way on Metal: Qwen3-Embedding-4B Q8_0 embeds 512 tokens in 0.68 s this way and in 7.2 s
-    /// by `DequantizeF16`.
-    #[default]
-    Quantized,
-    /// Each matrix is dequantized to f16 just before it multiplies and freed after, so the
-    /// multiply is an f16 GEMM over about one f16 matrix of memory above the quantized weights.
-    /// Every call pays the dequantization of every matrix.
-    DequantizeF16,
-}
-
-/// One weight matrix of a layer: a dense `Linear` loaded from safetensors, or a quantized matrix
-/// loaded from a GGUF file. A quantized matrix takes and returns f32.
+/// A dense matrix from safetensors, or a quantized one from a GGUF file.
 pub enum Projection {
     Dense(Linear),
-    Quantized(QMatMul, GgufMatmul),
+    Quantized(QMatMul),
 }
 
 impl Module for Projection {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Projection::Dense(linear) => linear.forward(xs),
-            Projection::Quantized(matrix, matmul) => {
-                // candle's quantized matmul on Metal reads a contiguous input from its buffer's
-                // start and ignores a view's offset, so a view (the last position's rows under
-                // `Rows::Last`) is copied first.
-                let copied;
-                let xs = if xs.is_contiguous() && xs.layout().start_offset() == 0 {
-                    xs
-                } else {
-                    copied = xs.force_contiguous()?;
-                    &copied
-                };
-                match matmul {
-                    GgufMatmul::Quantized => matrix.forward(xs),
-                    GgufMatmul::DequantizeF16 => matrix.forward_via_f16(xs),
-                }
+            // candle's quantized matmul rejects strided input, and off the CPU it also ignores a
+            // view's start offset.
+            Projection::Quantized(matrix)
+                if xs.is_contiguous()
+                    && (xs.layout().start_offset() == 0 || xs.device().is_cpu()) =>
+            {
+                matrix.forward(xs)
             }
+            Projection::Quantized(matrix) => matrix.forward(&xs.force_contiguous()?),
         }
     }
 }
 
-/// The weights of a GGUF file, read one tensor at a time onto a device.
 struct GgufWeights<'a, R: Read + Seek> {
     content: &'a gguf_file::Content,
     reader: &'a mut R,
     device: &'a Device,
-    matmul: GgufMatmul,
 }
 
 impl<R: Read + Seek> GgufWeights<'_, R> {
-    fn qtensor(&mut self, name: &str, device: &Device) -> Result<QTensor> {
-        self.content.tensor(self.reader, name, device)
+    fn tensor(&mut self, name: &str, dims: &[usize], device: &Device) -> Result<QTensor> {
+        let tensor = self.content.tensor(self.reader, name, device)?;
+        if tensor.shape().dims() != dims {
+            candle_core::bail!(
+                "GGUF tensor `{name}` has shape {:?}, expected {dims:?}",
+                tensor.shape().dims()
+            );
+        }
+        Ok(tensor)
     }
 
-    fn projection(&mut self, name: &str) -> Result<Projection> {
-        let device = self.device.clone();
-        let matrix = QMatMul::from_qtensor(self.qtensor(&format!("{name}.weight"), &device)?)?;
-        Ok(Projection::Quantized(matrix, self.matmul))
+    fn projection(&mut self, name: &str, out_dim: usize, in_dim: usize) -> Result<Projection> {
+        let device = self.device;
+        let matrix = self.tensor(&format!("{name}.weight"), &[out_dim, in_dim], device)?;
+        Ok(Projection::Quantized(QMatMul::from_qtensor(matrix)?))
     }
 
-    fn norm(&mut self, name: &str, eps: f64) -> Result<Qwen3RMSNorm> {
-        let device = self.device.clone();
+    fn norm(&mut self, name: &str, dim: usize, eps: f64) -> Result<Qwen3RMSNorm> {
+        let device = self.device;
         let weight = self
-            .qtensor(&format!("{name}.weight"), &device)?
-            .dequantize(&device)?;
+            .tensor(&format!("{name}.weight"), &[dim], device)?
+            .dequantize(device)?;
         Ok(Qwen3RMSNorm::from_weight(weight, eps))
     }
 
@@ -600,38 +581,44 @@ impl<R: Read + Seek> GgufWeights<'_, R> {
             .ok_or_else(|| candle_core::Error::Msg(format!("GGUF metadata has no `{key}`")))
     }
 
-    /// The text model's config from the file's `qwen3.*` metadata.
+    fn metadata_usize(&self, key: &str) -> Result<usize> {
+        Ok(self.metadata(key)?.to_u64()? as usize)
+    }
+
     fn config(&self) -> Result<Config> {
         let architecture = self.metadata("general.architecture")?.to_string()?;
         if architecture != "qwen3" {
-            return Err(candle_core::Error::Msg(format!(
-                "GGUF architecture is `{architecture}`, not `qwen3`"
-            )));
+            candle_core::bail!("GGUF architecture is `{architecture}`, not `qwen3`");
         }
-        let get = |key: &str| -> Result<usize> {
-            Ok(self.metadata(&format!("qwen3.{key}"))?.to_u32()? as usize)
+        if self.content.tensor_infos.contains_key("blk.0.attn_q.bias") {
+            candle_core::bail!("GGUF Qwen3 with attention biases is not supported");
+        }
+        let get = |key: &str| self.metadata_usize(&format!("qwen3.{key}"));
+        let hidden_size = get("embedding_length")?;
+        let num_attention_heads = get("attention.head_count")?;
+        // llama.cpp's fallback when the file has no key_length.
+        let head_dim = match self.metadata("qwen3.attention.key_length") {
+            Ok(value) => value.to_u64()? as usize,
+            Err(_) => hidden_size / num_attention_heads,
         };
         let table = self
             .content
             .tensor_infos
             .get("token_embd.weight")
             .ok_or_else(|| candle_core::Error::Msg("GGUF has no `token_embd.weight`".into()))?;
-        let (vocab_size, _) = table.shape.dims2()?;
-        let attention_bias = self.content.tensor_infos.contains_key("blk.0.attn_q.bias");
-        if attention_bias {
-            return Err(candle_core::Error::Msg(
-                "GGUF Qwen3 with attention biases is not supported".into(),
-            ));
+        let (vocab_size, width) = table.shape.dims2()?;
+        if width != hidden_size {
+            candle_core::bail!("GGUF `token_embd.weight` is {width} wide, expected {hidden_size}");
         }
         Ok(Config {
-            attention_bias,
+            attention_bias: false,
             attention_dropout: 0.0,
-            head_dim: Some(get("attention.key_length")?),
+            head_dim: Some(head_dim),
             hidden_act: Activation::Silu,
-            hidden_size: get("embedding_length")?,
+            hidden_size,
             intermediate_size: get("feed_forward_length")?,
             max_position_embeddings: get("context_length")?,
-            num_attention_heads: get("attention.head_count")?,
+            num_attention_heads,
             num_hidden_layers: get("block_count")?,
             num_key_value_heads: get("attention.head_count_kv")?,
             rms_norm_eps: f64::from(
@@ -680,16 +667,16 @@ impl Qwen3MLP {
         })
     }
 
-    /// Layer `prefix` (`blk.<i>`) of a GGUF file: `ffn_gate`, `ffn_up`, `ffn_down`.
     fn from_gguf<R: Read + Seek>(
         cfg: &Config,
         weights: &mut GgufWeights<'_, R>,
         prefix: &str,
     ) -> Result<Self> {
+        let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            gate_proj: weights.projection(&format!("{prefix}.ffn_gate"))?,
-            up_proj: weights.projection(&format!("{prefix}.ffn_up"))?,
-            down_proj: weights.projection(&format!("{prefix}.ffn_down"))?,
+            gate_proj: weights.projection(&format!("{prefix}.ffn_gate"), inter, hidden)?,
+            up_proj: weights.projection(&format!("{prefix}.ffn_up"), inter, hidden)?,
+            down_proj: weights.projection(&format!("{prefix}.ffn_down"), hidden, inter)?,
             act_fn: cfg.hidden_act,
         })
     }
@@ -943,16 +930,8 @@ pub struct Qwen3Attention {
 impl Qwen3Attention {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.head_dim();
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let num_kv_groups = cfg.num_kv_groups();
-        assert!(
-            num_heads.is_multiple_of(num_kv_heads),
-            "num_heads must be multiple of num_kv_heads"
-        );
-
-        let q_out = num_heads * head_dim;
-        let kv_out = num_kv_heads * head_dim;
+        let q_out = cfg.num_attention_heads * head_dim;
+        let kv_out = cfg.num_key_value_heads * head_dim;
 
         let q_proj = if cfg.attention_bias {
             linear(cfg.hidden_size, q_out, vb.pp("q_proj"))?
@@ -979,43 +958,54 @@ impl Qwen3Attention {
         let q_norm = Qwen3RMSNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = Qwen3RMSNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
 
-        Ok(Self {
-            q_proj: Projection::Dense(q_proj),
-            k_proj: Projection::Dense(k_proj),
-            v_proj: Projection::Dense(v_proj),
-            o_proj: Projection::Dense(o_proj),
+        Self::from_parts(
+            cfg,
+            [q_proj, k_proj, v_proj, o_proj].map(Projection::Dense),
             q_norm,
             k_norm,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            scaling: (head_dim as f32).powf(-0.5),
-        })
+        )
     }
 
-    /// Layer `prefix` (`blk.<i>`) of a GGUF file: `attn_q`, `attn_k`, `attn_v`, `attn_output`,
-    /// `attn_q_norm`, `attn_k_norm`.
     fn from_gguf<R: Read + Seek>(
         cfg: &Config,
         weights: &mut GgufWeights<'_, R>,
         prefix: &str,
     ) -> Result<Self> {
-        let head_dim = cfg.head_dim();
+        let (hidden, head_dim, eps) = (cfg.hidden_size, cfg.head_dim(), cfg.rms_norm_eps);
+        let q_out = cfg.num_attention_heads * head_dim;
+        let kv_out = cfg.num_key_value_heads * head_dim;
+        let projections = [
+            weights.projection(&format!("{prefix}.attn_q"), q_out, hidden)?,
+            weights.projection(&format!("{prefix}.attn_k"), kv_out, hidden)?,
+            weights.projection(&format!("{prefix}.attn_v"), kv_out, hidden)?,
+            weights.projection(&format!("{prefix}.attn_output"), hidden, q_out)?,
+        ];
+        let q_norm = weights.norm(&format!("{prefix}.attn_q_norm"), head_dim, eps)?;
+        let k_norm = weights.norm(&format!("{prefix}.attn_k_norm"), head_dim, eps)?;
+        Self::from_parts(cfg, projections, q_norm, k_norm)
+    }
+
+    /// `projections` is q, k, v, o.
+    fn from_parts(
+        cfg: &Config,
+        projections: [Projection; 4],
+        q_norm: Qwen3RMSNorm,
+        k_norm: Qwen3RMSNorm,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         if !num_heads.is_multiple_of(num_kv_heads) {
-            return Err(candle_core::Error::Msg(
-                "num_heads must be a multiple of num_kv_heads".into(),
-            ));
+            candle_core::bail!("num_heads must be a multiple of num_kv_heads");
         }
+        let head_dim = cfg.head_dim();
+        let [q_proj, k_proj, v_proj, o_proj] = projections;
         Ok(Self {
-            q_proj: weights.projection(&format!("{prefix}.attn_q"))?,
-            k_proj: weights.projection(&format!("{prefix}.attn_k"))?,
-            v_proj: weights.projection(&format!("{prefix}.attn_v"))?,
-            o_proj: weights.projection(&format!("{prefix}.attn_output"))?,
-            q_norm: weights.norm(&format!("{prefix}.attn_q_norm"), cfg.rms_norm_eps)?,
-            k_norm: weights.norm(&format!("{prefix}.attn_k_norm"), cfg.rms_norm_eps)?,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             num_kv_groups: cfg.num_kv_groups(),
@@ -1177,19 +1167,18 @@ impl Qwen3DecoderLayer {
         })
     }
 
-    /// Layer `i` of a GGUF file (`blk.<i>.*`).
     fn from_gguf<R: Read + Seek>(
         cfg: &Config,
         weights: &mut GgufWeights<'_, R>,
         i: usize,
     ) -> Result<Self> {
         let prefix = format!("blk.{i}");
+        let (hidden, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
         Ok(Self {
             self_attn: Qwen3Attention::from_gguf(cfg, weights, &prefix)?,
             mlp: Qwen3MLP::from_gguf(cfg, weights, &prefix)?,
-            input_layernorm: weights.norm(&format!("{prefix}.attn_norm"), cfg.rms_norm_eps)?,
-            post_attention_layernorm: weights
-                .norm(&format!("{prefix}.ffn_norm"), cfg.rms_norm_eps)?,
+            input_layernorm: weights.norm(&format!("{prefix}.attn_norm"), hidden, eps)?,
+            post_attention_layernorm: weights.norm(&format!("{prefix}.ffn_norm"), hidden, eps)?,
         })
     }
 
@@ -1218,8 +1207,7 @@ impl Qwen3DecoderLayer {
     }
 }
 
-/// The token table: dense on the model's device, or quantized and kept on the CPU (a GGUF file),
-/// where a lookup dequantizes only the rows it reads and moves them to the model's device in f32.
+/// A quantized table stays on the CPU. A lookup dequantizes only the rows it reads.
 enum TokenEmbedding {
     Dense(candle_nn::Embedding),
     Quantized { table: Box<QTensor>, device: Device },
@@ -1234,6 +1222,13 @@ impl TokenEmbedding {
                 .to_device(device),
         }
     }
+
+    fn ids_device<'a>(&'a self, model_device: &'a Device) -> &'a Device {
+        match self {
+            TokenEmbedding::Dense(_) => model_device,
+            TokenEmbedding::Quantized { .. } => &Device::Cpu,
+        }
+    }
 }
 
 pub struct Qwen3Model {
@@ -1246,29 +1241,30 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    /// The text model of a Qwen3 GGUF file (llama.cpp's `qwen3` tensor names), for example
-    /// `Qwen/Qwen3-Embedding-4B-GGUF`. Every matrix stays quantized on `device`; the token table
-    /// stays quantized on the CPU; the norms are dequantized to f32. The model runs in f32, and
-    /// `matmul` says how it multiplies by the quantized matrices.
+    /// Loads a llama.cpp `qwen3` GGUF file, such as `Qwen/Qwen3-Embedding-4B-GGUF`. The
+    /// matrices stay quantized on `device`, the token table stays quantized on the CPU, and the
+    /// model runs in f32.
     pub fn from_gguf<R: Read + Seek>(
         content: &gguf_file::Content,
         reader: &mut R,
         device: &Device,
-        matmul: GgufMatmul,
     ) -> Result<Self> {
         let mut weights = GgufWeights {
             content,
             reader,
             device,
-            matmul,
         };
         let cfg = weights.config()?;
-        let table = weights.qtensor("token_embd.weight", &Device::Cpu)?;
+        let table = weights.tensor(
+            "token_embd.weight",
+            &[cfg.vocab_size, cfg.hidden_size],
+            &Device::Cpu,
+        )?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             layers.push(Qwen3DecoderLayer::from_gguf(&cfg, &mut weights, i)?);
         }
-        let norm = weights.norm("output_norm", cfg.rms_norm_eps)?;
+        let norm = weights.norm("output_norm", cfg.hidden_size, cfg.rms_norm_eps)?;
         let rotary_emb = Qwen3RotaryEmbedding::new(&cfg, device)?;
         Ok(Self {
             embed_tokens: TokenEmbedding::Quantized {
@@ -1434,10 +1430,8 @@ impl Qwen3Model {
     }
 }
 
-/// The tokenizer an embedding model reads, from `tokenizer.json`: LEFT padding, so the last
-/// position is always the real last token (which keeps last-token pooling simple and matches the
-/// official implementation), truncated at `max_length`. Unlike some other embedding models,
-/// Qwen3-Embedding does NOT add an EOS token; the pooling takes the last real token.
+/// Left padding keeps the last real token at the last position, where the pooling reads it.
+/// Qwen3-Embedding adds no EOS token.
 fn embedding_tokenizer(path: &Path, max_length: usize) -> Result<tokenizers::Tokenizer> {
     use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, TruncationParams};
 
@@ -1513,28 +1507,24 @@ impl Qwen3TextEmbedding {
         Ok(Self { model, tokenizer })
     }
 
-    /// Load a Qwen3 embedding GGUF file (for example `Qwen3-Embedding-4B-Q8_0.gguf` from
-    /// `Qwen/Qwen3-Embedding-4B-GGUF`) with the original model's `tokenizer.json`. The matrices
-    /// stay quantized on `device` and the model runs in f32; see [`Qwen3Model::from_gguf`].
-    /// `GgufMatmul::default()` is the faster way to multiply for embedding.
+    /// Loads a GGUF file, such as `Qwen3-Embedding-4B-Q8_0.gguf`, with the original model's
+    /// `tokenizer.json`. See [`Qwen3Model::from_gguf`].
     pub fn from_gguf(
         gguf_path: &Path,
         tokenizer_path: &Path,
         device: &Device,
         max_length: usize,
-        matmul: GgufMatmul,
     ) -> Result<Self> {
         let mut file = std::fs::File::open(gguf_path)
             .map_err(|e| candle_core::Error::Msg(format!("{}: {e}", gguf_path.display())))?;
         let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(gguf_path))?;
-        let model = Qwen3Model::from_gguf(&content, &mut file, device, matmul)?;
+        let model = Qwen3Model::from_gguf(&content, &mut file, device)?;
         let tokenizer = embedding_tokenizer(tokenizer_path, max_length)?;
         Ok(Self { model, tokenizer })
     }
 
-    /// [`Self::from_gguf`] from Hugging Face: `gguf_file` from `gguf_repo_id` (for example
-    /// `Qwen/Qwen3-Embedding-4B-GGUF` and `Qwen3-Embedding-4B-Q8_0.gguf`), and `tokenizer.json`
-    /// from `tokenizer_repo_id` (for example `Qwen/Qwen3-Embedding-4B`).
+    /// [`Self::from_gguf`] with `gguf_file` from `gguf_repo_id` and `tokenizer.json` from
+    /// `tokenizer_repo_id`.
     #[cfg(feature = "hf-hub")]
     pub fn from_hf_gguf(
         gguf_repo_id: &str,
@@ -1542,13 +1532,12 @@ impl Qwen3TextEmbedding {
         tokenizer_repo_id: &str,
         device: &Device,
         max_length: usize,
-        matmul: GgufMatmul,
     ) -> Result<Self> {
         let gguf_path = hf_repo(gguf_repo_id)?.get(gguf_file).map_err(map_err)?;
         let tokenizer_path = hf_repo(tokenizer_repo_id)?
             .get("tokenizer.json")
             .map_err(map_err)?;
-        Self::from_gguf(&gguf_path, &tokenizer_path, device, max_length, matmul)
+        Self::from_gguf(&gguf_path, &tokenizer_path, device, max_length)
     }
 
     pub fn config(&self) -> &Config {
@@ -1583,7 +1572,11 @@ impl Qwen3TextEmbedding {
 
         let device = self.model.device();
         let padded = attention_mask_vec.contains(&0.0);
-        let input_ids = Tensor::from_vec(input_ids_vec, (batch_size, seq_len), device)?;
+        let input_ids = Tensor::from_vec(
+            input_ids_vec,
+            (batch_size, seq_len),
+            self.model.embed_tokens.ids_device(device),
+        )?;
 
         // Forward pass -> [B, T, H]. With no padding the mask is purely causal, which the fused
         // kernel applies itself, so neither the mask nor the attention table is built. With
@@ -2301,16 +2294,11 @@ mod tests {
         assert!(late_cos.iter().any(|&c| (c - 1.0).abs() > 1e-3));
     }
 
-    /// A random f32 model on the CPU (as `random_model` builds it) and the VarMap holding its
-    /// weights, so the same weights can be written to a GGUF file.
-    fn random_model_and_weights(
-        mut cfg: super::Config,
-        layers: usize,
-    ) -> (super::Qwen3Model, candle_nn::VarMap) {
+    /// A random f32 model on the CPU, and its VarMap for writing the same weights to GGUF.
+    fn random_model_and_weights(cfg: &super::Config) -> (super::Qwen3Model, candle_nn::VarMap) {
         use candle_core::{DType, Device};
         use candle_nn::{Init, VarBuilder, VarMap};
 
-        cfg.num_hidden_layers = layers;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
         let near_one = Init::Randn {
@@ -2320,7 +2308,7 @@ mod tests {
         vb.pp("norm")
             .get_with_hints(cfg.hidden_size, "weight", near_one)
             .unwrap();
-        for i in 0..layers {
+        for i in 0..cfg.num_hidden_layers {
             for (name, dim) in [
                 ("input_layernorm", cfg.hidden_size),
                 ("post_attention_layernorm", cfg.hidden_size),
@@ -2332,11 +2320,10 @@ mod tests {
                     .unwrap();
             }
         }
-        (super::Qwen3Model::new(cfg, vb).unwrap(), varmap)
+        (super::Qwen3Model::new(cfg.clone(), vb).unwrap(), varmap)
     }
 
-    /// The weights as a GGUF file in llama.cpp's `qwen3` layout, every matrix and the token
-    /// table in `matrix_dtype`, the norms in f32.
+    /// llama.cpp's `qwen3` layout, with the norms in f32 and everything else in `matrix_dtype`.
     fn gguf_bytes(
         cfg: &super::Config,
         varmap: &candle_nn::VarMap,
@@ -2421,33 +2408,42 @@ mod tests {
         out.into_inner()
     }
 
-    fn load_gguf(
+    /// Reads a GGUF file, lets `edit` change its metadata, and loads it.
+    fn load_gguf_with(
         bytes: Vec<u8>,
         device: &candle_core::Device,
-        matmul: super::GgufMatmul,
-    ) -> super::Qwen3Model {
+        edit: impl FnOnce(&mut candle_core::quantized::gguf_file::Content),
+    ) -> candle_core::Result<super::Qwen3Model> {
         use candle_core::quantized::gguf_file;
 
         let mut reader = std::io::Cursor::new(bytes);
-        let content = gguf_file::Content::read(&mut reader).unwrap();
-        super::Qwen3Model::from_gguf(&content, &mut reader, device, matmul).unwrap()
+        let mut content = gguf_file::Content::read(&mut reader).unwrap();
+        edit(&mut content);
+        super::Qwen3Model::from_gguf(&content, &mut reader, device)
     }
 
-    /// The small one-layer model and its weights.
+    fn load_gguf(bytes: Vec<u8>, device: &candle_core::Device) -> super::Qwen3Model {
+        load_gguf_with(bytes, device, |_| {}).unwrap()
+    }
+
     fn small_model() -> (super::Qwen3Model, candle_nn::VarMap) {
-        random_model_and_weights(small_config(), 1)
+        random_model_and_weights(&small_config())
     }
 
-    /// The small model's weights as a GGUF file, loaded on the CPU.
+    fn small_gguf_bytes(
+        varmap: &candle_nn::VarMap,
+        matrix_dtype: candle_core::quantized::GgmlDType,
+    ) -> Vec<u8> {
+        gguf_bytes(&small_config(), varmap, matrix_dtype)
+    }
+
     fn small_gguf_model(
         varmap: &candle_nn::VarMap,
         matrix_dtype: candle_core::quantized::GgmlDType,
-        matmul: super::GgufMatmul,
     ) -> super::Qwen3Model {
         load_gguf(
-            gguf_bytes(&small_config(), varmap, matrix_dtype),
+            small_gguf_bytes(varmap, matrix_dtype),
             &candle_core::Device::Cpu,
-            matmul,
         )
     }
 
@@ -2485,7 +2481,7 @@ mod tests {
         use candle_core::quantized::GgmlDType;
 
         let (_, varmap) = small_model();
-        let model = small_gguf_model(&varmap, GgmlDType::F32, super::GgufMatmul::default());
+        let model = small_gguf_model(&varmap, GgmlDType::F32);
         let (got, want) = (model.config(), small_config());
         assert_eq!(got.hidden_size, want.hidden_size);
         assert_eq!(got.intermediate_size, want.intermediate_size);
@@ -2504,8 +2500,8 @@ mod tests {
         use candle_core::quantized::GgmlDType;
 
         let (dense, varmap) = small_model();
-        // An f32 matrix stays a plain tensor, and `Quantized` multiplies it as `Linear` does.
-        let gguf = small_gguf_model(&varmap, GgmlDType::F32, super::GgufMatmul::Quantized);
+        // An f32 matrix stays a plain tensor, which `QMatMul` multiplies as `Linear` does.
+        let gguf = small_gguf_model(&varmap, GgmlDType::F32);
         let (dense_causal, dense_padded) = small_forwards(&dense, Rows::All);
         let (gguf_causal, gguf_padded) = small_forwards(&gguf, Rows::All);
         assert_eq!(gguf_causal, dense_causal);
@@ -2514,8 +2510,8 @@ mod tests {
             dense_causal.iter().any(|v| v.abs() > 1e-2),
             "states are zero"
         );
-        // For the last position alone the dense path multiplies the strided row view and the
-        // GGUF path a contiguous copy of it, so the sums round differently, within 1e-5.
+        // The GGUF path copies the last-position view before it multiplies, so the sums round
+        // differently.
         let (dense_causal, dense_padded) = small_forwards(&dense, Rows::Last);
         let (gguf_causal, gguf_padded) = small_forwards(&gguf, Rows::Last);
         for (a, b) in [(&dense_causal, &gguf_causal), (&dense_padded, &gguf_padded)] {
@@ -2535,72 +2531,67 @@ mod tests {
 
         let (dense, varmap) = small_model();
         let (dense_causal, dense_padded) = small_forwards(&dense, Rows::All);
-        let mut outputs = Vec::new();
-        for matmul in [
-            super::GgufMatmul::Quantized,
-            super::GgufMatmul::DequantizeF16,
-        ] {
-            let q8 = small_gguf_model(&varmap, GgmlDType::Q8_0, matmul);
-            let (q8_causal, q8_padded) = small_forwards(&q8, Rows::All);
-            for (a, b) in [(&dense_causal, &q8_causal), (&dense_padded, &q8_padded)] {
-                assert_ne!(a, b, "{matmul:?}: Q8_0 changed nothing");
-                let cosine = min_row_cosine(a, b);
-                assert!(cosine > 0.999, "{matmul:?}: Q8_0 row cosine {cosine}");
-            }
-            outputs.push(q8_causal);
+        let q8 = small_gguf_model(&varmap, GgmlDType::Q8_0);
+        let (q8_causal, q8_padded) = small_forwards(&q8, Rows::All);
+        for (a, b) in [(&dense_causal, &q8_causal), (&dense_padded, &q8_padded)] {
+            assert_ne!(a, b, "Q8_0 changed nothing");
+            let cosine = min_row_cosine(a, b);
+            assert!(cosine > 0.999, "Q8_0 row cosine {cosine}");
         }
-        // The two ways multiply differently (quantized kernels, f16 GEMM), so both ran.
-        assert_ne!(outputs[0], outputs[1], "both modes took one path");
     }
 
     #[test]
     fn gguf_last_position_alone_matches_the_full_last_layer_on_the_cpu() {
         use candle_core::quantized::GgmlDType;
 
-        let cfg = small_config();
-        let (_, varmap) = random_model_and_weights(cfg.clone(), 2);
-        let mut cfg2 = cfg;
-        cfg2.num_hidden_layers = 2;
+        let mut cfg = small_config();
+        cfg.num_hidden_layers = 2;
+        let (_, varmap) = random_model_and_weights(&cfg);
         let model = load_gguf(
-            gguf_bytes(&cfg2, &varmap, GgmlDType::Q8_0),
+            gguf_bytes(&cfg, &varmap, GgmlDType::Q8_0),
             &candle_core::Device::Cpu,
-            super::GgufMatmul::Quantized,
         );
         assert_last_row_matches(&model, 1e-5);
+        assert_one_row_last_position_matches(&model, &candle_core::Device::Cpu, 1e-5);
+    }
+
+    /// With one row, the last position is a contiguous view with an offset.
+    fn assert_one_row_last_position_matches(
+        model: &super::Qwen3Model,
+        device: &candle_core::Device,
+        tolerance: f32,
+    ) {
+        use super::Rows;
+        use candle_core::{IndexOp, Tensor};
+
+        let t = 23usize;
+        let ids: Vec<u32> = (0..t as u32).map(|i| (i * 17) % 1000).collect();
+        let input_ids = Tensor::from_vec(ids, (1, t), device).unwrap();
+        let all = model.forward_causal(&input_ids, Rows::All).unwrap();
+        let last = model.forward_causal(&input_ids, Rows::Last).unwrap();
+        let diff = max_abs_diff(&all.i((.., t - 1..t)).unwrap(), &last);
+        assert!(
+            diff < tolerance,
+            "one row: the last position differs by {diff}"
+        );
     }
 
     #[cfg(feature = "metal")]
     #[test]
     fn gguf_last_position_alone_matches_the_full_last_layer_on_metal() {
-        use super::Rows;
         use candle_core::quantized::GgmlDType;
-        use candle_core::{IndexOp, Tensor};
 
         // Head dim 64, one the fused attention kernel takes.
         let mut cfg = small_config();
         cfg.head_dim = Some(64);
         cfg.hidden_size = 256;
-        let (_, varmap) = random_model_and_weights(cfg.clone(), 2);
         cfg.num_hidden_layers = 2;
+        let (_, varmap) = random_model_and_weights(&cfg);
         let device = candle_core::Device::new_metal(0).unwrap();
-        let model = load_gguf(
-            gguf_bytes(&cfg, &varmap, GgmlDType::Q8_0),
-            &device,
-            super::GgufMatmul::Quantized,
-        );
-        // One position runs candle's quantized mat-vec kernel and the full layer its mat-mat
-        // kernel, which round differently: about 1e-3 on states of size 1.
+        let model = load_gguf(gguf_bytes(&cfg, &varmap, GgmlDType::Q8_0), &device);
+        // The mat-vec and mat-mat kernels round differently.
         assert_last_row_matches(&model, 5e-3);
-
-        // One row: its last position is a contiguous view with an offset, which candle's
-        // quantized matmul on Metal would read from the buffer's start.
-        let t = 23usize;
-        let ids: Vec<u32> = (0..t as u32).map(|i| (i * 17) % 1000).collect();
-        let input_ids = Tensor::from_vec(ids, (1, t), &device).unwrap();
-        let all = model.forward_causal(&input_ids, Rows::All).unwrap();
-        let last = model.forward_causal(&input_ids, Rows::Last).unwrap();
-        let diff = max_abs_diff(&all.i((.., t - 1..t)).unwrap(), &last);
-        assert!(diff < 5e-3, "one row: the last position differs by {diff}");
+        assert_one_row_last_position_matches(&model, &device, 5e-3);
     }
 
     #[test]
@@ -2609,22 +2600,64 @@ mod tests {
         use candle_core::Device;
 
         let (_, varmap) = small_model();
-        let bytes = gguf_bytes(&small_config(), &varmap, GgmlDType::F32);
-        let mut reader = std::io::Cursor::new(bytes);
-        let mut content = gguf_file::Content::read(&mut reader).unwrap();
-        content.metadata.insert(
-            "general.architecture".into(),
-            gguf_file::Value::String("llama".into()),
-        );
-        let err = super::Qwen3Model::from_gguf(
-            &content,
-            &mut reader,
+        let err = load_gguf_with(
+            small_gguf_bytes(&varmap, GgmlDType::F32),
             &Device::Cpu,
-            super::GgufMatmul::default(),
+            |content| {
+                content.metadata.insert(
+                    "general.architecture".into(),
+                    gguf_file::Value::String("llama".into()),
+                );
+            },
         )
         .err()
         .expect("a llama file loads as qwen3");
         assert!(err.to_string().contains("not `qwen3`"), "{err}");
+    }
+
+    #[test]
+    fn gguf_rejects_a_tensor_that_does_not_match_the_metadata() {
+        use candle_core::quantized::{gguf_file, GgmlDType};
+        use candle_core::Device;
+
+        let (_, varmap) = small_model();
+        let wrong = small_config().intermediate_size as u32 + 1;
+        let err = load_gguf_with(
+            small_gguf_bytes(&varmap, GgmlDType::F32),
+            &Device::Cpu,
+            |content| {
+                content.metadata.insert(
+                    "qwen3.feed_forward_length".into(),
+                    gguf_file::Value::U32(wrong),
+                );
+            },
+        )
+        .err()
+        .expect("a mismatched ffn_gate loads");
+        assert!(err.to_string().contains("blk.0.ffn_gate.weight"), "{err}");
+    }
+
+    #[test]
+    fn gguf_reads_other_integer_types_and_no_key_length() {
+        use candle_core::quantized::{gguf_file, GgmlDType};
+        use candle_core::Device;
+
+        let (_, varmap) = small_model();
+        let want = small_config();
+        let model = load_gguf_with(
+            small_gguf_bytes(&varmap, GgmlDType::F32),
+            &Device::Cpu,
+            |content| {
+                content.metadata.remove("qwen3.attention.key_length");
+                content.metadata.insert(
+                    "qwen3.block_count".into(),
+                    gguf_file::Value::U64(want.num_hidden_layers as u64),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(model.config().head_dim(), want.head_dim());
+        assert_eq!(model.config().num_hidden_layers, want.num_hidden_layers);
     }
 
     #[test]
