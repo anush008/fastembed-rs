@@ -9,8 +9,10 @@ use candle_core::{Result, Tensor};
 
 /// `sdpa(q, k, v, mask, do_causal, scale, 1.0).transpose(1, 2)`, contiguous: q `[B, H, T, D]`,
 /// k and v `[B, Hkv, S, D]` (any strides with the head dim contiguous), the mask
-/// `[B, H, T, S]`. On Metal with more than one query position this is candle's full attention
-/// kernel writing `[B, T, H, D]` directly; otherwise it is `candle_nn::ops::sdpa` and a copy.
+/// `[B, H, T, S]`. On Metal this is candle's full attention kernel writing `[B, T, H, D]`
+/// directly, for one query position too: candle's sdpa sends a single query to its vector
+/// kernel, which takes no mask, so a padded batch's last row would see its padding. Elsewhere it
+/// is `candle_nn::ops::sdpa` and a copy.
 pub(crate) fn sdpa_bthd(
     q: &Tensor,
     k: &Tensor,
@@ -20,7 +22,7 @@ pub(crate) fn sdpa_bthd(
     scale: f32,
 ) -> Result<Tensor> {
     #[cfg(feature = "metal")]
-    if q.device().is_metal() && q.dim(2)? > 1 {
+    if q.device().is_metal() {
         let op = metal::SdpaBthd {
             scale,
             mask: mask.cloned(),
@@ -93,8 +95,8 @@ mod metal {
                     v_l.dims()
                 )
             }
-            if t < 2 || (self.mask.is_some() && t > s) {
-                candle_core::bail!("sdpa-bthd runs the full kernel only: q {t}, k {s}")
+            if t > s {
+                candle_core::bail!("sdpa-bthd takes no more queries than keys: q {t}, k {s}")
             }
             for l in [q_l, k_l, v_l] {
                 if l.stride()[3] != 1 {
@@ -123,6 +125,11 @@ mod metal {
                     let candle_core::Storage::Metal(storage) = &**storage else {
                         candle_core::bail!("sdpa-bthd mask is not on the metal device")
                     };
+                    // call_sdpa_full binds the mask buffer at offset 0, so a view that starts
+                    // anywhere else (a narrowed row) would be read from the wrong place.
+                    if layout.start_offset() != 0 {
+                        candle_core::bail!("sdpa-bthd mask has to start at its buffer's start")
+                    }
                     if layout.dims() != [b, h, t, s] {
                         candle_core::bail!(
                             "sdpa-bthd mask is {:?}, it needs {:?}",
@@ -244,6 +251,33 @@ mod tests {
                     "{dtype:?} causal={causal}"
                 );
                 assert!(max_abs_diff(&got, &got.zeros_like().unwrap()) > 1e-2);
+
+                // The last query alone, against every key, is the full output's last row, to
+                // the bit: unmasked where the full run was causal, and through the mask's last
+                // row where it was padded. The padding is what candle's vector kernel would drop.
+                let last = sdpa_bthd(
+                    &q.narrow(2, t - 1, 1).unwrap(),
+                    &k,
+                    &v,
+                    mask.map(|m| {
+                        m.narrow(2, t - 1, 1)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .broadcast_as((b, h, 1, t))
+                            .unwrap()
+                    })
+                    .as_ref(),
+                    false,
+                    scale,
+                )
+                .unwrap();
+                assert_eq!(last.dims(), &[b, 1, h, d]);
+                assert_eq!(
+                    max_abs_diff(&last, &got.narrow(1, t - 1, 1).unwrap()),
+                    0.0,
+                    "{dtype:?} causal={causal}: the last query alone differs"
+                );
             }
         }
     }
