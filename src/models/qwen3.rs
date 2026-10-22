@@ -1697,6 +1697,160 @@ impl Qwen3TextEmbedding {
     }
 }
 
+/// The instruction the Qwen3-Reranker model card uses when none is given.
+pub const QWEN3_RERANKER_DEFAULT_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+
+const QWEN3_RERANKER_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
+const QWEN3_RERANKER_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+/// Qwen3-Reranker (for example `Qwen/Qwen3-Reranker-0.6B`): the probability that a document
+/// answers a query under an instruction, read as the model's "yes" against "no" at the last
+/// position, as the model card computes it.
+pub struct Qwen3Reranker {
+    model: Qwen3Model,
+    tokenizer: tokenizers::Tokenizer,
+    /// The output embedding rows of "no" and "yes", `[2, H]`, in the model's dtype.
+    no_yes: Tensor,
+    prefix: Vec<u32>,
+    suffix: Vec<u32>,
+    max_length: usize,
+}
+
+impl Qwen3Reranker {
+    /// Build from a loaded model, its tokenizer (no padding or truncation set; this sets its own),
+    /// and the `[2, H]` output rows of the "no" and "yes" tokens.
+    pub fn new(
+        model: Qwen3Model,
+        mut tokenizer: tokenizers::Tokenizer,
+        no_yes: Tensor,
+        max_length: usize,
+    ) -> Result<Self> {
+        tokenizer.with_padding(None);
+        tokenizer.with_truncation(None).map_err(map_err)?;
+        let encode = |text: &str| -> Result<Vec<u32>> {
+            Ok(tokenizer
+                .encode(text, false)
+                .map_err(map_err)?
+                .get_ids()
+                .to_vec())
+        };
+        let prefix = encode(QWEN3_RERANKER_PREFIX)?;
+        let suffix = encode(QWEN3_RERANKER_SUFFIX)?;
+        if max_length <= prefix.len() + suffix.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "max_length {max_length} leaves no room beside the prompt's {} tokens",
+                prefix.len() + suffix.len()
+            )));
+        }
+        Ok(Self {
+            model,
+            tokenizer,
+            no_yes,
+            prefix,
+            suffix,
+            max_length,
+        })
+    }
+
+    /// Load from a Hugging Face repo such as `Qwen/Qwen3-Reranker-0.6B`.
+    #[cfg(feature = "hf-hub")]
+    pub fn from_hf(
+        repo_id: &str,
+        device: &Device,
+        dtype: DType,
+        max_length: usize,
+    ) -> Result<Self> {
+        let repo = hf_repo(repo_id)?;
+        let cfg_path: PathBuf = repo.get("config.json").map_err(map_err)?;
+        let cfg_bytes = std::fs::read(&cfg_path).map_err(map_err)?;
+        let (cfg, _) = parse_config_and_weight_prefix(&cfg_bytes)?;
+        let weight_files = crate::common::safetensors_weight_files(&repo).map_err(map_err)?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
+
+        let tok_path: PathBuf = repo.get("tokenizer.json").map_err(map_err)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| candle_core::Error::Msg(format!("{}: {e}", tok_path.display())))?;
+        let id = |token: &str| {
+            tokenizer.token_to_id(token).ok_or_else(|| {
+                candle_core::Error::Msg(format!("the tokenizer has no `{token}` token"))
+            })
+        };
+        let ids = Tensor::new(&[id("no")?, id("yes")?], device)?;
+        // The output layer, tied to the token table when the config says so.
+        let output = if cfg.tie_word_embeddings {
+            vb.pp("model.embed_tokens")
+                .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+        } else {
+            vb.pp("lm_head")
+                .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+        };
+        let no_yes = output.index_select(&ids, 0)?;
+        let model = Qwen3Model::new(cfg, vb.pp("model"))?;
+        Self::new(model, tokenizer, no_yes, max_length)
+    }
+
+    /// The probability of "yes" for each document against `query` under `instruction`
+    /// ([`QWEN3_RERANKER_DEFAULT_INSTRUCTION`] when `None`), in the order of `documents`.
+    pub fn score<S: AsRef<str>>(
+        &self,
+        instruction: Option<&str>,
+        query: &str,
+        documents: &[S],
+    ) -> Result<Vec<f32>> {
+        let instruction = instruction.unwrap_or(QWEN3_RERANKER_DEFAULT_INSTRUCTION);
+        let room = self.max_length - self.prefix.len() - self.suffix.len();
+        let mut rows = Vec::with_capacity(documents.len());
+        for doc in documents {
+            let pair = format!(
+                "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {}",
+                doc.as_ref()
+            );
+            let encoding = self.tokenizer.encode(pair, true).map_err(map_err)?;
+            let ids = encoding.get_ids();
+            let mut row = self.prefix.clone();
+            row.extend_from_slice(&ids[..ids.len().min(room)]);
+            row.extend_from_slice(&self.suffix);
+            rows.push(row);
+        }
+        self.score_rows(&rows)
+    }
+
+    /// P("yes") for each row of token ids, run as one left-padded batch.
+    fn score_rows(&self, rows: &[Vec<u32>]) -> Result<Vec<f32>> {
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+        let device = self.model.device();
+        let t = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut ids = Vec::with_capacity(rows.len() * t);
+        let mut mask = Vec::with_capacity(rows.len() * t);
+        for row in rows {
+            let pad = t - row.len();
+            ids.extend(std::iter::repeat_n(0u32, pad).chain(row.iter().copied()));
+            mask.extend(std::iter::repeat_n(0f32, pad).chain(std::iter::repeat_n(1f32, row.len())));
+        }
+        let input_ids = Tensor::from_vec(
+            ids,
+            (rows.len(), t),
+            self.model.embed_tokens.ids_device(device),
+        )?;
+        let hidden = if mask.contains(&0.0) {
+            let mask = Tensor::from_vec(mask, (rows.len(), t), device)?;
+            self.model.forward_padded(&input_ids, &mask, Rows::Last)?
+        } else {
+            self.model.forward_causal(&input_ids, Rows::Last)?
+        };
+        // [B, 2]: the "no" and "yes" logits at the last position, then P("yes").
+        let logits = hidden
+            .i((.., 0))?
+            .matmul(&self.no_yes.to_dtype(hidden.dtype())?.t()?)?
+            .to_dtype(DType::F32)?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+        probs.i((.., 1))?.to_vec1::<f32>()
+    }
+}
+
 /// Multimodal embedding wrapper for Qwen3-VL embedding checkpoints.
 ///
 /// This supports text-only and image-only inputs. Image+text mixed inputs can be
@@ -2332,6 +2486,57 @@ mod tests {
         }
 
         assert!(model.with_output_dim(hidden + 1).is_err());
+    }
+
+    #[test]
+    fn reranker_scores_each_row_as_yes_against_no_at_its_last_position() {
+        use candle_core::{DType, Device, IndexOp, Tensor};
+
+        let cfg = small_config();
+        let hidden = cfg.hidden_size;
+        let model = random_model(cfg, 2, &Device::Cpu, DType::F32);
+        let no_yes = Tensor::randn(0f32, 1.0, (2, hidden), &Device::Cpu).unwrap();
+        let reranker =
+            super::Qwen3Reranker::new(model, word_tokenizer(), no_yes.clone(), 512).unwrap();
+
+        // Three rows of different lengths, run as one left-padded batch.
+        let rows: Vec<Vec<u32>> = vec![(1..9).collect(), (20..23).collect(), (40..52).collect()];
+        let together = reranker.score_rows(&rows).unwrap();
+        assert_eq!(together.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            // By hand: the row alone, its last position's normed state against the two rows.
+            let ids = Tensor::new(row.as_slice(), &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            let h = reranker
+                .model
+                .forward_causal(&ids, super::Rows::Last)
+                .unwrap()
+                .i((0, 0))
+                .unwrap();
+            let logits = no_yes
+                .matmul(&h.unsqueeze(1).unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let yes = 1.0 / (1.0 + (logits[0] - logits[1]).exp());
+            assert!(
+                (together[i] - yes).abs() < 1e-5,
+                "row {i}: {} against {yes}",
+                together[i]
+            );
+        }
+        assert!(together.iter().all(|p| (0.0..=1.0).contains(p)));
+        assert_ne!(together[0], together[1]);
+
+        // The prompt wraps every pair, and a max length with no room for a document is refused.
+        let scores = reranker.score(None, "w1 w2", &["w3 w4 w5", "w6"]).unwrap();
+        assert_eq!(scores.len(), 2);
+        let model = random_model(small_config(), 1, &Device::Cpu, DType::F32);
+        assert!(super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 4).is_err());
     }
 
     /// The last layer run for the last position alone gives the last row the full run gives:
