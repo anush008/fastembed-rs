@@ -1,6 +1,6 @@
 [package]
 name = "fastembed"
-version = "7.2.0"
+version = "7.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Library for generating vector embeddings, reranking locally."
