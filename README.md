@@ -1,7 +1,8 @@
 <div align="center">
   <h1><a href="https://crates.io/crates/fastembed">FastEmbed-rs 🦀</a></h1>
- <h3>Rust library for generating vector embeddings, reranking locally!</h3>
-  <a href="https://www.atlascloud.ai/?ref=FCWMKG"><img src="https://www.atlascloud.ai/oss-program/powered-by-atlas-cloud.svg" alt="Powered by Atlas Cloud"/></a>
+  <h3>Rust library for generating vector embeddings, reranking locally!</h3>
+  <a href="https://www.atlascloud.ai/?ref=FCWMKG"><img src="https://www.atlascloud.ai/oss-program/powered-by-atlas-cloud.svg" alt="Powered by Atlas Cloud" width="222" height="28"/></a>
+  <a href="https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source"><img src="https://www.greptile.com/badge.svg" alt="Greptile for Open Source" width="210" height="28"/></a>
 </div>
 
 ## Features
