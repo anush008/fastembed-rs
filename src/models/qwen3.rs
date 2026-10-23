@@ -1128,7 +1128,10 @@ impl Qwen3Attention {
             return out.apply(&self.o_proj);
         }
         let attention_mask = match mask {
-            AttentionMask::Additive(mask) => Some(mask.narrow(2, q_start, tq)?),
+            AttentionMask::Additive(mask) if mask.rank() == 4 && mask.dim(2)? == t => {
+                Some(mask.narrow(2, q_start, tq)?)
+            }
+            AttentionMask::Additive(mask) => Some(mask.clone()),
             AttentionMask::None | AttentionMask::Causal | AttentionMask::Fused(_) => None,
         };
 
@@ -1738,6 +1741,9 @@ impl Qwen3TextEmbedding {
                 .take_while(|&&m| m == 0)
                 .count();
             let ids = &enc.get_ids()[pad..];
+            if ids.is_empty() {
+                return Err(candle_core::Error::Msg(format!("text {i} has no tokens")));
+            }
             groups.entry(ids.len()).or_default().push(i);
             tokens.push(ids);
         }
@@ -1750,7 +1756,11 @@ impl Qwen3TextEmbedding {
                 .iter()
                 .flat_map(|&i| tokens[i].iter().copied())
                 .collect();
-            let input_ids = Tensor::from_vec(ids, (members.len(), len), device)?;
+            let input_ids = Tensor::from_vec(
+                ids,
+                (members.len(), len),
+                self.model.embed_tokens.ids_device(device),
+            )?;
             // [k, 1, H]: the last layer computes the last position alone.
             let (hidden, tapped) =
                 self.model
@@ -1782,6 +1792,9 @@ impl Qwen3TextEmbedding {
 
         let batch_size = encodings.len();
         let seq_len = encodings[0].len();
+        if seq_len == 0 {
+            return Err(candle_core::Error::Msg("the texts have no tokens".into()));
+        }
 
         let mut input_ids_vec: Vec<u32> = Vec::with_capacity(batch_size * seq_len);
         let mut attention_mask_vec: Vec<f32> = Vec::with_capacity(batch_size * seq_len);
@@ -1835,6 +1848,8 @@ fn pool_last(hidden: &Tensor, dim: Option<usize>) -> Result<Vec<Vec<f32>>> {
 /// The instruction the Qwen3-Reranker model card uses when none is given.
 pub const QWEN3_RERANKER_DEFAULT_INSTRUCTION: &str =
     "Given a web search query, retrieve relevant passages that answer the query";
+
+const QWEN3_RERANKER_BATCH_SIZE: usize = 16;
 
 const QWEN3_RERANKER_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
 const QWEN3_RERANKER_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -1948,7 +1963,20 @@ impl Qwen3Reranker {
             row.extend_from_slice(&self.suffix);
             rows.push(row);
         }
-        self.score_rows(&rows)
+
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|&i| rows[i].len());
+        let mut scores = vec![0f32; rows.len()];
+        for chunk in order.chunks(QWEN3_RERANKER_BATCH_SIZE) {
+            let batch: Vec<Vec<u32>> = chunk
+                .iter()
+                .map(|&i| std::mem::take(&mut rows[i]))
+                .collect();
+            for (&i, score) in chunk.iter().zip(self.score_rows(&batch)?) {
+                scores[i] = score;
+            }
+        }
+        Ok(scores)
     }
 
     /// P("yes") for each row of token ids, run as one left-padded batch.
@@ -2547,6 +2575,22 @@ mod tests {
                     .join(" ")
             })
             .collect()
+    }
+
+    #[test]
+    fn embed_rejects_a_text_with_no_tokens() {
+        let model = super::Qwen3TextEmbedding::new(
+            random_model(
+                small_config(),
+                2,
+                &candle_core::Device::Cpu,
+                candle_core::DType::F32,
+            ),
+            word_tokenizer(),
+        );
+        let texts = mixed_texts();
+        assert!(model.embed(&["", texts[0].as_ref()]).is_err());
+        assert!(model.embed_padded(&[""]).is_err());
     }
 
     #[test]
