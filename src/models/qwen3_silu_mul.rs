@@ -245,47 +245,50 @@ mod tests {
         assert_eq!(got.dims(), reference.dims());
         assert!(max_abs_diff(&got, &reference) < 1e-5, "f32 differs");
 
-        // bf16: one rounding against the two ops' two, each measured against the f32 result of
-        // the same bf16 inputs.
-        let bf16 = |x: &Tensor| x.to_dtype(DType::BF16).unwrap();
-        let f32 = |x: &Tensor| x.to_dtype(DType::F32).unwrap();
-        let (gate, up) = (bf16(&gate), bf16(&up));
-        let reference = two_ops(&f32(&gate), &f32(&up));
-        let mean_err = |x: &Tensor| {
-            (f32(x) - &reference)
+        // bf16 and f16, each with its own kernel: one rounding against the two ops' two, each
+        // measured against the f32 result of the same half-precision inputs. `mantissa` is the
+        // dtype's stored mantissa bits, so one step is |x| * 2^-mantissa.
+        for (dtype, mantissa) in [(DType::BF16, 7), (DType::F16, 10)] {
+            let half = |x: &Tensor| x.to_dtype(dtype).unwrap();
+            let f32 = |x: &Tensor| x.to_dtype(DType::F32).unwrap();
+            let (gate, up) = (half(&gate), half(&up));
+            let reference = two_ops(&f32(&gate), &f32(&up));
+            let mean_err = |x: &Tensor| {
+                (f32(x) - &reference)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .mean_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+            };
+            let got = silu_mul(&gate, &up).unwrap();
+            assert_eq!(got.dtype(), dtype);
+            let (one, two) = (mean_err(&got), mean_err(&two_ops(&gate, &up)));
+            assert!(one <= two, "{dtype:?}: mean error {one}, the two ops {two}");
+            // And the CPU op on the same inputs rounds the same way, up to one step where Metal's
+            // fast exp lands on the other side of a rounding boundary.
+            let to_cpu = |x: &Tensor| x.to_device(&Device::Cpu).unwrap();
+            let cpu = |x: &Tensor| f32(&to_cpu(x));
+            let on_cpu = to_cpu(&gate)
+                .apply_op2_no_bwd(&to_cpu(&up), &SiluMul)
+                .unwrap();
+            assert_eq!(on_cpu.dtype(), dtype);
+            let on_cpu = f32(&on_cpu);
+            let step = (on_cpu.abs().unwrap() * 2f64.powi(-mantissa)).unwrap();
+            let over = ((cpu(&got) - &on_cpu).unwrap().abs().unwrap() - step)
                 .unwrap()
-                .abs()
+                .flatten_all()
                 .unwrap()
-                .mean_all()
+                .max(0)
                 .unwrap()
                 .to_scalar::<f32>()
-                .unwrap()
-        };
-        let got = silu_mul(&gate, &up).unwrap();
-        assert_eq!(got.dtype(), DType::BF16);
-        let (one, two) = (mean_err(&got), mean_err(&two_ops(&gate, &up)));
-        assert!(one <= two, "bf16: mean error {one}, the two ops {two}");
-        // And the CPU op on the same bf16 inputs rounds the same way, up to one bf16 step where
-        // Metal's fast exp lands on the other side of a rounding boundary.
-        let to_cpu = |x: &Tensor| x.to_device(&Device::Cpu).unwrap();
-        let cpu = |x: &Tensor| f32(&to_cpu(x));
-        let on_cpu = to_cpu(&gate)
-            .apply_op2_no_bwd(&to_cpu(&up), &SiluMul)
-            .unwrap();
-        assert_eq!(on_cpu.dtype(), DType::BF16);
-        let on_cpu = f32(&on_cpu);
-        let step = (on_cpu.abs().unwrap() * 2f64.powi(-7)).unwrap();
-        let over = ((cpu(&got) - &on_cpu).unwrap().abs().unwrap() - step)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(
-            over <= 1e-6,
-            "Metal and CPU differ by more than a bf16 step"
-        );
+                .unwrap();
+            assert!(
+                over <= 1e-6,
+                "{dtype:?}: Metal and CPU differ by more than one step"
+            );
+        }
     }
 }
