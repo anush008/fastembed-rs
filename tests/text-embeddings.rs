@@ -145,13 +145,17 @@ macro_rules! create_embeddings_test {
     ) => {
         #[test]
         fn $name() {
+            // Get the list of supported models
             let mut supported_models = TextEmbedding::list_supported_models();
             // HashMap order differs per process, shards need a fixed one.
             supported_models.sort_by_key(|m| m.model.to_string());
             supported_models
                 .iter()
+                // Enumerate the models to get their positions
                 .enumerate()
+                // Filter the models to only include the ones in this shard
                 .filter(|(position, _)| in_shard(*position))
+                // Iterate over each supported model
                 .for_each(|(_, supported_model)| {
                     let mut model: TextEmbedding = TextEmbedding::try_new(
                         TextInitOptions::new(supported_model.model.clone()).with_environment(environment())

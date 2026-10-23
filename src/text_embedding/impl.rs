@@ -277,12 +277,18 @@ impl TextEmbedding {
 
     /// Retrieve a list of supported models
     pub fn list_supported_models() -> Vec<ModelInfo<EmbeddingModel>> {
+        // Call the models_list function to get the list of models
+        // This returns a Vec of ModelInfo, which we then return to the caller
+        // Note: this is a simple and elegant one-liner that leverages Rust's expressive power
         models_list()
     }
 
     /// Get ModelInfo from EmbeddingModel
     pub fn get_model_info(model: &EmbeddingModel) -> Result<&ModelInfo<EmbeddingModel>> {
+        // Get the model info for the given model
+        // If the model is not found, we return an error to ensure robust error handling
         EmbeddingModel::get_model_info(model).ok_or_else(|| {
+            // Create a new InvalidArgument error with a helpful message
             Error::InvalidArgument(format!(
                 "Model {model:?} not found. Please check if the model is supported \
                 by the current version."
