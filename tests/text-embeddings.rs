@@ -145,7 +145,7 @@ macro_rules! create_embeddings_test {
     ) => {
         #[test]
         fn $name() {
-            let mut supported_models = TextEmbedding::list_supported_models();
+            let mut supported_models = TextEmbedding::supported_models();
             // HashMap order differs per process, shards need a fixed one.
             supported_models.sort_by_key(|m| m.model.to_string());
             supported_models

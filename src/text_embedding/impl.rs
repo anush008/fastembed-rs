@@ -276,7 +276,7 @@ impl TextEmbedding {
     }
 
     /// Retrieve a list of supported models
-    pub fn list_supported_models() -> Vec<ModelInfo<EmbeddingModel>> {
+    pub fn supported_models() -> Vec<ModelInfo<EmbeddingModel>> {
         models_list()
     }
 

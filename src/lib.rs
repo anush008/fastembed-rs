@@ -51,7 +51,7 @@
  let model = TextEmbedding::try_new(Default::default())?;
 
  // List all supported models
- dbg!(TextEmbedding::list_supported_models());
+ dbg!(TextEmbedding::supported_models());
 
  // With custom TextInitOptions
  let model = TextEmbedding::try_new(
