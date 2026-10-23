@@ -187,11 +187,13 @@ fn build_attention_mask_fused(attention_mask_2d: &Tensor, dtype: DType) -> Resul
     causal.broadcast_add(&padding)
 }
 
+/// Each row of `xs` `[B, H]` divided by its L2 norm, in f32 whatever dtype `xs` is in: in bf16
+/// the sum of squares, the norm and every quotient would each round to 8 bits, and the vectors
+/// would come back up to about 0.5% off unit length.
 fn l2_normalize(xs: &Tensor) -> Result<Tensor> {
+    let xs = xs.to_dtype(DType::F32)?;
     let sum_sq = xs.sqr()?.sum_keepdim(1)?;
-    let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?
-        .to_dtype(sum_sq.dtype())?
-        .broadcast_as(sum_sq.shape())?;
+    let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?.broadcast_as(sum_sq.shape())?;
     let norm = sum_sq.add(&eps_tensor)?.sqrt()?;
     xs.broadcast_div(&norm)
 }
@@ -1840,9 +1842,7 @@ fn pool_last(hidden: &Tensor, dim: Option<usize>) -> Result<Vec<Vec<f32>>> {
         Some(dim) => pooled.narrow(1, 0, dim)?,
         None => pooled,
     };
-    l2_normalize(&pooled)?
-        .to_dtype(DType::F32)?
-        .to_vec2::<f32>()
+    l2_normalize(&pooled)?.to_vec2::<f32>()
 }
 
 /// The instruction the Qwen3-Reranker model card uses when none is given.
@@ -2311,8 +2311,7 @@ impl Qwen3VLEmbedding {
             position_ids.as_ref(),
         )?;
         let pooled = last_token_pool(&hidden, &attention_mask_2d)?;
-        let normalized = l2_normalize(&pooled)?.to_dtype(DType::F32)?;
-        normalized.to_vec2::<f32>()
+        l2_normalize(&pooled)?.to_vec2::<f32>()
     }
 }
 
@@ -2892,6 +2891,91 @@ mod tests {
         let device = candle_core::Device::new_metal(0).unwrap();
         let model = random_model(cfg, 2, &device, candle_core::DType::F32);
         assert_last_row_matches(&model, 1e-4);
+    }
+
+    /// The same random head-dim-128 model on the CPU in f32 and on Metal in F32 and BF16: every
+    /// pooled output (`embed` over mixed lengths, `embed_padded`, a 32-number output and an
+    /// earlier layer's vector) matches the CPU f32 vectors, and every vector it returns is unit
+    /// length, whatever dtype the model runs in.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_vectors_match_the_cpu_and_are_unit_length_in_f32_and_bf16() {
+        use candle_core::{DType, Device};
+        use candle_nn::VarBuilder;
+
+        let mut cfg = small_config();
+        cfg.head_dim = Some(128);
+        cfg.hidden_size = 256;
+        cfg.intermediate_size = 512;
+        cfg.num_hidden_layers = 2;
+        let (_, varmap) = random_model_and_weights(&cfg);
+        let weights: std::collections::HashMap<String, candle_core::Tensor> = varmap
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+            .collect();
+        let load = |device: &Device, dtype: DType| {
+            let vb = VarBuilder::from_tensors(weights.clone(), dtype, device);
+            super::Qwen3TextEmbedding::new(
+                super::Qwen3Model::new(cfg.clone(), vb).unwrap(),
+                word_tokenizer(),
+            )
+        };
+
+        /// Every pooled output the wrapper returns, in one list of vectors.
+        fn outputs(model: super::Qwen3TextEmbedding, texts: &[String]) -> Vec<Vec<f32>> {
+            let mut all = model.embed(texts).unwrap();
+            all.extend(model.embed_padded(texts).unwrap());
+            all.extend(model.embed_layers(texts, &[1]).unwrap().remove(0));
+            let short = model.with_output_dim(32).unwrap();
+            all.extend(short.embed(texts).unwrap());
+            all.extend(short.embed_padded(texts).unwrap());
+            all
+        }
+        let norm = |v: &[f32]| v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            dot / (norm(a) * norm(b))
+        };
+
+        let texts = mixed_texts();
+        let reference = outputs(load(&Device::Cpu, DType::F32), &texts);
+        let metal = Device::new_metal(0).unwrap();
+        for dtype in [DType::F32, DType::BF16] {
+            let got = outputs(load(&metal, dtype), &texts);
+            assert_eq!(got.len(), reference.len());
+            let (mut worst_norm, mut worst_diff, mut worst_cos) = (0f64, 0f32, 1f64);
+            for (g, r) in got.iter().zip(&reference) {
+                assert_eq!(g.len(), r.len(), "{dtype:?}");
+                worst_norm = worst_norm.max((norm(g) - 1.0).abs());
+                let diff = g
+                    .iter()
+                    .zip(r)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                worst_diff = worst_diff.max(diff);
+                worst_cos = worst_cos.min(cosine(g, r));
+            }
+            eprintln!(
+                "{dtype:?}: norm off 1 by at most {worst_norm:e}, max diff {worst_diff:e}, \
+                 min cosine {worst_cos}"
+            );
+            assert!(
+                worst_norm < 1e-4,
+                "{dtype:?}: a norm is off 1 by {worst_norm:e}"
+            );
+            if dtype == DType::F32 {
+                assert!(worst_diff < 1e-4, "f32: a vector differs by {worst_diff}");
+            } else {
+                assert!(worst_cos > 0.999, "bf16: a vector has cosine {worst_cos}");
+            }
+        }
     }
 
     #[test]
