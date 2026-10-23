@@ -1574,32 +1574,35 @@ fn encode_texts<S: AsRef<str>>(
         }
         _ => None,
     };
-    let mut sources: Vec<&str> = texts
+    let sources: Vec<&str> = texts
         .iter()
         .map(|t| match limit {
             Some(limit) => token_prefix(t.as_ref(), limit),
             None => t.as_ref(),
         })
         .collect();
-    let encode = |sources: &[&str]| {
-        tokenizer
-            .encode_batch_fast(sources.to_vec(), true)
-            .map_err(map_err)
-    };
-    let encodings = encode(&sources)?;
-    // A prefix truncation cut nothing from may have left tokens out: encode those texts whole.
-    let mut short = false;
-    for ((source, text), encoding) in sources.iter_mut().zip(texts).zip(&encodings) {
-        if source.len() < text.as_ref().len() && encoding.get_overflowing().is_empty() {
-            *source = text.as_ref();
-            short = true;
-        }
+    let encode = |sources: Vec<&str>| tokenizer.encode_batch_fast(sources, true).map_err(map_err);
+    let mut encodings = encode(sources.clone())?;
+    // A prefix truncation cut nothing from may have left tokens out: encode those texts whole,
+    // and only those.
+    let short: Vec<usize> = (0..texts.len())
+        .filter(|&i| {
+            sources[i].len() < texts[i].as_ref().len() && encodings[i].get_overflowing().is_empty()
+        })
+        .collect();
+    if short.is_empty() {
+        return Ok(encodings);
     }
-    if short {
-        encode(&sources)
-    } else {
-        Ok(encodings)
+    let whole = encode(short.iter().map(|&i| texts[i].as_ref()).collect())?;
+    for (&i, encoding) in short.iter().zip(whole) {
+        encodings[i] = encoding;
     }
+    // The two passes were padded apart. Padding only ever adds pad tokens, and no text got
+    // shorter, so padding the joined batch again gives what one pass over it would have.
+    if let Some(params) = tokenizer.get_padding() {
+        tokenizers::utils::padding::pad_encodings(&mut encodings, params).map_err(map_err)?;
+    }
+    Ok(encodings)
 }
 
 /// The longest prefix of `text` of at most `limit` bytes that ends just before a space which
@@ -2741,6 +2744,23 @@ mod tests {
             .unwrap()
             .get_overflowing()
             .is_empty());
+
+        // The dashes beside a short text and nothing longer: the first pass pads the short text
+        // only to the dashes' short prefix, so the joined batch must be padded again to the
+        // dashes' whole length.
+        let pair = vec![texts[10].clone(), "hello world".to_string()];
+        let whole = tokenizer.encode_batch(pair.clone(), true).unwrap();
+        let got = super::encode_texts(&tokenizer, &pair).unwrap();
+        let prefix_len = tokenizer.encode(prefix, true).unwrap().get_ids().len();
+        assert!(whole[0].get_ids().len() > prefix_len);
+        for (i, (g, w)) in got.iter().zip(&whole).enumerate() {
+            assert_eq!(g.get_ids(), w.get_ids(), "pair text {i}: ids");
+            assert_eq!(
+                g.get_attention_mask(),
+                w.get_attention_mask(),
+                "pair text {i}: mask"
+            );
+        }
     }
 
     #[test]
