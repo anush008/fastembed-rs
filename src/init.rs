@@ -1,6 +1,16 @@
 use crate::get_cache_dir;
 use ort::{environment::Environment, ep::ExecutionProviderDispatch};
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
+
+pub(crate) struct ProviderNames<'a>(pub(crate) &'a [ExecutionProviderDispatch]);
+
+impl fmt::Debug for ProviderNames<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|ep| ep.name()))
+            .finish()
+    }
+}
 
 pub trait HasMaxLength {
     const MAX_LENGTH: usize;
@@ -41,6 +51,41 @@ pub struct InitOptions<M> {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+}
+
+impl<M: fmt::Debug> fmt::Debug for InitOptionsWithLength<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitOptionsWithLength")
+            .field("model_name", &self.model_name)
+            .field("environment", &self.environment)
+            .field(
+                "execution_providers",
+                &ProviderNames(&self.execution_providers),
+            )
+            .field("cache_dir", &self.cache_dir)
+            .field("show_download_progress", &self.show_download_progress)
+            .field("max_length", &self.max_length)
+            .field("intra_threads", &self.intra_threads)
+            .field("session_config", &self.session_config)
+            .finish()
+    }
+}
+
+impl<M: fmt::Debug> fmt::Debug for InitOptions<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitOptions")
+            .field("model_name", &self.model_name)
+            .field("environment", &self.environment)
+            .field(
+                "execution_providers",
+                &ProviderNames(&self.execution_providers),
+            )
+            .field("cache_dir", &self.cache_dir)
+            .field("show_download_progress", &self.show_download_progress)
+            .field("intra_threads", &self.intra_threads)
+            .field("session_config", &self.session_config)
+            .finish()
+    }
 }
 
 impl<M: Default + HasMaxLength> Default for InitOptionsWithLength<M> {
