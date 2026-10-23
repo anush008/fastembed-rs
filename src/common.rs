@@ -1,6 +1,11 @@
-#[cfg(feature = "hf-hub")]
+#[cfg(all(
+    feature = "hf-hub",
+    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+))]
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
+#[cfg(feature = "onnx")]
 use ndarray::Array2;
+#[cfg(feature = "onnx")]
 use ort::{
     environment::Environment,
     ep::ExecutionProviderDispatch,
@@ -10,10 +15,16 @@ use ort::{
     },
     value::Value,
 };
+#[cfg(feature = "onnx")]
 use std::borrow::Cow;
-#[cfg(feature = "hf-hub")]
+#[cfg(all(
+    feature = "hf-hub",
+    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+))]
 use std::path::PathBuf;
+#[cfg(feature = "onnx")]
 use std::sync::{Mutex, PoisonError};
+#[cfg(feature = "onnx")]
 use tokenizers::{
     AddedToken, EncodeInput, Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
 };
@@ -53,6 +64,7 @@ pub enum Error {
     #[error("Tokenizer returned empty encodings for the batch")]
     EmptyTokenizations,
 
+    #[cfg(feature = "onnx")]
     #[error("ONNX runtime error: {0}")]
     Ort(#[from] ort::Error),
 
@@ -114,7 +126,7 @@ pub struct TokenizerFiles {
 
 /// Loading tokenizer files from the Hugging Face Hub is separate from the main
 /// `load_tokenizer` function, which expects bytes from any source.
-#[cfg(feature = "hf-hub")]
+#[cfg(all(feature = "onnx", feature = "hf-hub"))]
 pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<Tokenizer> {
     let tokenizer_files: TokenizerFiles = TokenizerFiles {
         tokenizer_file: std::fs::read(model_repo.get("tokenizer.json")?)?,
@@ -130,6 +142,7 @@ pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<T
 /// Function can be called directly from the try_new_from_user_defined function (providing file bytes)
 ///
 /// Or indirectly from the try_new function via load_tokenizer_hf_hub (converting HF files to bytes)
+#[cfg(feature = "onnx")]
 pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Result<Tokenizer> {
     let base_error_message =
         "Error building TokenizerFiles for UserDefinedEmbeddingModel. Could not read {} file.";
@@ -247,6 +260,7 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
     Ok(tokenizer.into())
 }
 
+#[cfg(feature = "onnx")]
 pub fn normalize(v: &[f32]) -> Vec<f32> {
     let norm = (v.iter().map(|val| val * val).sum::<f32>()).sqrt();
     let epsilon = 1e-12;
@@ -260,7 +274,10 @@ pub fn normalize(v: &[f32]) -> Vec<f32> {
 /// HF_ENDPOINT modifies the URL for the HuggingFace location.
 /// HF_TOKEN authenticates the requests. Without it the token written by
 /// `huggingface-cli login` is used when present.
-#[cfg(feature = "hf-hub")]
+#[cfg(all(
+    feature = "hf-hub",
+    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+))]
 pub fn pull_from_hf(
     model_name: String,
     default_cache_dir: PathBuf,
@@ -293,14 +310,20 @@ pub fn pull_from_hf(
 }
 
 /// Token written by `huggingface-cli login`. `Cache::default` panics without a home dir.
-#[cfg(feature = "hf-hub")]
+#[cfg(all(
+    feature = "hf-hub",
+    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+))]
 fn default_hf_token() -> Option<String> {
     let has_home = std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some();
     has_home.then(|| hf_hub::Cache::default().token()).flatten()
 }
 
 /// Safetensors files of a repo, resolving `model.safetensors.index.json` for sharded checkpoints.
-#[cfg(any(feature = "qwen3", feature = "nomic-v2-moe"))]
+#[cfg(all(
+    feature = "hf-hub",
+    any(feature = "qwen3-text", feature = "nomic-v2-moe")
+))]
 pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     const SINGLE_FILE: &str = "model.safetensors";
     const INDEX_FILE: &str = "model.safetensors.index.json";
@@ -337,12 +360,14 @@ pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
 }
 
 /// One tokenized batch as `[batch, sequence]` tensors.
+#[cfg(feature = "onnx")]
 pub(crate) struct EncodedBatch {
     pub input_ids: Array2<i64>,
     pub attention_mask: Array2<i64>,
     pub token_type_ids: Array2<i64>,
 }
 
+#[cfg(feature = "onnx")]
 impl EncodedBatch {
     /// ONNX session inputs. `token_type_ids` is moved out and attached only when the graph
     /// declares it, while `input_ids` and `attention_mask` stay available for post-processing.
@@ -366,6 +391,7 @@ impl EncodedBatch {
 }
 
 /// Tokenize a batch into padded `[batch, sequence]` tensors.
+#[cfg(feature = "onnx")]
 pub(crate) fn encode_batch<'s, E>(tokenizer: &Tokenizer, inputs: Vec<E>) -> Result<EncodedBatch>
 where
     E: Into<EncodeInput<'s>> + Send,
@@ -376,6 +402,7 @@ where
     encodings_to_batch(&encodings)
 }
 
+#[cfg(feature = "onnx")]
 fn encodings_to_batch(encodings: &[Encoding]) -> Result<EncodedBatch> {
     let encoding_length = encodings.first().ok_or(Error::EmptyTokenizations)?.len();
     let batch_size = encodings.len();
@@ -401,6 +428,7 @@ fn encodings_to_batch(encodings: &[Encoding]) -> Result<EncodedBatch> {
     })
 }
 
+#[cfg(feature = "onnx")]
 fn default_environment() -> Result<Environment> {
     static DEFAULT: Mutex<Option<Environment>> = Mutex::new(None);
     let mut default = DEFAULT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -418,6 +446,7 @@ fn default_environment() -> Result<Environment> {
     Ok(environment)
 }
 
+#[cfg(feature = "onnx")]
 pub(crate) fn init_session_builder(
     environment: Option<Environment>,
     execution_providers: Vec<ExecutionProviderDispatch>,
@@ -468,7 +497,7 @@ pub(crate) fn init_session_builder(
     Ok(builder)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "onnx"))]
 mod tests {
     use super::*;
 

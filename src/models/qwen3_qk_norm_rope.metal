@@ -1,9 +1,11 @@
 // Qwen3's q_norm / k_norm followed by the half-split rope, in one pass over q or k.
 //
 // One threadgroup per `[D]` row of a contiguous `[B, T, H, D]` tensor, D/2 threads: thread i
-// holds the pair (x[i], x[i + D/2]) the rotation mixes. The squares are summed in f32, then
-// each value is rounded to T at the points candle's own `rmsnorm` and `rope_thd` kernels round
-// it, so the result matches those two kernels run back to back up to the order of the f32 sum.
+// holds the pair (x[i], x[i + D/2]) the rotation mixes. Everything runs in f32 (the sum of
+// squares, the row's scale, the weight multiply and the rotation) and each value is rounded to T
+// once, at the store. In f32 that is candle's `rmsnorm` then `rope_thd` up to the order of the
+// sum; in bf16 and f16 it is closer to the f32 result than those two kernels, which round the
+// scale, the normed value and the rotated value each to T.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -42,18 +44,16 @@ METAL_FUNC void qk_norm_rope(
     for (uint s = 0; s < n_simd; ++s) {
         sum_sq += partial[s];
     }
-    const T total = static_cast<T>(rsqrt(sum_sq / float(d) + eps));
+    const float total = rsqrt(sum_sq / float(d) + eps);
 
-    T n1 = x1 * total;
-    n1 *= weight[tid];
-    T n2 = x2 * total;
-    n2 *= weight[tid + half_d];
+    const float n1 = f1 * total * static_cast<float>(weight[tid]);
+    const float n2 = f2 * total * static_cast<float>(weight[tid + half_d]);
 
     const uint i_cs = ((row / heads) % seq_len) * half_d + tid;
-    const T c = cos[i_cs];
-    const T s = sin[i_cs];
-    dst[i1] = n1 * c - n2 * s;
-    dst[i2] = n1 * s + n2 * c;
+    const float c = static_cast<float>(cos[i_cs]);
+    const float s = static_cast<float>(sin[i_cs]);
+    dst[i1] = static_cast<T>(n1 * c - n2 * s);
+    dst[i2] = static_cast<T>(n1 * s + n2 * c);
 }
 
 #define QK_NORM_ROPE(NAME, T)                                   \
