@@ -15,6 +15,10 @@
 //! Qwen3 and Nomic v2 MoE embeddings are available behind the `qwen3` and
 //! `nomic-v2-moe` feature flags (candle backend). A build with
 //! `default-features = false` and only those features compiles no ONNX Runtime.
+//! `qwen3` is `qwen3-text` (the text embedding model and the reranker, loaded from
+//! local files or GGUF) plus `qwen3-vl` (the Qwen3-VL image and text model) plus
+//! `hf-hub` (the `from_hf` loaders); `qwen3-text` alone pulls neither hf-hub nor
+//! the image crates.
 //!
 //! # Model cache
 //!
@@ -160,9 +164,11 @@ pub use crate::reranking::{
 };
 
 // For Qwen3 (candle backend)
-#[cfg(feature = "qwen3")]
+#[cfg(feature = "qwen3-vl")]
+pub use crate::models::qwen3::Qwen3VLEmbedding;
+#[cfg(feature = "qwen3-text")]
 pub use crate::models::qwen3::{
-    Config as Qwen3Config, Qwen3Model, Qwen3Reranker, Qwen3TextEmbedding, Qwen3VLEmbedding,
+    Config as Qwen3Config, Qwen3Model, Qwen3Reranker, Qwen3TextEmbedding,
     QWEN3_RERANKER_DEFAULT_INSTRUCTION,
 };
 

@@ -7,16 +7,22 @@ extern crate accelerate_src;
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
+#[cfg(feature = "qwen3-vl")]
 use image::{imageops::FilterType, DynamicImage};
 use serde::Deserialize;
-use std::io::{Cursor, Read, Seek};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "qwen3-vl")]
+use std::io::Cursor;
+use std::io::{Read, Seek};
+use std::path::Path;
+#[cfg(feature = "hf-hub")]
+use std::path::PathBuf;
 
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
 
 use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
 use crate::models::qwen3_sdpa_bthd::sdpa_bthd;
+#[cfg(feature = "qwen3-vl")]
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
 fn default_true() -> bool {
@@ -60,11 +66,13 @@ impl Config {
     }
 }
 
+#[cfg(any(feature = "hf-hub", test))]
 #[derive(Deserialize)]
 struct Qwen3VLConfig {
     text_config: Config,
 }
 
+#[cfg(any(feature = "hf-hub", test))]
 fn parse_config_and_weight_prefix(config_bytes: &[u8]) -> Result<(Config, Option<&'static str>)> {
     if let Ok(cfg) = serde_json::from_slice::<Config>(config_bytes) {
         return Ok((cfg, None));
@@ -79,6 +87,7 @@ fn parse_config_and_weight_prefix(config_bytes: &[u8]) -> Result<(Config, Option
     ))
 }
 
+#[cfg(feature = "qwen3-vl")]
 #[derive(Deserialize, Debug, Clone)]
 struct Qwen3VLFullConfig {
     text_config: Config,
@@ -90,6 +99,7 @@ struct Qwen3VLFullConfig {
     vision_end_token_id: u32,
 }
 
+#[cfg(feature = "qwen3-vl")]
 #[derive(Deserialize, Debug, Clone)]
 struct Qwen3VLPreprocessorConfig {
     min_pixels: usize,
@@ -102,6 +112,7 @@ struct Qwen3VLPreprocessorConfig {
     image_std: Vec<f32>,
 }
 
+#[cfg(feature = "qwen3-vl")]
 struct PreparedImage {
     pixel_values: Vec<f32>,
     grid_t: u32,
@@ -185,6 +196,7 @@ fn l2_normalize(xs: &Tensor) -> Result<Tensor> {
     xs.broadcast_div(&norm)
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn last_token_pool(hidden: &Tensor, attention_mask_2d: &Tensor) -> Result<Tensor> {
     let (batch_size, seq_len, _) = hidden.dims3()?;
     let masks = attention_mask_2d.to_vec2::<f32>()?;
@@ -203,6 +215,7 @@ fn last_token_pool(hidden: &Tensor, attention_mask_2d: &Tensor) -> Result<Tensor
     Tensor::stack(&pooled_refs, 0)
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn find_token_spans(ids: &[u32], token_id: u32) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0usize;
@@ -220,6 +233,7 @@ fn find_token_spans(ids: &[u32], token_id: u32) -> Vec<(usize, usize)> {
     spans
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn round_ties_to_even(value: f64) -> usize {
     let floor = value.floor();
     let frac = value - floor;
@@ -234,6 +248,7 @@ fn round_ties_to_even(value: f64) -> usize {
     }
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn smart_resize(
     height: usize,
     width: usize,
@@ -273,6 +288,7 @@ fn smart_resize(
     Ok((h_bar, w_bar))
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn preprocess_image(
     img: &DynamicImage,
     cfg: &Qwen3VLPreprocessorConfig,
@@ -365,6 +381,7 @@ fn preprocess_image(
     })
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn build_vl_prompt(text: Option<&str>, include_image: bool, instruction: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str("<|im_start|>system\n");
@@ -380,6 +397,7 @@ fn build_vl_prompt(text: Option<&str>, include_image: bool, instruction: &str) -
     prompt
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn expand_image_token_placeholders(prompt: &str, num_image_tokens: usize) -> Result<String> {
     if num_image_tokens == 0 {
         return Ok(prompt.to_string());
@@ -393,6 +411,7 @@ fn expand_image_token_placeholders(prompt: &str, num_image_tokens: usize) -> Res
     Ok(prompt.replacen(image_token, &image_token.repeat(num_image_tokens), 1))
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn build_image_position_ids(
     encodings: &[tokenizers::Encoding],
     image_spans_per_batch: &[Option<(usize, usize)>],
@@ -496,6 +515,7 @@ fn build_image_position_ids(
     Tensor::from_vec(data, (3, batch_size, seq_len), device)
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn load_image_from_path(path: &Path) -> Result<DynamicImage> {
     image::ImageReader::open(path)
         .map_err(map_err)?
@@ -1970,6 +1990,7 @@ impl Qwen3Reranker {
 ///
 /// This supports text-only and image-only inputs. Image+text mixed inputs can be
 /// added later with the same backend.
+#[cfg(feature = "qwen3-vl")]
 pub struct Qwen3VLEmbedding {
     model: Qwen3Model,
     vision: Qwen3VLVisionModel,
@@ -1980,6 +2001,7 @@ pub struct Qwen3VLEmbedding {
     max_image_tokens: usize,
 }
 
+#[cfg(feature = "qwen3-vl")]
 impl Qwen3VLEmbedding {
     /// Load a Qwen3-VL embedding model from Hugging Face.
     #[cfg(feature = "hf-hub")]
@@ -2268,10 +2290,9 @@ impl Qwen3VLEmbedding {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        expand_image_token_placeholders, find_token_spans, parse_config_and_weight_prefix,
-        round_ties_to_even,
-    };
+    use super::parse_config_and_weight_prefix;
+    #[cfg(feature = "qwen3-vl")]
+    use super::{expand_image_token_placeholders, find_token_spans, round_ties_to_even};
 
     #[test]
     fn fused_mask_matches_the_additive_mask() {
@@ -3325,6 +3346,7 @@ mod tests {
         assert_eq!(prefix, Some("model.language_model"));
     }
 
+    #[cfg(feature = "qwen3-vl")]
     #[test]
     fn finds_token_spans() {
         let ids = vec![1u32, 42, 42, 7, 42, 42, 42, 9];
@@ -3332,6 +3354,7 @@ mod tests {
         assert_eq!(spans, vec![(1, 3), (4, 7)]);
     }
 
+    #[cfg(feature = "qwen3-vl")]
     #[test]
     fn expands_image_placeholders() {
         let prompt = "<|vision_start|><|image_pad|><|vision_end|>";
@@ -3342,6 +3365,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qwen3-vl")]
     #[test]
     fn rounds_half_to_even_like_python() {
         assert_eq!(round_ties_to_even(12.5), 12);

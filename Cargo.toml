@@ -66,7 +66,13 @@ ort-download-binaries-native-tls = ["onnx", "ort/download-binaries", "ort/tls-na
 ort-download-binaries-rustls-tls = ["onnx", "ort/download-binaries", "ort/tls-rustls"]
 ort-load-dynamic = ["onnx", "ort/load-dynamic"]
 
-qwen3 = ["dep:candle-core", "dep:candle-nn", "dep:image", "hf-hub"]
+# `qwen3` is unchanged for its users: the text model and reranker, the VL model, and the
+# `from_hf` loaders. `qwen3-text` alone is the text model and reranker loaded from local
+# files or GGUF, with no hf-hub and no image crates.
+qwen3 = ["qwen3-text", "qwen3-vl", "hf-hub"]
+qwen3-text = ["dep:candle-core", "dep:candle-nn"]
+# Qwen3-VL loads only through `from_hf`, so it needs hf-hub.
+qwen3-vl = ["qwen3-text", "dep:image", "hf-hub"]
 nomic-v2-moe = ["dep:candle-core", "dep:candle-nn", "hf-hub"]
 
 image-models = ["onnx", "dep:image"]
