@@ -15,6 +15,7 @@ authors = [
   "Tri <tri@triandco.com>",
   "Denny Wong <denwong47@hotmail.com>",
   "Alex Rozgo <alex.rozgo@gmail.com>",
+  "Gil <dddhkts1@gmail.com>",
 ]
 documentation = "https://docs.rs/fastembed"
 repository = "https://github.com/Anush008/fastembed-rs"
