@@ -1551,6 +1551,82 @@ fn embedding_tokenizer(path: &Path, max_length: usize) -> Result<tokenizers::Tok
     Ok(tokenizer)
 }
 
+/// How many bytes of a long text [`encode_texts`] reads first for each token it may keep. Qwen3's
+/// tokenizer takes about 5 bytes per token of English or Chinese and 1 of digits, so 16 leaves
+/// room for most text. Long runs of one punctuation mark can take 50 bytes a token or more;
+/// such a text comes up short and is encoded whole, as before.
+const PREFIX_BYTES_PER_TOKEN: usize = 16;
+
+/// `tokenizer.encode_batch_fast(texts, true)`, without encoding the part of a long text that
+/// truncation would throw away. When the tokenizer truncates on the right to `max_length`, a
+/// text longer than `max_length * PREFIX_BYTES_PER_TOKEN` bytes is encoded only up to a space
+/// near that size (see [`token_prefix`]); if that prefix still runs past `max_length` tokens,
+/// its kept tokens are the whole text's, and otherwise the whole text is encoded. The fast
+/// encode leaves out the byte offsets of each token, which nothing here reads; the ids and the
+/// attention mask are the same.
+fn encode_texts<S: AsRef<str>>(
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[S],
+) -> Result<Vec<tokenizers::Encoding>> {
+    let limit = match tokenizer.get_truncation() {
+        Some(t) if t.direction == tokenizers::TruncationDirection::Right => {
+            Some(t.max_length.saturating_mul(PREFIX_BYTES_PER_TOKEN))
+        }
+        _ => None,
+    };
+    let sources: Vec<&str> = texts
+        .iter()
+        .map(|t| match limit {
+            Some(limit) => token_prefix(t.as_ref(), limit),
+            None => t.as_ref(),
+        })
+        .collect();
+    let encode = |sources: Vec<&str>| tokenizer.encode_batch_fast(sources, true).map_err(map_err);
+    let mut encodings = encode(sources.clone())?;
+    // A prefix truncation cut nothing from may have left tokens out: encode those texts whole,
+    // and only those.
+    let short: Vec<usize> = (0..texts.len())
+        .filter(|&i| {
+            sources[i].len() < texts[i].as_ref().len() && encodings[i].get_overflowing().is_empty()
+        })
+        .collect();
+    if short.is_empty() {
+        return Ok(encodings);
+    }
+    let whole = encode(short.iter().map(|&i| texts[i].as_ref()).collect())?;
+    for (&i, encoding) in short.iter().zip(whole) {
+        encodings[i] = encoding;
+    }
+    // The two passes were padded apart. Padding only ever adds pad tokens, and no text got
+    // shorter, so padding the joined batch again gives what one pass over it would have.
+    if let Some(params) = tokenizer.get_padding() {
+        tokenizers::utils::padding::pad_encodings(&mut encodings, params).map_err(map_err)?;
+    }
+    Ok(encodings)
+}
+
+/// The longest prefix of `text` of at most `limit` bytes that ends just before a space which
+/// follows a character other than whitespace, or all of `text` when it is no longer than
+/// `limit` or has no such space. Qwen3's pre-tokenizer splits text into pieces before it
+/// encodes them, and no piece runs from such a character across such a space, so the prefix's
+/// pieces, and with them its tokens, are the first ones of the whole text.
+fn token_prefix(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let bytes = text.as_bytes();
+    for end in (1..=limit).rev() {
+        // A space byte always starts a character, so `end` is a character boundary.
+        if bytes[end] == b' ' {
+            let before = text[..end].chars().next_back();
+            if before.is_some_and(|c| !c.is_whitespace()) {
+                return &text[..end];
+            }
+        }
+    }
+    text
+}
+
 /// High-level embedding wrapper around [`Qwen3Model`] that handles tokenization,
 /// batching, mean-pooling, and L2-normalization.
 pub struct Qwen3TextEmbedding {
@@ -1734,10 +1810,7 @@ impl Qwen3TextEmbedding {
         if texts.is_empty() {
             return Ok((vec![], vec![vec![]; taps.len()]));
         }
-        let encodings = self
-            .tokenizer
-            .encode_batch(texts.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), true)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let encodings = encode_texts(&self.tokenizer, texts)?;
 
         // Each text's tokens without the left padding, grouped by their count.
         let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
@@ -1793,10 +1866,7 @@ impl Qwen3TextEmbedding {
             return Ok(vec![]);
         }
 
-        let encodings = self
-            .tokenizer
-            .encode_batch(texts.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), true)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let encodings = encode_texts(&self.tokenizer, texts)?;
 
         let batch_size = encodings.len();
         let seq_len = encodings[0].len();
@@ -2580,6 +2650,149 @@ mod tests {
                     .join(" ")
             })
             .collect()
+    }
+
+    /// The Qwen3-Embedding tokenizer as `from_hf` builds it, truncating to `max_length`.
+    #[cfg(feature = "hf-hub")]
+    fn qwen3_tokenizer(max_length: usize) -> tokenizers::Tokenizer {
+        let path = super::hf_repo("Qwen/Qwen3-Embedding-0.6B")
+            .unwrap()
+            .get("tokenizer.json")
+            .unwrap();
+        super::embedding_tokenizer(&path, max_length).unwrap()
+    }
+
+    /// Texts far longer than 64 tokens of 16 bytes, in shapes where a cut could change tokens:
+    /// runs of whitespace and newlines, Chinese with and without spaces, combining marks, emoji,
+    /// digits, a long run of letters, and dashes (about 50 bytes a token, so its prefix comes up
+    /// short).
+    #[cfg(feature = "hf-hub")]
+    fn long_texts() -> Vec<String> {
+        let letters: String = (0..3000)
+            .map(|i| (b'a' + (i * 7 % 26) as u8) as char)
+            .collect();
+        vec![
+            "the quick brown fox jumps over the lazy dog ".repeat(200),
+            "word  \n\n word\t\tword   other\r\nthing  ".repeat(200),
+            "我们今天去公园散步然后吃饭".repeat(200),
+            "我们今天去公园散步。 然后吃饭了。 ".repeat(200),
+            "cafe\u{301} na\u{303}o  ".repeat(500),
+            "👍🏽 ok 👨‍👩‍👧 fine ".repeat(300),
+            "1234567890 ".repeat(500),
+            format!(
+                "{} {letters} {}",
+                "short words ".repeat(30),
+                "tail ".repeat(800)
+            ),
+            "end.\n\nstart, then: more!? ".repeat(200),
+            "a\u{a0} b\u{3000} c ".repeat(500),
+            format!("{} ", "-".repeat(120)).repeat(200),
+            // 1024 bytes in, a cut at that byte lands inside a long word whose tokens straddle
+            // the 63rd: cut there, the word splits into other tokens before the 63rd. Cut at the
+            // space before it, the prefix comes up short and the text is encoded whole.
+            format!(
+                " {}{}",
+                format!("{} ", "-".repeat(32)).repeat(24),
+                "internationalization incomprehensibilities counterrevolutionaries \
+                 electroencephalography uncharacteristically pneumonoultramicroscopic "
+                    .repeat(30)
+            ),
+        ]
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[test]
+    fn encode_texts_keeps_the_whole_texts_tokens_past_max_length() {
+        let max_length = 64;
+        let tokenizer = qwen3_tokenizer(max_length);
+        let limit = max_length * super::PREFIX_BYTES_PER_TOKEN;
+        let mut texts = long_texts();
+        assert!(texts.iter().all(|t| t.len() > 4 * limit));
+        // Short texts too, so the batch is padded.
+        texts.extend(["hello world".to_string(), "a".to_string()]);
+
+        let whole = tokenizer.encode_batch(texts.clone(), true).unwrap();
+        let got = super::encode_texts(&tokenizer, &texts).unwrap();
+        assert_eq!(got.len(), texts.len());
+        for (i, (g, w)) in got.iter().zip(&whole).enumerate() {
+            assert_eq!(g.get_ids(), w.get_ids(), "text {i}: ids");
+            assert_eq!(
+                g.get_attention_mask(),
+                w.get_attention_mask(),
+                "text {i}: mask"
+            );
+        }
+        // One at a time, with no padding, as well.
+        for text in &texts {
+            let got = super::encode_texts(&tokenizer, std::slice::from_ref(text)).unwrap();
+            let whole = tokenizer.encode(text.as_str(), true).unwrap();
+            assert_eq!(got[0].get_ids(), whole.get_ids());
+        }
+
+        // Both paths ran: most long texts were read up to a prefix, and the dashes' prefix came
+        // up short, so it was encoded whole.
+        let prefixed = texts
+            .iter()
+            .filter(|t| super::token_prefix(t, limit).len() < t.len())
+            .count();
+        assert!(prefixed >= 8, "only {prefixed} texts were cut");
+        let dashes = texts[10].as_str();
+        let prefix = super::token_prefix(dashes, limit);
+        assert!(prefix.len() < dashes.len());
+        assert!(tokenizer
+            .encode(prefix, true)
+            .unwrap()
+            .get_overflowing()
+            .is_empty());
+
+        // The dashes beside a short text and nothing longer: the first pass pads the short text
+        // only to the dashes' short prefix, so the joined batch must be padded again to the
+        // dashes' whole length.
+        let pair = vec![texts[10].clone(), "hello world".to_string()];
+        let whole = tokenizer.encode_batch(pair.clone(), true).unwrap();
+        let got = super::encode_texts(&tokenizer, &pair).unwrap();
+        let prefix_len = tokenizer.encode(prefix, true).unwrap().get_ids().len();
+        assert!(whole[0].get_ids().len() > prefix_len);
+        for (i, (g, w)) in got.iter().zip(&whole).enumerate() {
+            assert_eq!(g.get_ids(), w.get_ids(), "pair text {i}: ids");
+            assert_eq!(
+                g.get_attention_mask(),
+                w.get_attention_mask(),
+                "pair text {i}: mask"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_texts_encodes_whole_texts_when_nothing_truncates() {
+        // The word tokenizer has no truncation, so every text is encoded whole.
+        let tokenizer = word_tokenizer();
+        let texts = ["w1 w2 w3 ".repeat(400), "w4".to_string()];
+        let got = super::encode_texts(&tokenizer, &texts).unwrap();
+        let whole = tokenizer.encode_batch(texts.to_vec(), true).unwrap();
+        for (g, w) in got.iter().zip(&whole) {
+            assert_eq!(g.get_ids(), w.get_ids());
+            assert_eq!(g.get_attention_mask(), w.get_attention_mask());
+        }
+        assert_eq!(got[0].len(), 1200);
+    }
+
+    #[test]
+    fn token_prefix_ends_before_a_space_that_follows_a_non_space() {
+        use super::token_prefix;
+        assert_eq!(token_prefix("abc def", 10), "abc def");
+        assert_eq!(token_prefix("abc def ghi", 9), "abc def");
+        assert_eq!(token_prefix("abc def ghi", 7), "abc def");
+        assert_eq!(token_prefix("abc def ghi", 6), "abc");
+        // A space after whitespace is skipped, back to the run's first space.
+        assert_eq!(token_prefix("abc   def ghi", 6), "abc");
+        assert_eq!(token_prefix("abc\n def ghi", 5), "abc\n def ghi");
+        // Before a space that follows a multi-byte character.
+        assert_eq!(token_prefix("ab日 cd ef", 8), "ab日 cd");
+        assert_eq!(token_prefix("ab日 cdefg", 8), "ab日");
+        // No such space: the whole text.
+        assert_eq!(token_prefix("abcdefghij", 4), "abcdefghij");
+        assert_eq!(token_prefix(" abcdefghij", 4), " abcdefghij");
     }
 
     #[test]
