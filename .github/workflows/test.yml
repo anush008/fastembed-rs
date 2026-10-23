@@ -1,6 +1,10 @@
 name: "Cargo Tests"
 on:
   pull_request:
+  # The merged head of main is what release.yml publishes, so it is tested too:
+  # two pull requests green alone can be red together.
+  push:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,7 +29,7 @@ jobs:
         if: steps.cache-build-restore.outputs.cache-hit != 'true'
         run: |
           echo Cloning ONNX Runtime repository...
-          git clone https://github.com/microsoft/onnxruntime --recursive --branch $ONNX_VERSION --single-branch --depth 1
+          git clone https://github.com/microsoft/onnxruntime --recursive --branch "$ONNX_VERSION" --single-branch --depth 1
           cd onnxruntime
           ./build.sh --update --build --config Release --parallel --compile_no_warning_as_error --skip_submodule_sync
           cd ..
@@ -56,7 +60,8 @@ jobs:
           - { name: text-models-2, filter: "--test text-embeddings test_batch_size_default", shard: "2/4" }
           - { name: text-models-3, filter: "--test text-embeddings test_batch_size_default", shard: "3/4" }
           - { name: image, filter: "--test image-embeddings" }
-          - { name: qwen3, filter: "--features qwen3 --lib --test qwen3" }
+          - { name: qwen3, filter: "--features qwen3 --lib --test qwen3", cache: test-qwen3 }
+          - { name: nomic-v2-moe, filter: "--features nomic-v2-moe --test nomic_v2_moe", cache: test-nomic-v2-moe }
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,8 +69,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # The qwen3 suite also builds candle.
-          shared-key: ${{ matrix.suite.name == 'qwen3' && 'test-qwen3' || 'test' }}
+          # The candle suites build candle with their own features, so each keeps its own cache.
+          shared-key: ${{ matrix.suite.cache || 'test' }}
 
       - name: Restore ONNX Build
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -124,6 +129,9 @@ jobs:
           - os: windows-latest
             name: directml
             features: "directml,hf-hub-native-tls,image-models"
+          - os: macos-14
+            name: metal
+            features: "metal,hf-hub-native-tls,ort-download-binaries-native-tls"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust Cache
@@ -132,3 +140,21 @@ jobs:
           key: ${{ matrix.name }}
       - name: Clippy
         run: cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} -- -D warnings
+
+  # The in-file tests of the Metal code: the fused Qwen3 kernels and the model-level
+  # Metal checks. They build random weights, so nothing is downloaded but ONNX Runtime,
+  # which the crate links whatever its features.
+  test-metal:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-metal
+
+      - name: Cargo Test (Metal, in-file tests)
+        run: cargo test --release --no-default-features --features metal,ort-download-binaries-native-tls --lib

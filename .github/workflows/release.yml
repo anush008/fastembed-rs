@@ -5,7 +5,27 @@ on:
 env:
   CARGO_TERM_COLOR: always
 jobs:
+  # Publish only a commit whose own push run of "Cargo Tests" (test.yml) passed.
+  tests-passed:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Require a green "Cargo Tests" run of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          green=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow test.yml --commit "$SHA" \
+            --event push --status success --json databaseId --jq 'length')
+          if [ "$green" -eq 0 ]; then
+            echo "::error::No successful push run of 'Cargo Tests' for $SHA. Wait for it, or re-run it, then release."
+            exit 1
+          fi
+          echo "'Cargo Tests' passed on $SHA."
+
   release:
+    needs: tests-passed
     runs-on: ubuntu-latest
     permissions:
       contents: write
