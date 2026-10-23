@@ -15,6 +15,8 @@ pub(crate) mod qwen3_qk_norm_rope;
 #[cfg(feature = "qwen3")]
 pub(crate) mod qwen3_sdpa_bthd;
 #[cfg(feature = "qwen3")]
+pub(crate) mod qwen3_silu_mul;
+#[cfg(feature = "qwen3")]
 pub mod qwen3_vl;
 
 #[cfg(feature = "nomic-v2-moe")]

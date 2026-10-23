@@ -17,6 +17,7 @@ use hf_hub::api::sync::ApiRepo;
 
 use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
 use crate::models::qwen3_sdpa_bthd::sdpa_bthd;
+use crate::models::qwen3_silu_mul::silu_mul;
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
 fn default_true() -> bool {
@@ -684,9 +685,14 @@ impl Qwen3MLP {
 
 impl Module for Qwen3MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gate = xs.apply(&self.gate_proj)?;
+        let up = xs.apply(&self.up_proj)?;
+        // silu(gate) * up is one kernel on Metal (`silu_mul`); another activation takes two.
+        let hidden = match self.act_fn {
+            Activation::Silu => silu_mul(&gate, &up)?,
+            act => (gate.apply(&act)? * up)?,
+        };
+        hidden.apply(&self.down_proj)
     }
 }
 
