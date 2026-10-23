@@ -2063,6 +2063,15 @@ const QWEN3_RERANKER_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\
 /// 512 tokens each) still runs whole.
 const QWEN3_RERANKER_TOKENS_PER_FORWARD: usize = 8192;
 
+/// The shared head runs once in a length that is a multiple of this, and its last few tokens go
+/// with every document's tail. candle 0.11's fused Metal attention (`call_sdpa_full`), given
+/// fewer queries than keys, lines its causal mask up with the last keys but masks only the last
+/// `ceil((BQ + BK - 1) / BK)` key blocks (one more when the keys are not a whole number of
+/// blocks), and when the shared length is not a multiple of the key block BK the diagonal
+/// crosses one block more, so some positions would see keys after their own. BK is 8, 16 or
+/// 32, so a multiple of 32 keeps the diagonal inside the masked blocks for every head dim.
+const QWEN3_RERANKER_SHARED_BLOCK: usize = 32;
+
 /// The rows `ids` of the `[rows, cols]` matrix `name` in `files`, as a CPU tensor in the file's
 /// dtype, copied straight out of the mapped file: the rest of the matrix is never read.
 #[cfg(feature = "hf-hub")]
@@ -2099,10 +2108,9 @@ fn safetensors_rows(
 /// One `score` call's rows, from `Qwen3Reranker::rows`.
 struct RerankRows {
     rows: Vec<Vec<u32>>,
-    /// How many tokens the rows that share the head start with: the prompt's start, the
-    /// instruction and the query.
-    head_len: usize,
-    shares_head: Vec<bool>,
+    /// The ids the sharing rows start with, run once.
+    shared: Vec<u32>,
+    shares: Vec<bool>,
 }
 
 /// Qwen3-Reranker (for example `Qwen/Qwen3-Reranker-0.6B`): the probability that a document
@@ -2221,7 +2229,7 @@ impl Qwen3Reranker {
     }
 
     /// `score`, running the part every row shares (the prompt's start, the instruction and the
-    /// query) once when `share` holds, and every row whole when it does not.
+    /// query, see `rows`) once when `share` holds, and every row whole when it does not.
     fn score_sharing<S: AsRef<str>>(
         &self,
         instruction: Option<&str>,
@@ -2232,26 +2240,23 @@ impl Qwen3Reranker {
         let rows = self.rows(instruction, query, documents)?;
         let mut scores = vec![0f32; rows.rows.len()];
         let (shared, whole): (Vec<usize>, Vec<usize>) =
-            (0..rows.rows.len()).partition(|&i| share && rows.shares_head[i]);
+            (0..rows.rows.len()).partition(|&i| share && rows.shares[i]);
 
-        let head = rows.head_len;
-        let shared_rows: Vec<Vec<u32>> = shared
+        let start = rows.shared.len();
+        let tails: Vec<Vec<u32>> = shared
             .iter()
-            .map(|&i| rows.rows[i][head..].to_vec())
+            .map(|&i| rows.rows[i][start..].to_vec())
             .collect();
-        if !shared_rows.is_empty() {
+        if !tails.is_empty() {
             let ids = Tensor::new(
-                &rows.rows[shared[0]][..head],
+                rows.shared.as_slice(),
                 self.model.embed_tokens.ids_device(self.model.device()),
             )?
             .unsqueeze(0)?;
             let (_, past) = self
                 .model
                 .forward_causal_after(&ids, &[], Rows::Last, true)?;
-            for (i, score) in shared
-                .iter()
-                .zip(self.score_in_chunks(&shared_rows, &past)?)
-            {
+            for (i, score) in shared.iter().zip(self.score_in_chunks(&tails, &past)?) {
                 scores[*i] = score;
             }
         }
@@ -2263,10 +2268,12 @@ impl Qwen3Reranker {
     }
 
     /// Each document's full row of token ids (the prompt around the pair, truncated to the
-    /// max length), the length of the head every row starts with (the prompt's start, the
-    /// instruction and the query), and whether each row does start with it. A document whose
-    /// first tokens merge with the head's last ones in tokenizing, or a row cut inside the head,
-    /// does not.
+    /// max length), the ids that can run once for all of them, and whether each row starts with
+    /// those ids. The shared ids are the head every pair starts with (the prompt's start, the
+    /// instruction and the query) cut to a multiple of [`QWEN3_RERANKER_SHARED_BLOCK`]; the
+    /// rest of the head goes with each tail. A row does not share them when its first tokens
+    /// differ from the head's within them (a document's start merging with the head's last
+    /// tokens, or a row cut inside them), or when nothing of the row would be left after them.
     fn rows<S: AsRef<str>>(
         &self,
         instruction: Option<&str>,
@@ -2277,9 +2284,11 @@ impl Qwen3Reranker {
         let room = self.max_length - self.prefix.len() - self.suffix.len();
         let head_text = format!("<Instruct>: {instruction}\n<Query>: {query}\n<Document>:");
         let head = self.tokenizer.encode(head_text, true).map_err(map_err)?;
-        let head = head.get_ids();
+        let mut shared = self.prefix.clone();
+        shared.extend_from_slice(head.get_ids());
+        shared.truncate(shared.len() / QWEN3_RERANKER_SHARED_BLOCK * QWEN3_RERANKER_SHARED_BLOCK);
         let mut rows = Vec::with_capacity(documents.len());
-        let mut shares_head = Vec::with_capacity(documents.len());
+        let mut shares = Vec::with_capacity(documents.len());
         for doc in documents {
             let pair = format!(
                 "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {}",
@@ -2287,17 +2296,16 @@ impl Qwen3Reranker {
             );
             let encoding = self.tokenizer.encode(pair, true).map_err(map_err)?;
             let ids = encoding.get_ids();
-            let ids = &ids[..ids.len().min(room)];
-            shares_head.push(ids.starts_with(head));
             let mut row = self.prefix.clone();
-            row.extend_from_slice(ids);
+            row.extend_from_slice(&ids[..ids.len().min(room)]);
             row.extend_from_slice(&self.suffix);
+            shares.push(!shared.is_empty() && row.len() > shared.len() && row.starts_with(&shared));
             rows.push(row);
         }
         Ok(RerankRows {
             rows,
-            head_len: self.prefix.len() + head.len(),
-            shares_head,
+            shared,
+            shares,
         })
     }
 
@@ -3402,9 +3410,9 @@ mod tests {
             .fold(0f32, f32::max)
     }
 
-    /// `score` runs the shared head once and each document's tail after it, and gives the scores
-    /// of the whole rows: within 1e-5 in f32 on the CPU, over documents of mixed lengths. A
-    /// document whose ids do not start with the head's is scored as its whole row.
+    /// `score` runs the shared ids once and each document's tail after them, and gives the
+    /// scores of the whole rows: within 1e-5 in f32 on the CPU, over documents of mixed lengths.
+    /// A document whose ids differ from the shared ones is scored as its whole row.
     #[test]
     fn reranker_scores_with_the_shared_head_as_with_whole_rows() {
         use candle_core::{DType, Device, Tensor};
@@ -3417,68 +3425,99 @@ mod tests {
             super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes.clone(), 512).unwrap();
         let documents = reranker_documents();
         let query = "w1 w2 w3";
+        let check = |reranker: &super::Qwen3Reranker, instruction: Option<&str>| {
+            let shared = reranker.score(instruction, query, &documents).unwrap();
+            let whole = reranker
+                .score_sharing(instruction, query, &documents, false)
+                .unwrap();
+            let gap = max_gap(&shared, &whole);
+            assert!(
+                gap < 1e-5,
+                "{instruction:?}: shared against whole rows: {gap}"
+            );
+            // The scores are spread out, so a row scored against the wrong ids would show.
+            assert!(
+                max_gap(&whole, &vec![whole[0]; whole.len()]) > 2e-3,
+                "{whole:?}"
+            );
+        };
 
+        // The default head is not a multiple of 32 tokens long, so its last tokens, where the
+        // w9 document parts from it, go with every tail, and every row shares the rest.
         let rows = reranker.rows(None, query, &documents).unwrap();
-        let shares: Vec<bool> = rows.shares_head.clone();
+        assert_eq!(rows.shared.len(), 32);
+        assert!(rows.shares.iter().all(|&s| s), "{:?}", rows.shares);
+        check(&reranker, None);
+
+        // An instruction that makes the head 64 tokens long: all of it runs once, and the w9
+        // document, which parts from it at its last token, is scored whole.
+        let words = 64 - reranker.prefix.len() - 6;
+        let instruction = (0..words)
+            .map(|i| format!("w{}", 50 + i % 40))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rows = reranker
+            .rows(Some(&instruction), query, &documents)
+            .unwrap();
+        assert_eq!(rows.shared.len(), 64);
         let mut want = vec![true; documents.len()];
         want[3] = false;
-        assert_eq!(shares, want, "only the w9 document leaves the head");
-        assert!(rows.head_len > reranker.prefix.len());
+        assert_eq!(rows.shares, want, "only the w9 document leaves the head");
+        check(&reranker, Some(&instruction));
 
-        let shared = reranker.score(None, query, &documents).unwrap();
-        let whole = reranker
-            .score_sharing(None, query, &documents, false)
-            .unwrap();
-        let gap = max_gap(&shared, &whole);
-        assert!(gap < 1e-5, "shared head against whole rows: {gap}");
-        // The scores are spread out, so a row scored against the wrong head would show.
-        assert!(
-            max_gap(&whole, &vec![whole[0]; whole.len()]) > 2e-3,
-            "{whole:?}"
-        );
-
-        // A max length that cuts every row inside the head scores every row whole.
-        let head_len = rows.head_len - reranker.prefix.len();
-        let max_length = reranker.prefix.len() + reranker.suffix.len() + head_len - 2;
+        // A max length that cuts every row inside the shared ids scores every row whole.
+        let max_length = reranker.suffix.len() + 62;
         let model = random_model(small_config(), 2, &Device::Cpu, DType::F32);
         let short =
             super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes, max_length).unwrap();
-        let rows = short.rows(None, query, &documents).unwrap();
-        assert!(rows.shares_head.iter().all(|s| !s));
+        let rows = short.rows(Some(&instruction), query, &documents).unwrap();
+        assert!(rows.shares.iter().all(|&s| !s));
         assert_eq!(
-            short.score(None, query, &documents).unwrap(),
-            short.score_sharing(None, query, &documents, false).unwrap()
+            short.score(Some(&instruction), query, &documents).unwrap(),
+            short
+                .score_sharing(Some(&instruction), query, &documents, false)
+                .unwrap()
         );
     }
 
     /// The tail after a shared head on Metal, in f32 and bf16, against the whole rows on Metal:
-    /// the fused kernel lines its causal mask up with the last keys.
+    /// the fused kernel's causal mask, with fewer queries than keys, has to line each query up
+    /// with its own key. The kernel works in key blocks of 32 (head dim under 128) or 16 (128),
+    /// so the documents give tails of every length modulo 32, at both head dims.
     #[cfg(feature = "metal")]
     #[test]
     fn reranker_scores_with_the_shared_head_as_with_whole_rows_on_metal() {
         use candle_core::{DType, Device, Tensor};
 
-        // Head dim 64, one the fused attention kernel takes.
-        let mut cfg = small_config();
-        cfg.head_dim = Some(64);
-        cfg.hidden_size = 256;
         let device = Device::new_metal(0).unwrap();
-        let documents = reranker_documents();
-        for (dtype, tolerance) in [(DType::F32, 1e-4f32), (DType::BF16, 2e-2)] {
-            let model = random_model(cfg.clone(), 2, &device, dtype);
-            let no_yes = Tensor::randn(0f32, 0.1, (2, cfg.hidden_size), &Device::Cpu).unwrap();
-            let reranker =
-                super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes, 512).unwrap();
-            let shared = reranker.score(None, "w1 w2 w3", &documents).unwrap();
-            let whole = reranker
-                .score_sharing(None, "w1 w2 w3", &documents, false)
-                .unwrap();
-            let gap = max_gap(&shared, &whole);
-            assert!(
-                gap < tolerance,
-                "{dtype:?}: shared head against whole rows: {gap}"
-            );
-            assert!(max_gap(&whole, &vec![whole[0]; whole.len()]) > 1e-3);
+        let mut documents = reranker_documents();
+        documents.extend((10..44).map(|n| {
+            (0..n)
+                .map(|i| format!("w{}", (i * 17 + n) % 80 + 20))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }));
+        for head_dim in [64, 128] {
+            // Head dims the fused attention kernel takes.
+            let mut cfg = small_config();
+            cfg.head_dim = Some(head_dim);
+            cfg.hidden_size = 256;
+            for (dtype, tolerance) in [(DType::F32, 1e-4f32), (DType::BF16, 2e-2)] {
+                let model = random_model(cfg.clone(), 2, &device, dtype);
+                let no_yes = Tensor::randn(0f32, 0.1, (2, cfg.hidden_size), &Device::Cpu).unwrap();
+                let reranker =
+                    super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes, 512).unwrap();
+                let shared = reranker.score(None, "w1 w2 w3", &documents).unwrap();
+                let whole = reranker
+                    .score_sharing(None, "w1 w2 w3", &documents, false)
+                    .unwrap();
+                let gap = max_gap(&shared, &whole);
+                assert!(
+                    gap < tolerance,
+                    "head dim {head_dim} {dtype:?}: shared head against whole rows: {gap}"
+                );
+                assert!(max_gap(&whole, &vec![whole[0]; whole.len()]) > 1e-3);
+            }
         }
     }
 
