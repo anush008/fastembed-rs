@@ -1,6 +1,6 @@
 use super::DEFAULT_MAX_LENGTH;
 use crate::{
-    init::{HasMaxLength, InitOptionsWithLength},
+    init::{HasMaxLength, InitOptionsWithLength, ProviderNames},
     RerankerModel, TokenizerFiles,
 };
 use ort::{environment::Environment, ep::ExecutionProviderDispatch, session::Session};
@@ -57,6 +57,23 @@ impl Default for RerankInitOptionsUserDefined {
             dimension_overrides: Vec::new(),
             session_config: Vec::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for RerankInitOptionsUserDefined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankInitOptionsUserDefined")
+            .field("environment", &self.environment)
+            .field(
+                "execution_providers",
+                &ProviderNames(&self.execution_providers),
+            )
+            .field("max_length", &self.max_length)
+            .field("intra_threads", &self.intra_threads)
+            .field("disable_cpu_fallback", &self.disable_cpu_fallback)
+            .field("dimension_overrides", &self.dimension_overrides)
+            .field("session_config", &self.session_config)
+            .finish()
     }
 }
 
