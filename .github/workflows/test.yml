@@ -131,7 +131,7 @@ jobs:
             features: "directml,hf-hub-native-tls,image-models"
           - os: macos-14
             name: metal
-            features: "metal,hf-hub-native-tls,ort-download-binaries-native-tls"
+            features: "qwen3,nomic-v2-moe,metal,hf-hub-native-tls,ort-download-binaries-native-tls"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust Cache
@@ -157,4 +157,4 @@ jobs:
           key: test-metal
 
       - name: Cargo Test (Metal, in-file tests)
-        run: cargo test --release --no-default-features --features metal,ort-download-binaries-native-tls --lib
+        run: cargo test --release --no-default-features --features qwen3,nomic-v2-moe,metal,ort-download-binaries-native-tls --lib
