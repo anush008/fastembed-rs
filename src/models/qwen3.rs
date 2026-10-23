@@ -1835,10 +1835,12 @@ const QWEN3_RERANKER_BATCH_SIZE: usize = 16;
 const QWEN3_RERANKER_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
 const QWEN3_RERANKER_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-/// The most tokens [`Qwen3Reranker::score`] runs through the model in one forward: rows of one
-/// length go together until the next would pass it. 8192 is one row of the model card's longest
-/// input, so a long document costs no more memory than scoring it alone, and a forward of short
-/// documents still holds dozens of rows.
+/// The most tokens [`Qwen3Reranker::score`] runs through the model in one forward, beside the
+/// [`QWEN3_RERANKER_BATCH_SIZE`] rows: within a chunk of that many rows, rows of one length go
+/// together until the next would pass it. The row count alone still lets 16 long documents make
+/// one forward of 131072 tokens. 8192 is one row of the model card's longest input, so a long
+/// document costs no more memory than scoring it alone, while a chunk of short documents (under
+/// 512 tokens each) still runs whole.
 const QWEN3_RERANKER_TOKENS_PER_FORWARD: usize = 8192;
 
 /// The rows `ids` of the `[rows, cols]` matrix `name` in `files`, as a CPU tensor in the file's
@@ -2856,22 +2858,24 @@ mod tests {
         let no_yes = Tensor::randn(0f32, 0.05, (2, hidden), &Device::Cpu).unwrap();
         let reranker = super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 512).unwrap();
 
-        let long: String = (0..40)
-            .map(|i| format!("w{}", i % 100))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let alone = reranker.score(None, "w1 w2", &["w3"]).unwrap();
-        // Next to a long document (which padding would put in front of it) and one of another
-        // length, the short document is still the only row of its length: a batch of one.
-        let together = reranker
-            .score(None, "w1 w2", &[long.as_str(), "w3", "w4 w5 w6 w7 w8"])
-            .unwrap();
-        assert_eq!(together.len(), 3);
-        assert_eq!(together[1], alone[0], "the other documents moved the score");
-        assert_eq!(
-            together[0],
-            reranker.score(None, "w1 w2", &[long.as_str()]).unwrap()[0]
-        );
+        let words = |n: usize| {
+            (0..n)
+                .map(|i| format!("w{}", (i * 13 + n) % 100))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // Next to a long document, which padding would put in front of every other one, each
+        // document is still the only row of its length: a batch of one, exactly as alone.
+        let documents: Vec<String> = [120, 1, 2, 3, 5, 8, 13].iter().map(|&n| words(n)).collect();
+        let together = reranker.score(None, "w1 w2", &documents).unwrap();
+        assert_eq!(together.len(), documents.len());
+        for (i, document) in documents.iter().enumerate() {
+            let alone = reranker.score(None, "w1 w2", &[document]).unwrap();
+            assert_eq!(
+                together[i], alone[0],
+                "document {i}: the others moved its score"
+            );
+        }
 
         // Under a token budget a group runs in several forwards, and every row keeps its place.
         let rows: Vec<Vec<u32>> = (0..7u32).map(|i| (i..i + 6).collect()).collect();
