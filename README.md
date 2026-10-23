@@ -97,7 +97,7 @@ Quantized versions are also available for several models above (append `Q` to th
 
 ## ✊ Support
 
-To support the library, please donate to our primary upstream dependency, [`ort`](https://github.com/pykeio/ort?tab=readme-ov-file#-sponsor-ort) - The Rust wrapper for the ONNX runtime.
+To support the library, please donate to our primary upstream dependency, [`ort`](https://opencollective.com/pyke-osai) - The Rust wrapper for the ONNX runtime.
 
 ## Installation
 
