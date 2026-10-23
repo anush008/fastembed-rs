@@ -3459,33 +3459,62 @@ mod tests {
         assert!(late_cos.iter().any(|&c| (c - 1.0).abs() > 1e-3));
     }
 
-    /// A random f32 model on the CPU, and its VarMap for writing the same weights to GGUF.
+    /// A random-looking f32 model on the CPU, and its VarMap for writing the same weights to
+    /// GGUF. The weights are the same on every run (see `fixed_weights`).
     fn random_model_and_weights(cfg: &super::Config) -> (super::Qwen3Model, candle_nn::VarMap) {
         use candle_core::{DType, Device};
-        use candle_nn::{Init, VarBuilder, VarMap};
+        use candle_nn::{VarBuilder, VarMap};
 
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-        let near_one = Init::Randn {
-            mean: 1.0,
-            stdev: 0.1,
-        };
-        vb.pp("norm")
-            .get_with_hints(cfg.hidden_size, "weight", near_one)
-            .unwrap();
-        for i in 0..cfg.num_hidden_layers {
-            for (name, dim) in [
-                ("input_layernorm", cfg.hidden_size),
-                ("post_attention_layernorm", cfg.hidden_size),
-                ("self_attn.q_norm", cfg.head_dim()),
-                ("self_attn.k_norm", cfg.head_dim()),
-            ] {
-                vb.pp(format!("layers.{i}.{name}"))
-                    .get_with_hints(dim, "weight", near_one)
-                    .unwrap();
-            }
+        let model = super::Qwen3Model::new(cfg.clone(), vb).unwrap();
+        // The model holds the variables' own storage, so it sees the values written here.
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            let values = fixed_weights(name, var.dims());
+            let tensor = candle_core::Tensor::from_vec(values, var.dims(), &Device::Cpu).unwrap();
+            var.set(&tensor).unwrap();
         }
-        (super::Qwen3Model::new(cfg.clone(), vb).unwrap(), varmap)
+        (model, varmap)
+    }
+
+    /// Normal-looking values for the weight `name`, the same on every run and every machine.
+    ///
+    /// candle's CPU device cannot be seeded, and random weights made the GGUF last-position
+    /// tests flaky: candle's f32 matmul rounds the last row a little differently alone than
+    /// inside the full batch (under 1e-6), and when a value then sits on a Q8_0 rounding
+    /// boundary the activation quantization moves it a whole step, which showed as up to 2e-2
+    /// in the output (about one run in 430). With fixed weights a run passes or fails the same
+    /// way every time. The spread is what candle would draw: norms near one (mean 1, 0.1), the
+    /// embedding table N(0, 1), and the projections Kaiming normal, sqrt(2 / fan_in).
+    ///
+    /// SplitMix64 seeded from the name, and the sum of twelve uniforms for the normal, so no
+    /// float function whose last bit may differ between platforms is involved.
+    fn fixed_weights(name: &str, dims: &[usize]) -> Vec<f32> {
+        let (mean, stdev) = match dims {
+            [_] => (1.0f32, 0.1f32),
+            _ if name.starts_with("embed_tokens.") => (0.0, 1.0),
+            [_, fan_in] => (0.0, (2.0 / *fan_in as f32).sqrt()),
+            _ => panic!("no fixed weights for `{name}` with shape {dims:?}"),
+        };
+        // FNV-1a of the name, so each weight has its own stream.
+        let mut state = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let mut uniform = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            // The top 24 bits, exact in f32: [0, 1).
+            (z >> 40) as f32 / (1u32 << 24) as f32
+        };
+        (0..dims.iter().product::<usize>())
+            .map(|_| {
+                let normal = (0..12).map(|_| uniform()).sum::<f32>() - 6.0;
+                mean + stdev * normal
+            })
+            .collect()
     }
 
     /// llama.cpp's `qwen3` layout, with the norms in f32 and everything else in `matrix_dtype`.
