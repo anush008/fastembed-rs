@@ -1,8 +1,6 @@
 name: "Cargo Tests"
 on:
   pull_request:
-  # The merged head of main is what release.yml publishes, so it is tested too:
-  # two pull requests green alone can be red together.
   push:
     branches: [main]
 
