@@ -22,6 +22,8 @@ pub mod qwen3;
 pub(crate) mod qwen3_qk_norm_rope;
 #[cfg(feature = "qwen3-text")]
 pub(crate) mod qwen3_sdpa_bthd;
+#[cfg(feature = "qwen3-text")]
+pub(crate) mod qwen3_silu_mul;
 #[cfg(feature = "qwen3-vl")]
 pub mod qwen3_vl;
 
