@@ -1871,6 +1871,7 @@ const QWEN3_RERANKER_TOKENS_PER_FORWARD: usize = 8192;
 
 /// The rows `ids` of the `[rows, cols]` matrix `name` in `files`, as a CPU tensor in the file's
 /// dtype, copied straight out of the mapped file: the rest of the matrix is never read.
+#[cfg(feature = "hf-hub")]
 fn safetensors_rows(
     files: &[PathBuf],
     name: &str,
@@ -2798,6 +2799,7 @@ mod tests {
         assert!(super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 4).is_err());
     }
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn safetensors_rows_reads_the_named_rows_alone() {
         use candle_core::{DType, Device, Tensor};
