@@ -129,7 +129,7 @@ jobs:
           - os: windows-latest
             name: directml
             features: "directml,hf-hub-native-tls,image-models"
-          - os: macos-14
+          - os: macos-15
             name: metal
             features: "qwen3,nomic-v2-moe,metal,hf-hub-native-tls,ort-download-binaries-native-tls"
     steps:
@@ -145,7 +145,7 @@ jobs:
   # Metal checks. They build random weights, so nothing is downloaded but ONNX Runtime,
   # which the crate links whatever its features.
   test-metal:
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     steps:
