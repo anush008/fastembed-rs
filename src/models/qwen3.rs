@@ -1435,9 +1435,9 @@ impl Qwen3Model {
         Ok((hs.apply(&self.norm)?, tapped))
     }
 
-    /// input_ids: [B,T]
-    /// attention_mask: optionally [B,T] (1=token,0=pad) OR already expanded additive mask [B,1,T,T]
-    /// Here we assume additive mask [B,1,T,T] for simplicity (HF does that).
+    /// input_ids: `[B,T]`
+    /// attention_mask: optionally `[B,T]` (1=token,0=pad) OR already expanded additive mask `[B,1,T,T]`
+    /// Here we assume additive mask `[B,1,T,T]` for simplicity (HF does that).
     pub fn forward(
         &self,
         input_ids: &Tensor,
