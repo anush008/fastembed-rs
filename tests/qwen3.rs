@@ -332,35 +332,26 @@ fn qwen3_reranker_06b_metal_bf16_near_python() {
 }
 
 #[test]
+#[ignore = "downloads Qwen3-Embedding-4B; run with --ignored qwen3_4b_embed"]
 fn qwen3_4b_embed() {
-    if std::env::var("RUN_QWEN3_4B").is_err() {
-        return;
-    }
     run_embed_test(REPO_4B);
 }
 
 #[test]
+#[ignore = "downloads Qwen3-Embedding-8B; run with --ignored qwen3_8b_embed"]
 fn qwen3_8b_embed() {
-    if std::env::var("RUN_QWEN3_8B").is_err() {
-        return;
-    }
     run_embed_test(REPO_8B);
 }
 
 #[test]
+#[ignore = "downloads Qwen3-VL-Embedding-2B; run with --ignored qwen3_vl_2b_text_embed"]
 fn qwen3_vl_2b_text_embed() {
-    if std::env::var("RUN_QWEN3_VL_2B").is_err() {
-        return;
-    }
     run_embed_test(REPO_VL_2B);
 }
 
 #[test]
+#[ignore = "downloads Qwen3-VL-Embedding-2B; run with --ignored qwen3_vl_2b_image_embed"]
 fn qwen3_vl_2b_image_embed() {
-    if std::env::var("RUN_QWEN3_VL_2B_IMAGE").is_err() {
-        return;
-    }
-
     let device = Device::Cpu;
     let model =
         one_download_at_a_time(|| Qwen3VLEmbedding::from_hf(REPO_VL_2B, &device, DType::F32, 2048))

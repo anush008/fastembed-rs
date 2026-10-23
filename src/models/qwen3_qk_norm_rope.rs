@@ -101,15 +101,17 @@ fn cpu_inner<T: WithDType>(
                 v * v
             })
             .sum();
-        let total = T::from_f64(f64::from(1.0 / (sum_sq / d as f32 + eps).sqrt()));
+        let total = 1.0 / (sum_sq / d as f32 + eps).sqrt();
         let cs = ((row / dims.heads) % dims.seq_len) * half_d;
         let out = &mut dst[row * d..(row + 1) * d];
+        // In f32 throughout, rounded to `T` once at the store, as the Metal kernel does.
+        let f = |v: T| v.to_f64() as f32;
         for i in 0..half_d {
-            let n1 = x[i] * total * weight[i];
-            let n2 = x[i + half_d] * total * weight[i + half_d];
-            let (c, s) = (cos[cs + i], sin[cs + i]);
-            out[i] = n1 * c - n2 * s;
-            out[i + half_d] = n1 * s + n2 * c;
+            let n1 = f(x[i]) * total * f(weight[i]);
+            let n2 = f(x[i + half_d]) * total * f(weight[i + half_d]);
+            let (c, s) = (f(cos[cs + i]), f(sin[cs + i]));
+            out[i] = T::from_f64(f64::from(n1 * c - n2 * s));
+            out[i + half_d] = T::from_f64(f64::from(n1 * s + n2 * c));
         }
     }
     dst
@@ -373,6 +375,29 @@ mod tests {
             // The CPU path of the dispatcher is the two ops themselves.
             let dispatched = rms_norm_rope_thd(&xs, &weight, &cos, &sin, 1e-6).unwrap();
             assert_eq!(max_abs_diff(&dispatched, &expected), 0.0);
+
+            // In bf16 and f16 the op works in f32 and rounds once, as the Metal kernel does.
+            for dtype in [DType::BF16, DType::F16] {
+                let cast = |x: &Tensor| x.to_dtype(dtype).unwrap();
+                let f32 = |x: &Tensor| x.to_dtype(DType::F32).unwrap();
+                let (xs, weight, cos, sin) = (cast(&xs), cast(&weight), cast(&cos), cast(&sin));
+                let once = cast(&two_ops(&f32(&xs), &f32(&weight), &f32(&cos), &f32(&sin)));
+                let got = fused(&xs, &weight, &cos, &sin);
+                assert_eq!(got.dtype(), dtype);
+                let not_once = f32(&got)
+                    .ne(&f32(&once))
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .mean_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(
+                    not_once <= 0.01,
+                    "{dtype:?} d={d}: {not_once} not rounded once"
+                );
+            }
         }
     }
 
@@ -399,39 +424,63 @@ mod tests {
             assert!(max_abs_diff(&got, &reference) < 1e-5, "f32 d={d} differs");
             assert!(max_abs_diff(&got, &xs) > 1e-1);
 
-            // bf16: the two kernels and the one round at different points (about 40% of the
-            // values differ by one bf16 step), so each is measured against the f32 reference of
-            // the same bf16 inputs, and the one kernel's error is the two kernels' error class.
-            let bf16 = |x: &Tensor| x.to_dtype(DType::BF16).unwrap();
-            let f32 = |x: &Tensor| x.to_dtype(DType::F32).unwrap();
-            let (xs, weight, cos, sin) = (bf16(&xs), bf16(&weight), bf16(&cos), bf16(&sin));
-            let reference = two_ops(&f32(&xs), &f32(&weight), &f32(&cos), &f32(&sin));
-            let mean_err = |x: &Tensor| {
-                (f32(x) - &reference)
+            // bf16 and f16: the kernel works in f32 and rounds once at the store, so it gives the
+            // f32 result of the same rounded inputs rounded once, where the two kernels round
+            // three times. Measured against that f32 reference.
+            for dtype in [DType::BF16, DType::F16] {
+                let cast = |x: &Tensor| x.to_dtype(dtype).unwrap();
+                let f32 = |x: &Tensor| x.to_dtype(DType::F32).unwrap();
+                let (xs, weight, cos, sin) = (cast(&xs), cast(&weight), cast(&cos), cast(&sin));
+                let reference = two_ops(&f32(&xs), &f32(&weight), &f32(&cos), &f32(&sin));
+                let mean_err = |x: &Tensor| {
+                    (f32(x) - &reference)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .mean_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                };
+                let got = rms_norm_rope_thd(&xs, &weight, &cos, &sin, 1e-6).unwrap();
+                assert_eq!(got.dtype(), dtype);
+                let rounded = cast(&reference);
+                let two_ops_t = two_ops(&xs, &weight, &cos, &sin);
+                // The share of values that are not the f32 result rounded once.
+                let not_rounded = f32(&got)
+                    .ne(&f32(&rounded))
                     .unwrap()
-                    .abs()
+                    .to_dtype(DType::F32)
                     .unwrap()
                     .mean_all()
                     .unwrap()
                     .to_scalar::<f32>()
-                    .unwrap()
-            };
-            let two_ops_bf16 = two_ops(&xs, &weight, &cos, &sin);
-            let got = rms_norm_rope_thd(&xs, &weight, &cos, &sin, 1e-6).unwrap();
-            assert_eq!(got.dtype(), DType::BF16);
-            let (one, two) = (mean_err(&got), mean_err(&two_ops_bf16));
-            assert!(
-                one <= 1.1 * two,
-                "bf16 d={d}: mean error {one}, the two ops {two}"
-            );
-            let (one, two) = (
-                max_abs_diff(&got, &reference),
-                max_abs_diff(&two_ops_bf16, &reference),
-            );
-            assert!(
-                one <= 1.5 * two,
-                "bf16 d={d}: max error {one}, the two ops {two}"
-            );
+                    .unwrap();
+                let (one, two, once) = (mean_err(&got), mean_err(&two_ops_t), mean_err(&rounded));
+                let (max_one, max_once) = (
+                    max_abs_diff(&got, &reference),
+                    max_abs_diff(&rounded, &reference),
+                );
+                eprintln!(
+                    "{dtype:?} d={d}: not rounded once {not_rounded}, mean error {one} (rounded \
+                     once {once}, two ops {two}), max error {max_one} (rounded once {max_once})"
+                );
+                // Measured: every value is the f32 result rounded once, and the mean error is
+                // about half the two kernels'. A fast-math f32 can still land one value on the
+                // other side of a rounding tie, hence 1% rather than none.
+                assert!(
+                    not_rounded <= 0.01,
+                    "{dtype:?} d={d}: {not_rounded} of the values are not rounded once"
+                );
+                assert!(
+                    one <= 0.75 * two,
+                    "{dtype:?} d={d}: mean error {one}, the two ops {two}"
+                );
+                assert!(
+                    max_one <= 1.01 * max_once,
+                    "{dtype:?} d={d}: max error {max_one}, rounded once {max_once}"
+                );
+            }
         }
     }
 }

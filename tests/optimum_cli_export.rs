@@ -1,4 +1,4 @@
-#![cfg(feature = "hf-hub")]
+#![cfg(all(feature = "onnx", feature = "hf-hub"))]
 #![cfg(feature = "optimum-cli")]
 #![allow(clippy::excessive_precision)]
 //! Test the use of the ``optimum-cli`` to pull models from the Hugging Face Hub,

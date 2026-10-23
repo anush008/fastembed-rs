@@ -7,16 +7,23 @@ extern crate accelerate_src;
 use candle_core::quantized::{gguf_file, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
+#[cfg(feature = "qwen3-vl")]
 use image::{imageops::FilterType, DynamicImage};
 use serde::Deserialize;
-use std::io::{Cursor, Read, Seek};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "qwen3-vl")]
+use std::io::Cursor;
+use std::io::{Read, Seek};
+use std::path::Path;
+#[cfg(feature = "hf-hub")]
+use std::path::PathBuf;
 
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
 
 use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
 use crate::models::qwen3_sdpa_bthd::sdpa_bthd;
+use crate::models::qwen3_silu_mul::silu_mul;
+#[cfg(feature = "qwen3-vl")]
 use crate::models::qwen3_vl::{Qwen3VLVisionModel, VisionConfig};
 
 fn default_true() -> bool {
@@ -60,11 +67,13 @@ impl Config {
     }
 }
 
+#[cfg(any(feature = "hf-hub", test))]
 #[derive(Deserialize)]
 struct Qwen3VLConfig {
     text_config: Config,
 }
 
+#[cfg(any(feature = "hf-hub", test))]
 fn parse_config_and_weight_prefix(config_bytes: &[u8]) -> Result<(Config, Option<&'static str>)> {
     if let Ok(cfg) = serde_json::from_slice::<Config>(config_bytes) {
         return Ok((cfg, None));
@@ -79,6 +88,7 @@ fn parse_config_and_weight_prefix(config_bytes: &[u8]) -> Result<(Config, Option
     ))
 }
 
+#[cfg(feature = "qwen3-vl")]
 #[derive(Deserialize, Debug, Clone)]
 struct Qwen3VLFullConfig {
     text_config: Config,
@@ -90,6 +100,7 @@ struct Qwen3VLFullConfig {
     vision_end_token_id: u32,
 }
 
+#[cfg(feature = "qwen3-vl")]
 #[derive(Deserialize, Debug, Clone)]
 struct Qwen3VLPreprocessorConfig {
     min_pixels: usize,
@@ -102,6 +113,7 @@ struct Qwen3VLPreprocessorConfig {
     image_std: Vec<f32>,
 }
 
+#[cfg(feature = "qwen3-vl")]
 struct PreparedImage {
     pixel_values: Vec<f32>,
     grid_t: u32,
@@ -176,15 +188,18 @@ fn build_attention_mask_fused(attention_mask_2d: &Tensor, dtype: DType) -> Resul
     causal.broadcast_add(&padding)
 }
 
+/// Each row of `xs` `[B, H]` divided by its L2 norm, in f32 whatever dtype `xs` is in: in bf16
+/// the sum of squares, the norm and every quotient would each round to 8 bits, and the vectors
+/// would come back up to about 0.5% off unit length.
 fn l2_normalize(xs: &Tensor) -> Result<Tensor> {
+    let xs = xs.to_dtype(DType::F32)?;
     let sum_sq = xs.sqr()?.sum_keepdim(1)?;
-    let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?
-        .to_dtype(sum_sq.dtype())?
-        .broadcast_as(sum_sq.shape())?;
+    let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?.broadcast_as(sum_sq.shape())?;
     let norm = sum_sq.add(&eps_tensor)?.sqrt()?;
     xs.broadcast_div(&norm)
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn last_token_pool(hidden: &Tensor, attention_mask_2d: &Tensor) -> Result<Tensor> {
     let (batch_size, seq_len, _) = hidden.dims3()?;
     let masks = attention_mask_2d.to_vec2::<f32>()?;
@@ -203,6 +218,7 @@ fn last_token_pool(hidden: &Tensor, attention_mask_2d: &Tensor) -> Result<Tensor
     Tensor::stack(&pooled_refs, 0)
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn find_token_spans(ids: &[u32], token_id: u32) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0usize;
@@ -220,6 +236,7 @@ fn find_token_spans(ids: &[u32], token_id: u32) -> Vec<(usize, usize)> {
     spans
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn round_ties_to_even(value: f64) -> usize {
     let floor = value.floor();
     let frac = value - floor;
@@ -234,6 +251,7 @@ fn round_ties_to_even(value: f64) -> usize {
     }
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn smart_resize(
     height: usize,
     width: usize,
@@ -273,6 +291,7 @@ fn smart_resize(
     Ok((h_bar, w_bar))
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn preprocess_image(
     img: &DynamicImage,
     cfg: &Qwen3VLPreprocessorConfig,
@@ -365,6 +384,7 @@ fn preprocess_image(
     })
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn build_vl_prompt(text: Option<&str>, include_image: bool, instruction: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str("<|im_start|>system\n");
@@ -380,6 +400,7 @@ fn build_vl_prompt(text: Option<&str>, include_image: bool, instruction: &str) -
     prompt
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn expand_image_token_placeholders(prompt: &str, num_image_tokens: usize) -> Result<String> {
     if num_image_tokens == 0 {
         return Ok(prompt.to_string());
@@ -393,6 +414,7 @@ fn expand_image_token_placeholders(prompt: &str, num_image_tokens: usize) -> Res
     Ok(prompt.replacen(image_token, &image_token.repeat(num_image_tokens), 1))
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn build_image_position_ids(
     encodings: &[tokenizers::Encoding],
     image_spans_per_batch: &[Option<(usize, usize)>],
@@ -496,6 +518,7 @@ fn build_image_position_ids(
     Tensor::from_vec(data, (3, batch_size, seq_len), device)
 }
 
+#[cfg(feature = "qwen3-vl")]
 fn load_image_from_path(path: &Path) -> Result<DynamicImage> {
     image::ImageReader::open(path)
         .map_err(map_err)?
@@ -684,9 +707,14 @@ impl Qwen3MLP {
 
 impl Module for Qwen3MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gate = xs.apply(&self.gate_proj)?;
+        let up = xs.apply(&self.up_proj)?;
+        // silu(gate) * up is one kernel on Metal (`silu_mul`); another activation takes two.
+        let hidden = match self.act_fn {
+            Activation::Silu => silu_mul(&gate, &up)?,
+            act => (gate.apply(&act)? * up)?,
+        };
+        hidden.apply(&self.down_proj)
     }
 }
 
@@ -1415,9 +1443,9 @@ impl Qwen3Model {
         Ok((hs.apply(&self.norm)?, tapped))
     }
 
-    /// input_ids: [B,T]
-    /// attention_mask: optionally [B,T] (1=token,0=pad) OR already expanded additive mask [B,1,T,T]
-    /// Here we assume additive mask [B,1,T,T] for simplicity (HF does that).
+    /// input_ids: `[B,T]`
+    /// attention_mask: optionally `[B,T]` (1=token,0=pad) OR already expanded additive mask `[B,1,T,T]`
+    /// Here we assume additive mask `[B,1,T,T]` for simplicity (HF does that).
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -1821,9 +1849,7 @@ fn pool_last(hidden: &Tensor, dim: Option<usize>) -> Result<Vec<Vec<f32>>> {
         Some(dim) => pooled.narrow(1, 0, dim)?,
         None => pooled,
     };
-    l2_normalize(&pooled)?
-        .to_dtype(DType::F32)?
-        .to_vec2::<f32>()
+    l2_normalize(&pooled)?.to_vec2::<f32>()
 }
 
 /// The instruction the Qwen3-Reranker model card uses when none is given.
@@ -2072,6 +2098,7 @@ impl Qwen3Reranker {
 ///
 /// This supports text-only and image-only inputs. Image+text mixed inputs can be
 /// added later with the same backend.
+#[cfg(feature = "qwen3-vl")]
 pub struct Qwen3VLEmbedding {
     model: Qwen3Model,
     vision: Qwen3VLVisionModel,
@@ -2082,6 +2109,7 @@ pub struct Qwen3VLEmbedding {
     max_image_tokens: usize,
 }
 
+#[cfg(feature = "qwen3-vl")]
 impl Qwen3VLEmbedding {
     /// Load a Qwen3-VL embedding model from Hugging Face.
     #[cfg(feature = "hf-hub")]
@@ -2363,17 +2391,15 @@ impl Qwen3VLEmbedding {
             position_ids.as_ref(),
         )?;
         let pooled = last_token_pool(&hidden, &attention_mask_2d)?;
-        let normalized = l2_normalize(&pooled)?.to_dtype(DType::F32)?;
-        normalized.to_vec2::<f32>()
+        l2_normalize(&pooled)?.to_vec2::<f32>()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        expand_image_token_placeholders, find_token_spans, parse_config_and_weight_prefix,
-        round_ties_to_even,
-    };
+    use super::parse_config_and_weight_prefix;
+    #[cfg(feature = "qwen3-vl")]
+    use super::{expand_image_token_placeholders, find_token_spans, round_ties_to_even};
 
     #[test]
     fn fused_mask_matches_the_additive_mask() {
@@ -3068,6 +3094,91 @@ mod tests {
         assert_last_row_matches(&model, 1e-4);
     }
 
+    /// The same random head-dim-128 model on the CPU in f32 and on Metal in F32 and BF16: every
+    /// pooled output (`embed` over mixed lengths, `embed_padded`, a 32-number output and an
+    /// earlier layer's vector) matches the CPU f32 vectors, and every vector it returns is unit
+    /// length, whatever dtype the model runs in.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_vectors_match_the_cpu_and_are_unit_length_in_f32_and_bf16() {
+        use candle_core::{DType, Device};
+        use candle_nn::VarBuilder;
+
+        let mut cfg = small_config();
+        cfg.head_dim = Some(128);
+        cfg.hidden_size = 256;
+        cfg.intermediate_size = 512;
+        cfg.num_hidden_layers = 2;
+        let (_, varmap) = random_model_and_weights(&cfg);
+        let weights: std::collections::HashMap<String, candle_core::Tensor> = varmap
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+            .collect();
+        let load = |device: &Device, dtype: DType| {
+            let vb = VarBuilder::from_tensors(weights.clone(), dtype, device);
+            super::Qwen3TextEmbedding::new(
+                super::Qwen3Model::new(cfg.clone(), vb).unwrap(),
+                word_tokenizer(),
+            )
+        };
+
+        /// Every pooled output the wrapper returns, in one list of vectors.
+        fn outputs(model: super::Qwen3TextEmbedding, texts: &[String]) -> Vec<Vec<f32>> {
+            let mut all = model.embed(texts).unwrap();
+            all.extend(model.embed_padded(texts).unwrap());
+            all.extend(model.embed_layers(texts, &[1]).unwrap().remove(0));
+            let short = model.with_output_dim(32).unwrap();
+            all.extend(short.embed(texts).unwrap());
+            all.extend(short.embed_padded(texts).unwrap());
+            all
+        }
+        let norm = |v: &[f32]| v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            dot / (norm(a) * norm(b))
+        };
+
+        let texts = mixed_texts();
+        let reference = outputs(load(&Device::Cpu, DType::F32), &texts);
+        let metal = Device::new_metal(0).unwrap();
+        for dtype in [DType::F32, DType::BF16] {
+            let got = outputs(load(&metal, dtype), &texts);
+            assert_eq!(got.len(), reference.len());
+            let (mut worst_norm, mut worst_diff, mut worst_cos) = (0f64, 0f32, 1f64);
+            for (g, r) in got.iter().zip(&reference) {
+                assert_eq!(g.len(), r.len(), "{dtype:?}");
+                worst_norm = worst_norm.max((norm(g) - 1.0).abs());
+                let diff = g
+                    .iter()
+                    .zip(r)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                worst_diff = worst_diff.max(diff);
+                worst_cos = worst_cos.min(cosine(g, r));
+            }
+            eprintln!(
+                "{dtype:?}: norm off 1 by at most {worst_norm:e}, max diff {worst_diff:e}, \
+                 min cosine {worst_cos}"
+            );
+            assert!(
+                worst_norm < 1e-4,
+                "{dtype:?}: a norm is off 1 by {worst_norm:e}"
+            );
+            if dtype == DType::F32 {
+                assert!(worst_diff < 1e-4, "f32: a vector differs by {worst_diff}");
+            } else {
+                assert!(worst_cos > 0.999, "bf16: a vector has cosine {worst_cos}");
+            }
+        }
+    }
+
     #[test]
     fn mrope_matches_plain_rope_for_identical_positions() {
         use super::Qwen3RotaryEmbedding;
@@ -3564,6 +3675,7 @@ mod tests {
         assert_eq!(prefix, Some("model.language_model"));
     }
 
+    #[cfg(feature = "qwen3-vl")]
     #[test]
     fn finds_token_spans() {
         let ids = vec![1u32, 42, 42, 7, 42, 42, 42, 9];
@@ -3571,6 +3683,7 @@ mod tests {
         assert_eq!(spans, vec![(1, 3), (4, 7)]);
     }
 
+    #[cfg(feature = "qwen3-vl")]
     #[test]
     fn expands_image_placeholders() {
         let prompt = "<|vision_start|><|image_pad|><|vision_end|>";
@@ -3581,6 +3694,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qwen3-vl")]
     #[test]
     fn rounds_half_to_even_like_python() {
         assert_eq!(round_ties_to_even(12.5), 12);
