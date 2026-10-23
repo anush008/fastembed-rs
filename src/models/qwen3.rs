@@ -2656,6 +2656,16 @@ mod tests {
             "end.\n\nstart, then: more!? ".repeat(200),
             "a\u{a0} b\u{3000} c ".repeat(500),
             format!("{} ", "-".repeat(120)).repeat(200),
+            // 1024 bytes in, a cut at that byte lands inside a long word whose tokens straddle
+            // the 63rd: cut there, the word splits into other tokens before the 63rd. Cut at the
+            // space before it, the prefix comes up short and the text is encoded whole.
+            format!(
+                " {}{}",
+                format!("{} ", "-".repeat(32)).repeat(24),
+                "internationalization incomprehensibilities counterrevolutionaries \
+                 electroencephalography uncharacteristically pneumonoultramicroscopic "
+                    .repeat(30)
+            ),
         ]
     }
 
