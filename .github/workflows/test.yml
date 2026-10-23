@@ -4,7 +4,7 @@ on:
   # The merged head of main is what release.yml publishes, so it is tested too:
   # two pull requests green alone can be red together.
   push:
-    branches: [main, next, beta]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
