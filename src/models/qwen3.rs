@@ -2759,7 +2759,6 @@ mod tests {
         let reranker =
             super::Qwen3Reranker::new(model, word_tokenizer(), no_yes.clone(), 512).unwrap();
 
-        // Three rows of different lengths in one call.
         let rows: Vec<Vec<u32>> = vec![(1..9).collect(), (20..23).collect(), (40..52).collect()];
         let together = reranker.score_rows(&rows).unwrap();
         assert_eq!(together.len(), 3);
