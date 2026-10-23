@@ -3402,12 +3402,25 @@ mod tests {
         documents
     }
 
+    /// The largest difference between two score lists. A NaN anywhere fails the test here,
+    /// because `f32::max` would skip it and let a broken score compare as equal.
     fn max_gap(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
+        assert!(
+            a.iter().chain(b).all(|s| s.is_finite()),
+            "a score is not finite: {a:?} {b:?}"
+        );
         a.iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())
             .fold(0f32, f32::max)
+    }
+
+    /// How far apart the scores are, on the logit scale: random weights can put every
+    /// probability near 0 or 1, where the probabilities barely differ but the logits still do.
+    fn logit_spread(scores: &[f32]) -> f32 {
+        let logits: Vec<f32> = scores.iter().map(|p| (p / (1.0 - p)).ln()).collect();
+        max_gap(&logits, &vec![logits[0]; logits.len()])
     }
 
     /// `score` runs the shared ids once and each document's tail after them, and gives the
@@ -3436,10 +3449,7 @@ mod tests {
                 "{instruction:?}: shared against whole rows: {gap}"
             );
             // The scores are spread out, so a row scored against the wrong ids would show.
-            assert!(
-                max_gap(&whole, &vec![whole[0]; whole.len()]) > 2e-3,
-                "{whole:?}"
-            );
+            assert!(logit_spread(&whole) > 1e-2, "{whole:?}");
         };
 
         // The default head is not a multiple of 32 tokens long, so its last tokens, where the
@@ -3516,7 +3526,7 @@ mod tests {
                     gap < tolerance,
                     "head dim {head_dim} {dtype:?}: shared head against whole rows: {gap}"
                 );
-                assert!(max_gap(&whole, &vec![whole[0]; whole.len()]) > 1e-3);
+                assert!(logit_spread(&whole) > 1e-2, "{whole:?}");
             }
         }
     }
