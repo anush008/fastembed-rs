@@ -76,13 +76,17 @@ qwen3-vl = ["qwen3-text", "dep:image", "hf-hub"]
 nomic-v2-moe = ["dep:candle-core", "dep:candle-nn", "hf-hub"]
 
 image-models = ["onnx", "dep:image"]
-mkl = ["qwen3", "nomic-v2-moe", "dep:intel-mkl-src", "candle-nn/mkl", "candle-core/mkl"]
-accelerate = ["qwen3", "nomic-v2-moe", "dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
 directml = ["onnx", "ort/directml"]
 webgpu = ["onnx", "ort/webgpu"]
-cuda = ["qwen3", "nomic-v2-moe", "candle-core/cuda", "candle-nn/cuda"]
-cudnn = ["qwen3", "nomic-v2-moe", "candle-core/cudnn", "candle-nn/cudnn", "cuda"]
-metal = ["qwen3", "nomic-v2-moe", "candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
+
+# candle backends. Each switches the backend of whichever candle models are selected
+# (`qwen3`, `qwen3-text`, `qwen3-vl`, `nomic-v2-moe`) and selects no model itself, so
+# name the model feature beside it: `features = ["qwen3", "metal"]`.
+mkl = ["dep:intel-mkl-src", "candle-nn?/mkl", "candle-core?/mkl"]
+accelerate = ["dep:accelerate-src", "candle-core?/accelerate", "candle-nn?/accelerate"]
+cuda = ["candle-core?/cuda", "candle-nn?/cuda"]
+cudnn = ["candle-core?/cudnn", "candle-nn?/cudnn", "cuda"]
+metal = ["candle-core?/metal", "candle-nn?/metal", "dep:candle-metal-kernels"]
 
 # This feature does not change any code, but is used to limit tests if
 # the user does not have `optimum-cli` or even python installed.
