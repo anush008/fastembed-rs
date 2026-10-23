@@ -3197,7 +3197,9 @@ mod tests {
         let cfg = small_config();
         let hidden = cfg.hidden_size;
         let model = random_model(cfg, 2, &Device::Cpu, DType::F32);
-        let no_yes = Tensor::randn(0f32, 1.0, (2, hidden), &Device::Cpu).unwrap();
+        // Small rows keep the logits off the flat ends of the sigmoid. At scale 1.0 the logits
+        // are large, and two rows' probabilities once came out equal, failing the check below.
+        let no_yes = Tensor::randn(0f32, 0.02, (2, hidden), &Device::Cpu).unwrap();
         let reranker =
             super::Qwen3Reranker::new(model, word_tokenizer(), no_yes.clone(), 512).unwrap();
 
