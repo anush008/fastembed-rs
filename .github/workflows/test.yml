@@ -92,6 +92,11 @@ jobs:
       - name: Cargo Test Offline
         run: cargo test --no-default-features --features image-models,ort-download-binaries-native-tls
 
+      # With no ONNX Runtime anywhere, this test binary links only while no feature it
+      # names pulls `ort` back in: ort-sys plants a link-error symbol otherwise.
+      - name: Candle-only build links without ONNX Runtime
+        run: cargo test --no-default-features --features qwen3-text --lib
+
       - name: Cargo Clippy
         run: cargo clippy --all-targets --no-default-features --features hf-hub-native-tls,image-models,ort-download-binaries-native-tls -- -D warnings
 
@@ -115,6 +120,9 @@ jobs:
           - os: ubuntu-latest
             name: qwen3
             features: "qwen3,hf-hub-native-tls"
+          - os: ubuntu-latest
+            name: qwen3-text
+            features: "qwen3-text"
           - os: ubuntu-latest
             name: nomic-v2-moe
             features: "nomic-v2-moe,hf-hub-native-tls"
