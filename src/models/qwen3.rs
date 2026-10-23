@@ -1826,6 +1826,38 @@ const QWEN3_RERANKER_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\
 /// documents still holds dozens of rows.
 const QWEN3_RERANKER_TOKENS_PER_FORWARD: usize = 8192;
 
+/// The rows `ids` of the `[rows, cols]` matrix `name` in `files`, as a CPU tensor in the file's
+/// dtype, copied straight out of the mapped file: the rest of the matrix is never read.
+fn safetensors_rows(
+    files: &[PathBuf],
+    name: &str,
+    (rows, cols): (usize, usize),
+    ids: &[u32],
+) -> Result<Tensor> {
+    let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(files)? };
+    let view = tensors.get(name)?;
+    if view.shape() != [rows, cols] {
+        return Err(candle_core::Error::Msg(format!(
+            "{name} is {:?}, expected [{rows}, {cols}]",
+            view.shape()
+        )));
+    }
+    let dtype = DType::try_from(view.dtype())?;
+    let row_bytes = cols * dtype.size_in_bytes();
+    let picked = ids
+        .iter()
+        .map(|&id| {
+            let start = id as usize * row_bytes;
+            let bytes = view
+                .data()
+                .get(start..start + row_bytes)
+                .ok_or_else(|| candle_core::Error::Msg(format!("{name} has no row {id}")))?;
+            Tensor::from_raw_buffer(bytes, dtype, &[1, cols], &Device::Cpu)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&picked, 0)
+}
+
 /// Qwen3-Reranker (for example `Qwen/Qwen3-Reranker-0.6B`): the probability that a document
 /// answers a query under an instruction, read as the model's "yes" against "no" at the last
 /// position, as the model card computes it.
@@ -1913,16 +1945,19 @@ impl Qwen3Reranker {
                 candle_core::Error::Msg(format!("the tokenizer has no `{token}` token"))
             })
         };
-        let ids = Tensor::new(&[id("no")?, id("yes")?], device)?;
-        // The output layer, tied to the token table when the config says so.
+        // The output layer, tied to the token table when the config says so. Only its "no" and
+        // "yes" rows are read, from the mapped file, so the table never goes to the device.
         let output = if cfg.tie_word_embeddings {
-            vb.pp("model.embed_tokens")
-                .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+            "model.embed_tokens.weight"
         } else {
-            vb.pp("lm_head")
-                .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+            "lm_head.weight"
         };
-        let no_yes = output.index_select(&ids, 0)?;
+        let no_yes = safetensors_rows(
+            &weight_files,
+            output,
+            (cfg.vocab_size, cfg.hidden_size),
+            &[id("no")?, id("yes")?],
+        )?;
         let model = Qwen3Model::new(cfg, vb.pp("model"))?;
         Self::new(model, tokenizer, no_yes, max_length)
     }
@@ -2689,6 +2724,40 @@ mod tests {
         assert_eq!(scores.len(), 2);
         let model = random_model(small_config(), 1, &Device::Cpu, DType::F32);
         assert!(super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 4).is_err());
+    }
+
+    #[test]
+    fn safetensors_rows_reads_the_named_rows_alone() {
+        use candle_core::{DType, Device, Tensor};
+
+        let table = Tensor::randn(0f32, 1.0, (50, 8), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "fastembed-safetensors-rows-{}.safetensors",
+            std::process::id()
+        ));
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([("t.weight".to_string(), table.clone())]),
+            &path,
+        )
+        .unwrap();
+        let files = [path.clone()];
+        let got = super::safetensors_rows(&files, "t.weight", (50, 8), &[49, 0, 7]);
+        let wrong_shape = super::safetensors_rows(&files, "t.weight", (50, 9), &[0]);
+        let past_the_end = super::safetensors_rows(&files, "t.weight", (50, 8), &[50]);
+        std::fs::remove_file(&path).unwrap();
+
+        let got = got.unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        let want = table
+            .index_select(&Tensor::new(&[49u32, 0, 7], &Device::Cpu).unwrap(), 0)
+            .unwrap();
+        let as_f32 = |t: &Tensor| t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(as_f32(&got), as_f32(&want));
+        assert!(wrong_shape.is_err());
+        assert!(past_the_end.is_err());
     }
 
     #[test]
