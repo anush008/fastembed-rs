@@ -1485,7 +1485,8 @@ impl Qwen3Model {
     /// `[B, heads, T, T]` table; on any other device it is `forward` with the mask
     /// `build_attention_mask_4d` builds.
     /// `rows` as in `forward_embeds_masked`; with left padding the last position is every row's
-    /// last real token.
+    /// last real token. Only the tests call it; `embed_padded` takes the tapped form.
+    #[cfg(test)]
     pub(crate) fn forward_padded(
         &self,
         input_ids: &Tensor,
@@ -1930,14 +1931,56 @@ const QWEN3_RERANKER_BATCH_SIZE: usize = 16;
 const QWEN3_RERANKER_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
 const QWEN3_RERANKER_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
+/// The most tokens [`Qwen3Reranker::score`] runs through the model in one forward, beside the
+/// [`QWEN3_RERANKER_BATCH_SIZE`] rows: within a chunk of that many rows, rows of one length go
+/// together until the next would pass it. The row count alone still lets 16 long documents make
+/// one forward of 131072 tokens. 8192 is one row of the model card's longest input, so a long
+/// document costs no more memory than scoring it alone, while a chunk of short documents (under
+/// 512 tokens each) still runs whole.
+const QWEN3_RERANKER_TOKENS_PER_FORWARD: usize = 8192;
+
+/// The rows `ids` of the `[rows, cols]` matrix `name` in `files`, as a CPU tensor in the file's
+/// dtype, copied straight out of the mapped file: the rest of the matrix is never read.
+#[cfg(feature = "hf-hub")]
+fn safetensors_rows(
+    files: &[PathBuf],
+    name: &str,
+    (rows, cols): (usize, usize),
+    ids: &[u32],
+) -> Result<Tensor> {
+    let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(files)? };
+    let view = tensors.get(name)?;
+    if view.shape() != [rows, cols] {
+        return Err(candle_core::Error::Msg(format!(
+            "{name} is {:?}, expected [{rows}, {cols}]",
+            view.shape()
+        )));
+    }
+    let dtype = DType::try_from(view.dtype())?;
+    let row_bytes = cols * dtype.size_in_bytes();
+    let picked = ids
+        .iter()
+        .map(|&id| {
+            let start = id as usize * row_bytes;
+            let bytes = view
+                .data()
+                .get(start..start + row_bytes)
+                .ok_or_else(|| candle_core::Error::Msg(format!("{name} has no row {id}")))?;
+            Tensor::from_raw_buffer(bytes, dtype, &[1, cols], &Device::Cpu)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&picked, 0)
+}
+
 /// Qwen3-Reranker (for example `Qwen/Qwen3-Reranker-0.6B`): the probability that a document
 /// answers a query under an instruction, read as the model's "yes" against "no" at the last
 /// position, as the model card computes it.
 pub struct Qwen3Reranker {
     model: Qwen3Model,
     tokenizer: tokenizers::Tokenizer,
-    /// The output embedding rows of "no" and "yes", `[2, H]`, in the model's dtype.
-    no_yes: Tensor,
+    /// The "yes" output row minus the "no" one, in f32: P("yes") is the sigmoid of the last
+    /// position's normed state against it, with no rounding to the model's dtype on the way.
+    yes_minus_no: Vec<f32>,
     prefix: Vec<u32>,
     suffix: Vec<u32>,
     max_length: usize,
@@ -1945,13 +1988,27 @@ pub struct Qwen3Reranker {
 
 impl Qwen3Reranker {
     /// Build from a loaded model, its tokenizer (no padding or truncation set; this sets its own),
-    /// and the `[2, H]` output rows of the "no" and "yes" tokens.
+    /// and the `[2, H]` output rows of the "no" and "yes" tokens (any dtype or device: they are
+    /// read once, in f32).
     pub fn new(
         model: Qwen3Model,
         mut tokenizer: tokenizers::Tokenizer,
         no_yes: Tensor,
         max_length: usize,
     ) -> Result<Self> {
+        let hidden = model.config().hidden_size;
+        if no_yes.dims() != [2, hidden] {
+            return Err(candle_core::Error::Msg(format!(
+                "the no and yes rows are {:?}, expected [2, {hidden}]",
+                no_yes.dims()
+            )));
+        }
+        let no_yes = no_yes.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let yes_minus_no = no_yes[1]
+            .iter()
+            .zip(&no_yes[0])
+            .map(|(y, n)| y - n)
+            .collect();
         tokenizer.with_padding(None);
         tokenizer.with_truncation(None).map_err(map_err)?;
         let encode = |text: &str| -> Result<Vec<u32>> {
@@ -1972,7 +2029,7 @@ impl Qwen3Reranker {
         Ok(Self {
             model,
             tokenizer,
-            no_yes,
+            yes_minus_no,
             prefix,
             suffix,
             max_length,
@@ -2002,16 +2059,19 @@ impl Qwen3Reranker {
                 candle_core::Error::Msg(format!("the tokenizer has no `{token}` token"))
             })
         };
-        let ids = Tensor::new(&[id("no")?, id("yes")?], device)?;
-        // The output layer, tied to the token table when the config says so.
+        // The output layer, tied to the token table when the config says so. Only its "no" and
+        // "yes" rows are read, from the mapped file, so the table never goes to the device.
         let output = if cfg.tie_word_embeddings {
-            vb.pp("model.embed_tokens")
-                .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+            "model.embed_tokens.weight"
         } else {
-            vb.pp("lm_head")
-                .get((cfg.vocab_size, cfg.hidden_size), "weight")?
+            "lm_head.weight"
         };
-        let no_yes = output.index_select(&ids, 0)?;
+        let no_yes = safetensors_rows(
+            &weight_files,
+            output,
+            (cfg.vocab_size, cfg.hidden_size),
+            &[id("no")?, id("yes")?],
+        )?;
         let model = Qwen3Model::new(cfg, vb.pp("model"))?;
         Self::new(model, tokenizer, no_yes, max_length)
     }
@@ -2055,38 +2115,53 @@ impl Qwen3Reranker {
         Ok(scores)
     }
 
-    /// P("yes") for each row of token ids, run as one left-padded batch.
+    /// P("yes") for each row of token ids, in the order of `rows`.
     fn score_rows(&self, rows: &[Vec<u32>]) -> Result<Vec<f32>> {
-        if rows.is_empty() {
-            return Ok(vec![]);
+        self.score_rows_within(rows, QWEN3_RERANKER_TOKENS_PER_FORWARD)
+    }
+
+    /// `score_rows` with the rows grouped by length, each group run causal with no padding (so a
+    /// row's score does not depend on the other rows' lengths), in forwards of at most
+    /// `token_budget` tokens (one row when a single row is longer).
+    fn score_rows_within(&self, rows: &[Vec<u32>], token_budget: usize) -> Result<Vec<f32>> {
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for (i, row) in rows.iter().enumerate() {
+            groups.entry(row.len()).or_default().push(i);
         }
         let device = self.model.device();
-        let t = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let mut ids = Vec::with_capacity(rows.len() * t);
-        let mut mask = Vec::with_capacity(rows.len() * t);
-        for row in rows {
-            let pad = t - row.len();
-            ids.extend(std::iter::repeat_n(0u32, pad).chain(row.iter().copied()));
-            mask.extend(std::iter::repeat_n(0f32, pad).chain(std::iter::repeat_n(1f32, row.len())));
+        let mut out = vec![0f32; rows.len()];
+        for (len, members) in groups {
+            for chunk in members.chunks((token_budget / len.max(1)).max(1)) {
+                let ids: Vec<u32> = chunk
+                    .iter()
+                    .flat_map(|&i| rows[i].iter().copied())
+                    .collect();
+                let input_ids = Tensor::from_vec(
+                    ids,
+                    (chunk.len(), len),
+                    self.model.embed_tokens.ids_device(device),
+                )?;
+                let hidden = self.model.forward_causal(&input_ids, Rows::Last)?;
+                for (&i, p) in chunk.iter().zip(self.yes_probabilities(&hidden)?) {
+                    out[i] = p;
+                }
+            }
         }
-        let input_ids = Tensor::from_vec(
-            ids,
-            (rows.len(), t),
-            self.model.embed_tokens.ids_device(device),
-        )?;
-        let hidden = if mask.contains(&0.0) {
-            let mask = Tensor::from_vec(mask, (rows.len(), t), device)?;
-            self.model.forward_padded(&input_ids, &mask, Rows::Last)?
-        } else {
-            self.model.forward_causal(&input_ids, Rows::Last)?
-        };
-        // [B, 2]: the "no" and "yes" logits at the last position, then P("yes").
-        let logits = hidden
-            .i((.., 0))?
-            .matmul(&self.no_yes.to_dtype(hidden.dtype())?.t()?)?
-            .to_dtype(DType::F32)?;
-        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
-        probs.i((.., 1))?.to_vec1::<f32>()
+        Ok(out)
+    }
+
+    /// P("yes") of each row of `hidden` `[B, 1, H]`: softmax over the "no" and "yes" logits is
+    /// the sigmoid of their difference, `h . (w_yes - w_no)`, taken here in f32 from the state
+    /// in f32, so a bf16 model's logits are not rounded to bf16 first.
+    fn yes_probabilities(&self, hidden: &Tensor) -> Result<Vec<f32>> {
+        let rows = hidden.i((.., 0))?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        Ok(rows
+            .iter()
+            .map(|h| {
+                let logit: f32 = h.iter().zip(&self.yes_minus_no).map(|(a, b)| a * b).sum();
+                1.0 / (1.0 + (-logit).exp())
+            })
+            .collect())
     }
 }
 
@@ -2897,7 +2972,6 @@ mod tests {
         let reranker =
             super::Qwen3Reranker::new(model, word_tokenizer(), no_yes.clone(), 512).unwrap();
 
-        // Three rows of different lengths, run as one left-padded batch.
         let rows: Vec<Vec<u32>> = vec![(1..9).collect(), (20..23).collect(), (40..52).collect()];
         let together = reranker.score_rows(&rows).unwrap();
         assert_eq!(together.len(), 3);
@@ -2935,6 +3009,128 @@ mod tests {
         assert_eq!(scores.len(), 2);
         let model = random_model(small_config(), 1, &Device::Cpu, DType::F32);
         assert!(super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 4).is_err());
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[test]
+    fn safetensors_rows_reads_the_named_rows_alone() {
+        use candle_core::{DType, Device, Tensor};
+
+        let table = Tensor::randn(0f32, 1.0, (50, 8), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "fastembed-safetensors-rows-{}.safetensors",
+            std::process::id()
+        ));
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([("t.weight".to_string(), table.clone())]),
+            &path,
+        )
+        .unwrap();
+        let files = [path.clone()];
+        let got = super::safetensors_rows(&files, "t.weight", (50, 8), &[49, 0, 7]);
+        let wrong_shape = super::safetensors_rows(&files, "t.weight", (50, 9), &[0]);
+        let past_the_end = super::safetensors_rows(&files, "t.weight", (50, 8), &[50]);
+        std::fs::remove_file(&path).unwrap();
+
+        let got = got.unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        let want = table
+            .index_select(&Tensor::new(&[49u32, 0, 7], &Device::Cpu).unwrap(), 0)
+            .unwrap();
+        let as_f32 = |t: &Tensor| t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(as_f32(&got), as_f32(&want));
+        assert!(wrong_shape.is_err());
+        assert!(past_the_end.is_err());
+    }
+
+    #[test]
+    fn reranker_takes_the_yes_logit_in_f32_from_a_half_precision_model() {
+        use candle_core::{DType, Device, IndexOp, Tensor};
+
+        let cfg = small_config();
+        let hidden = cfg.hidden_size;
+        let model = random_model(cfg, 2, &Device::Cpu, DType::F16);
+        let no_yes = Tensor::randn(0f32, 0.3, (2, hidden), &Device::Cpu).unwrap();
+        let reranker =
+            super::Qwen3Reranker::new(model, word_tokenizer(), no_yes.clone(), 512).unwrap();
+        let no_yes = no_yes.to_vec2::<f32>().unwrap();
+        for row in [
+            (1..9).collect::<Vec<u32>>(),
+            (20..23).collect(),
+            (40..52).collect(),
+        ] {
+            let got = reranker.score_rows(std::slice::from_ref(&row)).unwrap();
+            // By hand: the f16 model's last normed state, then everything after it in f32.
+            let ids = Tensor::new(row.as_slice(), &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            let h = reranker
+                .model
+                .forward_causal(&ids, super::Rows::Last)
+                .unwrap()
+                .i((0, 0))
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let dot = |w: &[f32]| h.iter().zip(w).map(|(a, b)| a * b).sum::<f32>();
+            let want = 1.0 / (1.0 + (dot(&no_yes[0]) - dot(&no_yes[1])).exp());
+            assert!(
+                (got[0] - want).abs() < 1e-6,
+                "{} against {want}: the logits were rounded",
+                got[0]
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_scores_a_document_the_same_whatever_else_is_in_the_call() {
+        use candle_core::{DType, Device, Tensor};
+
+        let cfg = small_config();
+        let hidden = cfg.hidden_size;
+        let model = random_model(cfg, 2, &Device::Cpu, DType::F32);
+        let no_yes = Tensor::randn(0f32, 0.05, (2, hidden), &Device::Cpu).unwrap();
+        let reranker = super::Qwen3Reranker::new(model, word_tokenizer(), no_yes, 512).unwrap();
+
+        let words = |n: usize| {
+            (0..n)
+                .map(|i| format!("w{}", (i * 13 + n) % 100))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // Next to a long document, which padding would put in front of every other one, each
+        // document is still the only row of its length: a batch of one, exactly as alone.
+        let documents: Vec<String> = [120, 1, 2, 3, 5, 8, 13].iter().map(|&n| words(n)).collect();
+        let together = reranker.score(None, "w1 w2", &documents).unwrap();
+        assert_eq!(together.len(), documents.len());
+        for (i, document) in documents.iter().enumerate() {
+            let alone = reranker.score(None, "w1 w2", &[document]).unwrap();
+            assert_eq!(
+                together[i], alone[0],
+                "document {i}: the others moved its score"
+            );
+        }
+
+        // Under a token budget a group runs in several forwards, and every row keeps its place.
+        let rows: Vec<Vec<u32>> = (0..7u32).map(|i| (i..i + 6).collect()).collect();
+        let whole = reranker.score_rows_within(&rows, 1 << 20).unwrap();
+        for budget in [1, 6, 13, 24] {
+            let chunked = reranker.score_rows_within(&rows, budget).unwrap();
+            assert_eq!(chunked.len(), rows.len());
+            for (i, (a, b)) in chunked.iter().zip(&whole).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "budget {budget} row {i}: {a} against {b}"
+                );
+            }
+        }
+        assert_ne!(whole[0], whole[1]);
     }
 
     #[test]
