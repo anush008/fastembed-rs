@@ -176,11 +176,13 @@ fn build_attention_mask_fused(attention_mask_2d: &Tensor, dtype: DType) -> Resul
     causal.broadcast_add(&padding)
 }
 
+/// Each row of `xs` `[B, H]` divided by its L2 norm, in f32 whatever dtype `xs` is in: in bf16
+/// the sum of squares, the norm and every quotient would each round to 8 bits, and the vectors
+/// would come back up to about 0.5% off unit length.
 fn l2_normalize(xs: &Tensor) -> Result<Tensor> {
+    let xs = xs.to_dtype(DType::F32)?;
     let sum_sq = xs.sqr()?.sum_keepdim(1)?;
-    let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?
-        .to_dtype(sum_sq.dtype())?
-        .broadcast_as(sum_sq.shape())?;
+    let eps_tensor = Tensor::new(&[1e-12f32], xs.device())?.broadcast_as(sum_sq.shape())?;
     let norm = sum_sq.add(&eps_tensor)?.sqrt()?;
     xs.broadcast_div(&norm)
 }
@@ -1807,9 +1809,7 @@ fn pool_last(hidden: &Tensor, dim: Option<usize>) -> Result<Vec<Vec<f32>>> {
         Some(dim) => pooled.narrow(1, 0, dim)?,
         None => pooled,
     };
-    l2_normalize(&pooled)?
-        .to_dtype(DType::F32)?
-        .to_vec2::<f32>()
+    l2_normalize(&pooled)?.to_vec2::<f32>()
 }
 
 /// The instruction the Qwen3-Reranker model card uses when none is given.
@@ -2261,8 +2261,7 @@ impl Qwen3VLEmbedding {
             position_ids.as_ref(),
         )?;
         let pooled = last_token_pool(&hidden, &attention_mask_2d)?;
-        let normalized = l2_normalize(&pooled)?.to_dtype(DType::F32)?;
-        normalized.to_vec2::<f32>()
+        l2_normalize(&pooled)?.to_vec2::<f32>()
     }
 }
 
