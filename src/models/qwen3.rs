@@ -2650,6 +2650,7 @@ mod tests {
     }
 
     /// The Qwen3-Embedding tokenizer as `from_hf` builds it, truncating to `max_length`.
+    #[cfg(feature = "hf-hub")]
     fn qwen3_tokenizer(max_length: usize) -> tokenizers::Tokenizer {
         let path = super::hf_repo("Qwen/Qwen3-Embedding-0.6B")
             .unwrap()
@@ -2662,6 +2663,7 @@ mod tests {
     /// runs of whitespace and newlines, Chinese with and without spaces, combining marks, emoji,
     /// digits, a long run of letters, and dashes (about 50 bytes a token, so its prefix comes up
     /// short).
+    #[cfg(feature = "hf-hub")]
     fn long_texts() -> Vec<String> {
         let letters: String = (0..3000)
             .map(|i| (b'a' + (i * 7 % 26) as u8) as char)
@@ -2695,6 +2697,7 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn encode_texts_keeps_the_whole_texts_tokens_past_max_length() {
         let max_length = 64;
