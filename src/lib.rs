@@ -27,6 +27,18 @@
 //! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both.
 //! Set `HF_ENDPOINT` to pull from a mirror.
 //!
+// Without `onnx` the ONNX types above are not in the crate, so their links point at docs.rs.
+#![cfg_attr(
+    not(feature = "onnx"),
+    doc = r#"
+[`TextEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=TextEmbedding
+[`SparseTextEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=SparseTextEmbedding
+[`Bgem3Embedding`]: https://docs.rs/fastembed/latest/fastembed/?search=Bgem3Embedding
+[`ImageEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=ImageEmbedding
+[`TextRerank`]: https://docs.rs/fastembed/latest/fastembed/?search=TextRerank
+[`TextInitOptions`]: https://docs.rs/fastembed/latest/fastembed/?search=TextInitOptions
+"#
+)]
 #![cfg_attr(
     all(feature = "onnx", feature = "hf-hub"),
     doc = r#"
@@ -50,7 +62,10 @@
  ```
 "#
 )]
-//! Find more info about the available options in the [TextInitOptions] documentation.
+#![cfg_attr(
+    feature = "onnx",
+    doc = "Find more info about the available options in the [TextInitOptions] documentation.\n"
+)]
 //!
 #![cfg_attr(
     all(feature = "onnx", feature = "hf-hub"),
