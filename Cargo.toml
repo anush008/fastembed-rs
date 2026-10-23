@@ -32,11 +32,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 thiserror = "2"
 hf-hub = { version = "0.5.0", default-features = false, optional = true }
 image = { version = "0.25.10", optional = true }
-ndarray = { version = "0.17.2", default-features = false }
-ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+# The ONNX Runtime stack, behind the `onnx` feature (on by default).
+ndarray = { version = "0.17.2", default-features = false, optional = true }
+ort = { version = "=2.0.0-rc.15", default-features = false, optional = true, features = [
   "ndarray", "std", "api-24"
 ] }
-safetensors = { version = "0.8.0" }
+safetensors = { version = "0.8.0", optional = true }
 serde_json = { version = "1" }
 serde = { version = "1", features = ["derive"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
@@ -50,25 +51,29 @@ intel-mkl-src = { version = "0.8.1", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
 
 [features]
-default = ["ort-download-binaries-native-tls", "hf-hub-native-tls", "image-models"]
+default = ["onnx", "ort-download-binaries-native-tls", "hf-hub-native-tls", "image-models"]
+
+# The ONNX models (TextEmbedding, SparseTextEmbedding, Bgem3Embedding, ImageEmbedding,
+# TextRerank) and the ONNX Runtime they run on. Every `ort-*` feature turns it on.
+onnx = ["dep:ort", "dep:ndarray", "dep:safetensors"]
 
 hf-hub = ["dep:hf-hub", "hf-hub?/ureq"]
 hf-hub-native-tls = ["hf-hub", "hf-hub?/native-tls"]
 hf-hub-rustls-tls = ["hf-hub", "hf-hub?/rustls-tls"]
 
 ort-download-binaries = ["ort-download-binaries-native-tls"]
-ort-download-binaries-native-tls = ["ort/download-binaries", "ort/tls-native"]
-ort-download-binaries-rustls-tls = ["ort/download-binaries", "ort/tls-rustls"]
-ort-load-dynamic = ["ort/load-dynamic"]
+ort-download-binaries-native-tls = ["onnx", "ort/download-binaries", "ort/tls-native"]
+ort-download-binaries-rustls-tls = ["onnx", "ort/download-binaries", "ort/tls-rustls"]
+ort-load-dynamic = ["onnx", "ort/load-dynamic"]
 
 qwen3 = ["dep:candle-core", "dep:candle-nn", "dep:image", "hf-hub"]
 nomic-v2-moe = ["dep:candle-core", "dep:candle-nn", "hf-hub"]
 
-image-models = ["dep:image"]
+image-models = ["onnx", "dep:image"]
 mkl = ["qwen3", "nomic-v2-moe", "dep:intel-mkl-src", "candle-nn/mkl", "candle-core/mkl"]
 accelerate = ["qwen3", "nomic-v2-moe", "dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
-directml = ["ort/directml"]
-webgpu = ["ort/webgpu"]
+directml = ["onnx", "ort/directml"]
+webgpu = ["onnx", "ort/webgpu"]
 cuda = ["qwen3", "nomic-v2-moe", "candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["qwen3", "nomic-v2-moe", "candle-core/cudnn", "candle-nn/cudnn", "cuda"]
 metal = ["qwen3", "nomic-v2-moe", "candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels"]

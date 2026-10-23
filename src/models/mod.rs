@@ -1,11 +1,19 @@
+#[cfg(feature = "onnx")]
 use crate::ModelInfo;
 
+#[cfg(feature = "onnx")]
 pub mod bgem3;
+#[cfg(feature = "onnx")]
 pub mod image_embedding;
+#[cfg(feature = "onnx")]
 pub mod model_info;
+#[cfg(feature = "onnx")]
 pub mod quantization;
+#[cfg(feature = "onnx")]
 pub mod reranking;
+#[cfg(feature = "onnx")]
 pub mod sparse;
+#[cfg(feature = "onnx")]
 pub mod text_embedding;
 
 #[cfg(feature = "qwen3")]
@@ -20,11 +28,13 @@ pub mod qwen3_vl;
 #[cfg(feature = "nomic-v2-moe")]
 pub mod nomic_v2_moe;
 
+#[cfg(feature = "onnx")]
 pub trait ModelTrait {
     type Model;
     fn get_model_info(model: &Self::Model) -> Option<&ModelInfo<Self::Model>>;
 }
 
+#[cfg(feature = "onnx")]
 impl ModelTrait for bgem3::Bgem3Model {
     type Model = Self;
 

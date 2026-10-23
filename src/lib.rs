@@ -9,8 +9,12 @@
 //! - [`ImageEmbedding`] - image embeddings (CLIP, ResNet, ...)
 //! - [`TextRerank`] - cross-encoder reranking of candidates
 //!
+//! These run on ONNX Runtime and need the `onnx` feature, which is on by default
+//! and which every `ort-*` feature turns on.
+//!
 //! Qwen3 and Nomic v2 MoE embeddings are available behind the `qwen3` and
-//! `nomic-v2-moe` feature flags (candle backend).
+//! `nomic-v2-moe` feature flags (candle backend). A build with
+//! `default-features = false` and only those features compiles no ONNX Runtime.
 //!
 //! # Model cache
 //!
@@ -20,7 +24,7 @@
 //! Set `HF_ENDPOINT` to pull from a mirror.
 //!
 #![cfg_attr(
-    feature = "hf-hub",
+    all(feature = "onnx", feature = "hf-hub"),
     doc = r#"
  ### Instantiating [TextEmbedding]
  ```
@@ -45,7 +49,7 @@
 //! Find more info about the available options in the [TextInitOptions] documentation.
 //!
 #![cfg_attr(
-    feature = "hf-hub",
+    all(feature = "onnx", feature = "hf-hub"),
     doc = r#"
  ### Embeddings generation
 ```
@@ -72,49 +76,69 @@
 
 mod common;
 
+#[cfg(feature = "onnx")]
 mod bgem3_embedding;
 #[cfg(feature = "image-models")]
 mod image_embedding;
+#[cfg(feature = "onnx")]
 mod init;
 mod models;
+#[cfg(feature = "onnx")]
 pub mod output;
+#[cfg(feature = "onnx")]
 mod pooling;
+#[cfg(feature = "onnx")]
 mod reranking;
 pub mod similarity;
+#[cfg(feature = "onnx")]
 mod sparse_text_embedding;
+#[cfg(feature = "onnx")]
 mod text_embedding;
 
+#[cfg(feature = "onnx")]
 pub use ort::ep::ExecutionProviderDispatch;
 
 pub use crate::common::{get_cache_dir, Embedding, Error, Result, SparseEmbedding, TokenizerFiles};
+#[cfg(feature = "onnx")]
 pub use crate::models::{
     model_info::ModelInfo, model_info::RerankerModelInfo, quantization::QuantizationMode,
 };
+#[cfg(feature = "onnx")]
 pub use crate::output::{EmbeddingOutput, OutputKey, OutputPrecedence, SingleBatchOutput};
+#[cfg(feature = "onnx")]
 pub use crate::pooling::Pooling;
 
 // For all Embedding
+#[cfg(feature = "onnx")]
 pub use crate::init::{InitOptions as BaseInitOptions, InitOptionsWithLength};
+#[cfg(feature = "onnx")]
 pub use crate::models::ModelTrait;
 
 // For Text Embedding
+#[cfg(feature = "onnx")]
 pub use crate::models::text_embedding::EmbeddingModel;
+#[cfg(feature = "onnx")]
 pub use crate::text_embedding::{
     InitOptionsUserDefined, TextEmbedding, TextInitOptions, UserDefinedEmbeddingModel,
 };
+#[cfg(feature = "onnx")]
 #[deprecated(note = "use `TextInitOptions` instead")]
 pub type InitOptions = TextInitOptions;
 
 // For Sparse Text Embedding
+#[cfg(feature = "onnx")]
 pub use crate::models::sparse::SparseModel;
+#[cfg(feature = "onnx")]
 pub use crate::sparse_text_embedding::{
     SparseInitOptions, SparseTextEmbedding, UserDefinedSparseModel,
 };
 
 // For BGEM3 Joint Embedding
+#[cfg(feature = "onnx")]
 pub use crate::bgem3_embedding::{
     Bgem3Embedding, Bgem3EmbeddingOutput, Bgem3InitOptions, UserDefinedBgem3Model,
 };
+#[cfg(feature = "onnx")]
 pub use crate::models::bgem3::Bgem3Model;
 
 // For Image Embedding
@@ -123,10 +147,13 @@ pub use crate::image_embedding::{
     ImageEmbedding, ImageInitOptions, ImageInitOptionsUserDefined, ImagePreprocessor,
     UserDefinedImageEmbeddingModel,
 };
+#[cfg(feature = "onnx")]
 pub use crate::models::image_embedding::ImageEmbeddingModel;
 
 // For Reranking
+#[cfg(feature = "onnx")]
 pub use crate::models::reranking::RerankerModel;
+#[cfg(feature = "onnx")]
 pub use crate::reranking::{
     OnnxSource, RerankInitOptions, RerankInitOptionsUserDefined, RerankResult, TextRerank,
     UserDefinedRerankingModel,
