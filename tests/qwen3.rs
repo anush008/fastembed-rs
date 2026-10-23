@@ -253,7 +253,7 @@ fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolera
 
 /// Qwen3-Reranker-0.6B on the model card's queries and documents, f32 on the CPU, against the
 /// model card's own Python code (transformers, f32 on the CPU, each pair alone). Each query's
-/// documents run here as one left-padded batch.
+/// documents run here in one call.
 #[test]
 fn qwen3_reranker_06b_matches_python() {
     use fastembed::Qwen3Reranker;
@@ -274,6 +274,7 @@ fn qwen3_reranker_06b_matches_python() {
     ];
     for (query, expected) in expected_from_python {
         let scores = model.score(None, query, &documents).expect("score");
+        assert_eq!(scores.len(), documents.len(), "{query:?}");
         for (got, want) in scores.iter().zip(expected) {
             assert!(
                 (got - want).abs() < 1e-4,
@@ -281,6 +282,51 @@ fn qwen3_reranker_06b_matches_python() {
             );
         }
     }
+    check_mid_relevance(&model, 1e-3);
+}
+
+/// Two pairs the model is unsure about (P("yes") 0.45 and 0.63), where a saturated pair would
+/// hide a template, mask or precision error, compared on the logit difference ("yes" minus "no")
+/// against the model card's own code (transformers, f32 on the CPU, each pair alone), within `tol`.
+fn check_mid_relevance(model: &fastembed::Qwen3Reranker, tol: f32) {
+    let pairs = [
+        (
+            "What is the capital of Australia?",
+            "Canberra is a planned city in the Australian Capital Territory.",
+            -0.185289_f32,
+        ),
+        (
+            "Who discovered penicillin?",
+            "Howard Florey and Ernst Chain developed penicillin into a drug.",
+            0.535620,
+        ),
+    ];
+    for (query, document, want) in pairs {
+        let scores = model.score(None, query, &[document]).expect("score");
+        assert_eq!(scores.len(), 1);
+        let got = (scores[0] / (1.0 - scores[0])).ln();
+        assert!(
+            (got - want).abs() < tol,
+            "{query:?}: logit {got}, expected {want} within {tol}"
+        );
+    }
+}
+
+/// The same pairs through the Metal backend in bf16, with its own tolerance. These two pairs come
+/// out 0.023 and 0.024 from the reference with the logits taken in f32, and 0.065 and 0.036 when
+/// each logit is rounded to bf16 first. Other pairs can sit further off: over 50 pairs with
+/// P("yes") between 0.02 and 0.96 the bf16 forward's largest logit error was 0.41.
+#[cfg(feature = "metal")]
+#[test]
+fn qwen3_reranker_06b_metal_bf16_near_python() {
+    use fastembed::Qwen3Reranker;
+
+    let device = Device::new_metal(0).expect("metal device");
+    let model = one_download_at_a_time(|| {
+        Qwen3Reranker::from_hf("Qwen/Qwen3-Reranker-0.6B", &device, DType::BF16, 8192)
+    })
+    .expect("load model");
+    check_mid_relevance(&model, 0.05);
 }
 
 #[test]
