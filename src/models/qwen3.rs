@@ -937,7 +937,7 @@ pub(crate) enum Rows {
     Last,
 }
 
-/// One layer's post-RoPE k and v, `[B, Nkv, S, D]` each.
+/// One layer's post-RoPE k and v, `[B, S, Nkv, D]` each (the layout the rope kernel writes).
 pub(crate) type LayerKv = (Tensor, Tensor);
 
 // - q_norm/k_norm on head_dim after reshape
@@ -1052,7 +1052,7 @@ impl Qwen3Attention {
     /// `Qwen3Model::forward_causal` and `Qwen3Model::forward_padded` pass them only there.
     /// `rows` picks the query positions: every one (`[B,T,H]` out), or the last alone
     /// (`[B,1,H]` out), which attends to every key as the last row of the full attention does.
-    /// `past`, when given, is the post-RoPE k and v (`[1 or B, Nkv, P, D]` each) of `P` earlier
+    /// `past`, when given, is the post-RoPE k and v (`[1, P, Nkv, D]` each) of `P` earlier
     /// positions shared by every row: the rows' positions are then `P..P+T`, so the plain rotary
     /// tables have to cover `P + T` positions, and the mask is `Causal` or an additive
     /// `[1 or B, 1, T, P + T]`. With `keep_kv` it also returns this layer's k and v over all
@@ -1069,7 +1069,7 @@ impl Qwen3Attention {
         let (b, t, _h) = hidden_states.dims3()?;
         let d = self.head_dim;
         let p = match past {
-            Some((past_k, _)) => past_k.dim(2)?,
+            Some((past_k, _)) => past_k.dim(1)?,
             None => 0,
         };
         if p > 0
@@ -1095,13 +1095,12 @@ impl Qwen3Attention {
             .apply(&self.k_proj)?
             .reshape((b, t, self.num_kv_heads, d))?;
 
-        // v: [B,Nkv,T,D]
+        // v: [B,T,Nkv,D]
         let v = hidden_states
             .apply(&self.v_proj)?
-            .reshape((b, t, self.num_kv_heads, d))?
-            .transpose(1, 2)?;
+            .reshape((b, t, self.num_kv_heads, d))?;
 
-        // q_norm/k_norm and RoPE, then q: [B,Nh,Tq,D] and k: [B,Nkv,T,D]. With the plain tables
+        // q_norm/k_norm and RoPE, then q: [B,Nh,Tq,D] and k: [B,T,Nkv,D]. With the plain tables
         // the two run as one pass over q and one over k (one kernel each on Metal). q's rows of
         // the tables are its own positions.
         let (q, k) = match rotary {
@@ -1117,7 +1116,7 @@ impl Qwen3Attention {
                 };
                 (
                     norm_rope(&q, &self.q_norm, p + q_start, tq)?.transpose(1, 2)?,
-                    norm_rope(&k, &self.k_norm, p, t)?.transpose(1, 2)?,
+                    norm_rope(&k, &self.k_norm, p, t)?,
                 )
             }
             RotaryTables::PerRow(cos, sin) => (
@@ -1126,21 +1125,31 @@ impl Qwen3Attention {
                     &cos.narrow(1, q_start, tq)?,
                     &sin.narrow(1, q_start, tq)?,
                 )?,
-                apply_rotary_pos_emb(&k.apply(&self.k_norm)?.transpose(1, 2)?, cos, sin)?,
+                apply_rotary_pos_emb(&k.apply(&self.k_norm)?.transpose(1, 2)?, cos, sin)?
+                    .transpose(1, 2)?,
             ),
         };
-        // The earlier positions' k and v go in front, one copy each for every row.
+        // The earlier positions' k and v go in front. In `[B, S, Nkv, D]` both parts are
+        // contiguous (the rope kernel and v_proj write that layout), so the join is one plain
+        // copy of each; one row reads the stored past as it is, more rows a copy of it per row.
         let (k, v) = match past {
             Some((past_k, past_v)) => {
                 let join = |past: &Tensor, own: &Tensor| {
-                    let (_, n_kv, _, _) = past.dims4()?;
-                    Tensor::cat(&[&past.broadcast_as((b, n_kv, p, d))?, own], 2)
+                    let past = if b == 1 {
+                        past.clone()
+                    } else {
+                        past.broadcast_as((b, p, self.num_kv_heads, d))?
+                            .contiguous()?
+                    };
+                    Tensor::cat(&[&past, &own.contiguous()?], 1)
                 };
                 (join(past_k, &k)?, join(past_v, &v)?)
             }
             None => (k, v),
         };
         let kept = keep_kv.then(|| (k.clone(), v.clone()));
+        // k and v as the `[B, Nkv, S, D]` views the attention reads.
+        let (k, v) = (k.transpose(1, 2)?, v.transpose(1, 2)?);
 
         // The fused kernel takes k and v with their own heads (GQA). It masks causally itself, or
         // reads a given mask through its strides, so the heads share one `[B, 1, T, T]` copy.
@@ -1553,7 +1562,7 @@ impl Qwen3Model {
             )
         }
         let p = match past.first() {
-            Some((k, _)) => k.dim(2)?,
+            Some((k, _)) => k.dim(1)?,
             None => 0,
         };
         let mut hs = self.embed_tokens(input_ids)?;
@@ -2327,7 +2336,7 @@ impl Qwen3Reranker {
         token_budget: usize,
     ) -> Result<Vec<f32>> {
         let p = match past.first() {
-            Some((k, _)) => k.dim(2)?,
+            Some((k, _)) => k.dim(1)?,
             None => 0,
         };
         let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
