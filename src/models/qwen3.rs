@@ -937,6 +937,9 @@ pub(crate) enum Rows {
     Last,
 }
 
+/// One layer's post-RoPE k and v, `[B, Nkv, S, D]` each.
+pub(crate) type LayerKv = (Tensor, Tensor);
+
 // - q_norm/k_norm on head_dim after reshape
 // - RoPE on q,k
 // - repeat_kv for key/value (GQA)
@@ -1049,15 +1052,34 @@ impl Qwen3Attention {
     /// `Qwen3Model::forward_causal` and `Qwen3Model::forward_padded` pass them only there.
     /// `rows` picks the query positions: every one (`[B,T,H]` out), or the last alone
     /// (`[B,1,H]` out), which attends to every key as the last row of the full attention does.
+    /// `past`, when given, is the post-RoPE k and v (`[1 or B, Nkv, P, D]` each) of `P` earlier
+    /// positions shared by every row: the rows' positions are then `P..P+T`, so the plain rotary
+    /// tables have to cover `P + T` positions, and the mask is `Causal` or an additive
+    /// `[1 or B, 1, T, P + T]`. With `keep_kv` it also returns this layer's k and v over all
+    /// `P + T` positions, for a later call's `past`.
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         rotary: RotaryTables<'_>,
         mask: AttentionMask<'_>,
         rows: Rows,
-    ) -> Result<Tensor> {
+        past: Option<&LayerKv>,
+        keep_kv: bool,
+    ) -> Result<(Tensor, Option<LayerKv>)> {
         let (b, t, _h) = hidden_states.dims3()?;
         let d = self.head_dim;
+        let p = match past {
+            Some((past_k, _)) => past_k.dim(2)?,
+            None => 0,
+        };
+        if p > 0
+            && matches!(
+                (rotary, mask),
+                (RotaryTables::PerRow(..), _) | (_, AttentionMask::Fused(_) | AttentionMask::None)
+            )
+        {
+            candle_core::bail!("earlier positions take the plain rotary tables and a causal mask")
+        }
         // The query positions, `tq` of them, ending at the last.
         let (q_start, tq) = match rows {
             Rows::All => (0, t),
@@ -1094,8 +1116,8 @@ impl Qwen3Attention {
                     )
                 };
                 (
-                    norm_rope(&q, &self.q_norm, q_start, tq)?.transpose(1, 2)?,
-                    norm_rope(&k, &self.k_norm, 0, t)?.transpose(1, 2)?,
+                    norm_rope(&q, &self.q_norm, p + q_start, tq)?.transpose(1, 2)?,
+                    norm_rope(&k, &self.k_norm, p, t)?.transpose(1, 2)?,
                 )
             }
             RotaryTables::PerRow(cos, sin) => (
@@ -1107,12 +1129,26 @@ impl Qwen3Attention {
                 apply_rotary_pos_emb(&k.apply(&self.k_norm)?.transpose(1, 2)?, cos, sin)?,
             ),
         };
+        // The earlier positions' k and v go in front, one copy each for every row.
+        let (k, v) = match past {
+            Some((past_k, past_v)) => {
+                let join = |past: &Tensor, own: &Tensor| {
+                    let (_, n_kv, _, _) = past.dims4()?;
+                    Tensor::cat(&[&past.broadcast_as((b, n_kv, p, d))?, own], 2)
+                };
+                (join(past_k, &k)?, join(past_v, &v)?)
+            }
+            None => (k, v),
+        };
+        let kept = keep_kv.then(|| (k.clone(), v.clone()));
 
         // The fused kernel takes k and v with their own heads (GQA). It masks causally itself, or
         // reads a given mask through its strides, so the heads share one `[B, 1, T, T]` copy.
         // The last position alone sees every key, so it needs no causal mask, and a padding mask
         // keeps its last row, copied out (`[B, 1, 1, T]`) because the kernel reads the mask from
-        // its buffer's start.
+        // its buffer's start. With earlier positions in front, the kernel's causal mask lines the
+        // queries up with the last keys (its `qL_off` is keys minus queries), so query i sees the
+        // earlier positions and its own first i + 1.
         let fused = match mask {
             AttentionMask::Causal => Some((None, rows == Rows::All)),
             AttentionMask::Fused(mask) => Some((
@@ -1133,7 +1169,7 @@ impl Qwen3Attention {
             // o_proj is a view too.
             let out = sdpa_bthd(&q, &k, &v, fused_mask.as_ref(), causal, self.scaling)?;
             let out = out.reshape((b, tq, self.num_heads * d))?;
-            return out.apply(&self.o_proj);
+            return Ok((out.apply(&self.o_proj)?, kept));
         }
         let attention_mask = match mask {
             AttentionMask::Additive(mask) if mask.rank() == 4 && mask.dim(2)? == t => {
@@ -1169,7 +1205,7 @@ impl Qwen3Attention {
         let out = attn.matmul(&v)?;
         // transpose back -> [B,Tq,Nh,D] -> reshape [B,Tq,Nh*D] -> o_proj -> [B,Tq,H]
         let out = out.transpose(1, 2)?.reshape((b, tq, self.num_heads * d))?;
-        out.apply(&self.o_proj)
+        Ok((out.apply(&self.o_proj)?, kept))
     }
 }
 
@@ -1221,20 +1257,37 @@ impl Qwen3DecoderLayer {
         rotary: RotaryTables<'_>,
         rows: Rows,
     ) -> Result<Tensor> {
+        Ok(self
+            .forward_after(hidden_states, mask, rotary, rows, None, false)?
+            .0)
+    }
+
+    /// `forward` after earlier positions' k and v, as `Qwen3Attention::forward_after`.
+    pub(crate) fn forward_after(
+        &self,
+        hidden_states: &Tensor,
+        mask: AttentionMask<'_>,
+        rotary: RotaryTables<'_>,
+        rows: Rows,
+        past: Option<&LayerKv>,
+        keep_kv: bool,
+    ) -> Result<(Tensor, Option<LayerKv>)> {
         // Pre-norm
         let residual = match rows {
             Rows::All => hidden_states.clone(),
             Rows::Last => hidden_states.narrow(1, hidden_states.dim(1)? - 1, 1)?,
         };
         let hs = hidden_states.apply(&self.input_layernorm)?;
-        let hs = self.self_attn.forward(&hs, rotary, mask, rows)?;
+        let (hs, kv) = self
+            .self_attn
+            .forward(&hs, rotary, mask, rows, past, keep_kv)?;
         let hs = (residual + hs)?;
 
         // MLP
         let residual = hs.clone();
         let hs2 = hs.apply(&self.post_attention_layernorm)?;
         let hs2 = hs2.apply(&self.mlp)?;
-        residual + hs2
+        Ok(((residual + hs2)?, kv))
     }
 }
 
@@ -1478,6 +1531,68 @@ impl Qwen3Model {
         let no_padding = Tensor::ones((b, t), DType::F32, &self.device)?;
         let mask = build_attention_mask_4d(&no_padding)?;
         self.forward_embeds_tapped(&hs, AttentionMask::Additive(&mask), None, None, rows, taps)
+    }
+
+    /// `forward_causal` for rows that all follow the same earlier positions, whose k and v per
+    /// layer are `past` (empty for none): the `[B, T]` ids sit at positions `P..P+T`, and each
+    /// attends to the `P` earlier positions and causally to its own. This is the full rows'
+    /// forward with the shared part run once. With `keep_kv` it also returns every layer's k and
+    /// v over the `P + T` positions (for one row, to be a later call's `past`).
+    pub(crate) fn forward_causal_after(
+        &self,
+        input_ids: &Tensor,
+        past: &[LayerKv],
+        rows: Rows,
+        keep_kv: bool,
+    ) -> Result<(Tensor, Vec<LayerKv>)> {
+        if !past.is_empty() && past.len() != self.layers.len() {
+            candle_core::bail!(
+                "{} layers of earlier k and v for a model of {} layers",
+                past.len(),
+                self.layers.len()
+            )
+        }
+        let p = match past.first() {
+            Some((k, _)) => k.dim(2)?,
+            None => 0,
+        };
+        let mut hs = self.embed_tokens(input_ids)?;
+        let (_, t, _) = hs.dims3()?;
+        let (cos, sin) = self
+            .rotary_emb
+            .plain_tables(p + t, hs.dtype(), hs.device())?;
+        let rotary = RotaryTables::Plain(&cos, &sin);
+        // Off Metal: the causal mask shifted by `P`, `[1, 1, T, P + T]`; row i sees keys up to
+        // P + i.
+        let additive = if self.device.is_metal() {
+            None
+        } else {
+            let mut data = vec![0f32; t * (p + t)];
+            for i in 0..t {
+                for j in (p + i + 1)..(p + t) {
+                    data[i * (p + t) + j] = -1e4;
+                }
+            }
+            Some(Tensor::from_vec(data, (1, 1, t, p + t), &self.device)?)
+        };
+        let mask = match &additive {
+            Some(mask) => AttentionMask::Additive(mask),
+            None => AttentionMask::Causal,
+        };
+        let last_layer = self.layers.len().saturating_sub(1);
+        let mut kept = Vec::with_capacity(if keep_kv { self.layers.len() } else { 0 });
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let layer_rows = if layer_idx == last_layer {
+                rows
+            } else {
+                Rows::All
+            };
+            let (next, kv) =
+                layer.forward_after(&hs, mask, rotary, layer_rows, past.get(layer_idx), keep_kv)?;
+            hs = next;
+            kept.extend(kv);
+        }
+        Ok((hs.apply(&self.norm)?, kept))
     }
 
     /// `forward` over a padded batch, `attention_mask_2d` being `[B, T]` (1 a token, 0 padding).
@@ -1972,6 +2087,15 @@ fn safetensors_rows(
     Tensor::cat(&picked, 0)
 }
 
+/// One `score` call's rows, from `Qwen3Reranker::rows`.
+struct RerankRows {
+    rows: Vec<Vec<u32>>,
+    /// How many tokens the rows that share the head start with: the prompt's start, the
+    /// instruction and the query.
+    head_len: usize,
+    shares_head: Vec<bool>,
+}
+
 /// Qwen3-Reranker (for example `Qwen/Qwen3-Reranker-0.6B`): the probability that a document
 /// answers a query under an instruction, read as the model's "yes" against "no" at the last
 /// position, as the model card computes it.
@@ -2084,9 +2208,69 @@ impl Qwen3Reranker {
         query: &str,
         documents: &[S],
     ) -> Result<Vec<f32>> {
+        self.score_sharing(instruction, query, documents, true)
+    }
+
+    /// `score`, running the part every row shares (the prompt's start, the instruction and the
+    /// query) once when `share` holds, and every row whole when it does not.
+    fn score_sharing<S: AsRef<str>>(
+        &self,
+        instruction: Option<&str>,
+        query: &str,
+        documents: &[S],
+        share: bool,
+    ) -> Result<Vec<f32>> {
+        let rows = self.rows(instruction, query, documents)?;
+        let mut scores = vec![0f32; rows.rows.len()];
+        let (shared, whole): (Vec<usize>, Vec<usize>) =
+            (0..rows.rows.len()).partition(|&i| share && rows.shares_head[i]);
+
+        let head = rows.head_len;
+        let shared_rows: Vec<Vec<u32>> = shared
+            .iter()
+            .map(|&i| rows.rows[i][head..].to_vec())
+            .collect();
+        if !shared_rows.is_empty() {
+            let ids = Tensor::new(
+                &rows.rows[shared[0]][..head],
+                self.model.embed_tokens.ids_device(self.model.device()),
+            )?
+            .unsqueeze(0)?;
+            let (_, past) = self
+                .model
+                .forward_causal_after(&ids, &[], Rows::Last, true)?;
+            for (i, score) in shared
+                .iter()
+                .zip(self.score_in_chunks(&shared_rows, &past)?)
+            {
+                scores[*i] = score;
+            }
+        }
+        let whole_rows: Vec<Vec<u32>> = whole.iter().map(|&i| rows.rows[i].clone()).collect();
+        for (i, score) in whole.iter().zip(self.score_in_chunks(&whole_rows, &[])?) {
+            scores[*i] = score;
+        }
+        Ok(scores)
+    }
+
+    /// Each document's full row of token ids (the prompt around the pair, truncated to the
+    /// max length), the length of the head every row starts with (the prompt's start, the
+    /// instruction and the query), and whether each row does start with it. A document whose
+    /// first tokens merge with the head's last ones in tokenizing, or a row cut inside the head,
+    /// does not.
+    fn rows<S: AsRef<str>>(
+        &self,
+        instruction: Option<&str>,
+        query: &str,
+        documents: &[S],
+    ) -> Result<RerankRows> {
         let instruction = instruction.unwrap_or(QWEN3_RERANKER_DEFAULT_INSTRUCTION);
         let room = self.max_length - self.prefix.len() - self.suffix.len();
+        let head_text = format!("<Instruct>: {instruction}\n<Query>: {query}\n<Document>:");
+        let head = self.tokenizer.encode(head_text, true).map_err(map_err)?;
+        let head = head.get_ids();
         let mut rows = Vec::with_capacity(documents.len());
+        let mut shares_head = Vec::with_capacity(documents.len());
         for doc in documents {
             let pair = format!(
                 "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {}",
@@ -2094,21 +2278,31 @@ impl Qwen3Reranker {
             );
             let encoding = self.tokenizer.encode(pair, true).map_err(map_err)?;
             let ids = encoding.get_ids();
+            let ids = &ids[..ids.len().min(room)];
+            shares_head.push(ids.starts_with(head));
             let mut row = self.prefix.clone();
-            row.extend_from_slice(&ids[..ids.len().min(room)]);
+            row.extend_from_slice(ids);
             row.extend_from_slice(&self.suffix);
             rows.push(row);
         }
+        Ok(RerankRows {
+            rows,
+            head_len: self.prefix.len() + head.len(),
+            shares_head,
+        })
+    }
 
+    /// P("yes") for each row, in the order of `rows`, the rows following `past` (see
+    /// `score_rows_within`), in chunks of [`QWEN3_RERANKER_BATCH_SIZE`] rows of close lengths.
+    fn score_in_chunks(&self, rows: &[Vec<u32>], past: &[LayerKv]) -> Result<Vec<f32>> {
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|&i| rows[i].len());
         let mut scores = vec![0f32; rows.len()];
         for chunk in order.chunks(QWEN3_RERANKER_BATCH_SIZE) {
-            let batch: Vec<Vec<u32>> = chunk
-                .iter()
-                .map(|&i| std::mem::take(&mut rows[i]))
-                .collect();
-            for (&i, score) in chunk.iter().zip(self.score_rows(&batch)?) {
+            let batch: Vec<Vec<u32>> = chunk.iter().map(|&i| rows[i].clone()).collect();
+            let batch_scores =
+                self.score_rows_within(&batch, past, QWEN3_RERANKER_TOKENS_PER_FORWARD)?;
+            for (&i, score) in chunk.iter().zip(batch_scores) {
                 scores[i] = score;
             }
         }
@@ -2116,14 +2310,26 @@ impl Qwen3Reranker {
     }
 
     /// P("yes") for each row of token ids, in the order of `rows`.
+    #[cfg(test)]
     fn score_rows(&self, rows: &[Vec<u32>]) -> Result<Vec<f32>> {
-        self.score_rows_within(rows, QWEN3_RERANKER_TOKENS_PER_FORWARD)
+        self.score_rows_within(rows, &[], QWEN3_RERANKER_TOKENS_PER_FORWARD)
     }
 
-    /// `score_rows` with the rows grouped by length, each group run causal with no padding (so a
-    /// row's score does not depend on the other rows' lengths), in forwards of at most
-    /// `token_budget` tokens (one row when a single row is longer).
-    fn score_rows_within(&self, rows: &[Vec<u32>], token_budget: usize) -> Result<Vec<f32>> {
+    /// P("yes") for each row, the rows grouped by length, each group run causal with no padding
+    /// (so a row's score does not depend on the other rows' lengths), in forwards of at most
+    /// `token_budget` tokens counting the `past` positions every row attends to (one row when a
+    /// single row is longer). With `past` (every layer's k and v of the positions in front of
+    /// every row, from `Qwen3Model::forward_causal_after`) the rows are what follows them.
+    fn score_rows_within(
+        &self,
+        rows: &[Vec<u32>],
+        past: &[LayerKv],
+        token_budget: usize,
+    ) -> Result<Vec<f32>> {
+        let p = match past.first() {
+            Some((k, _)) => k.dim(2)?,
+            None => 0,
+        };
         let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
         for (i, row) in rows.iter().enumerate() {
             groups.entry(row.len()).or_default().push(i);
@@ -2131,7 +2337,7 @@ impl Qwen3Reranker {
         let device = self.model.device();
         let mut out = vec![0f32; rows.len()];
         for (len, members) in groups {
-            for chunk in members.chunks((token_budget / len.max(1)).max(1)) {
+            for chunk in members.chunks((token_budget / (p + len).max(1)).max(1)) {
                 let ids: Vec<u32> = chunk
                     .iter()
                     .flat_map(|&i| rows[i].iter().copied())
@@ -2141,7 +2347,13 @@ impl Qwen3Reranker {
                     (chunk.len(), len),
                     self.model.embed_tokens.ids_device(device),
                 )?;
-                let hidden = self.model.forward_causal(&input_ids, Rows::Last)?;
+                let hidden = if past.is_empty() {
+                    self.model.forward_causal(&input_ids, Rows::Last)?
+                } else {
+                    self.model
+                        .forward_causal_after(&input_ids, past, Rows::Last, false)?
+                        .0
+                };
                 for (&i, p) in chunk.iter().zip(self.yes_probabilities(&hidden)?) {
                     out[i] = p;
                 }
@@ -3119,9 +3331,9 @@ mod tests {
 
         // Under a token budget a group runs in several forwards, and every row keeps its place.
         let rows: Vec<Vec<u32>> = (0..7u32).map(|i| (i..i + 6).collect()).collect();
-        let whole = reranker.score_rows_within(&rows, 1 << 20).unwrap();
+        let whole = reranker.score_rows_within(&rows, &[], 1 << 20).unwrap();
         for budget in [1, 6, 13, 24] {
-            let chunked = reranker.score_rows_within(&rows, budget).unwrap();
+            let chunked = reranker.score_rows_within(&rows, &[], budget).unwrap();
             assert_eq!(chunked.len(), rows.len());
             for (i, (a, b)) in chunked.iter().zip(&whole).enumerate() {
                 assert!(
@@ -3131,6 +3343,134 @@ mod tests {
             }
         }
         assert_ne!(whole[0], whole[1]);
+    }
+
+    /// `word_tokenizer` with `<Document>:` as its own token (101), and a normalizer that glues
+    /// `<Document>:` to a document starting with `w9`, so such a row's ids do not start with the
+    /// head's: the case a byte-level tokenizer meets when a document's first characters merge
+    /// with the prompt's last ones.
+    fn reranker_tokenizer() -> tokenizers::Tokenizer {
+        use std::str::FromStr;
+        let vocab: Vec<String> = std::iter::once("\"[UNK]\": 0".to_string())
+            .chain((0..100).map(|i| format!("\"w{i}\": {}", i + 1)))
+            .chain(std::iter::once("\"<Document>:\": 101".to_string()))
+            .collect();
+        let json = format!(
+            r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": {{"type": "Replace", "pattern": {{"String": "<Document>: w9"}},
+                                "content": "<Document>:w9"}},
+                "pre_tokenizer": {{"type": "WhitespaceSplit"}},
+                "post_processor": null, "decoder": null,
+                "model": {{"type": "WordLevel", "vocab": {{{}}}, "unk_token": "[UNK]"}}}}"#,
+            vocab.join(", ")
+        );
+        tokenizers::Tokenizer::from_str(&json).unwrap()
+    }
+
+    /// Documents of 0 to 40 words, three of one length, and one starting with `w9`, which
+    /// `reranker_tokenizer` glues to the head.
+    fn reranker_documents() -> Vec<String> {
+        let words = |n: usize, seed: usize| {
+            (0..n)
+                .map(|i| format!("w{}", (i * 13 + seed * 7 + 20) % 80 + 20))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut documents: Vec<String> = [1usize, 5, 2, 5, 40, 0, 5, 9]
+            .iter()
+            .enumerate()
+            .map(|(seed, &n)| words(n, seed))
+            .collect();
+        documents.insert(3, "w9 w30 w31".to_string());
+        documents
+    }
+
+    fn max_gap(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// `score` runs the shared head once and each document's tail after it, and gives the scores
+    /// of the whole rows: within 1e-5 in f32 on the CPU, over documents of mixed lengths. A
+    /// document whose ids do not start with the head's is scored as its whole row.
+    #[test]
+    fn reranker_scores_with_the_shared_head_as_with_whole_rows() {
+        use candle_core::{DType, Device, Tensor};
+
+        let cfg = small_config();
+        let hidden = cfg.hidden_size;
+        let model = random_model(cfg, 2, &Device::Cpu, DType::F32);
+        let no_yes = Tensor::randn(0f32, 0.02, (2, hidden), &Device::Cpu).unwrap();
+        let reranker =
+            super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes.clone(), 512).unwrap();
+        let documents = reranker_documents();
+        let query = "w1 w2 w3";
+
+        let rows = reranker.rows(None, query, &documents).unwrap();
+        let shares: Vec<bool> = rows.shares_head.clone();
+        let mut want = vec![true; documents.len()];
+        want[3] = false;
+        assert_eq!(shares, want, "only the w9 document leaves the head");
+        assert!(rows.head_len > reranker.prefix.len());
+
+        let shared = reranker.score(None, query, &documents).unwrap();
+        let whole = reranker
+            .score_sharing(None, query, &documents, false)
+            .unwrap();
+        let gap = max_gap(&shared, &whole);
+        assert!(gap < 1e-5, "shared head against whole rows: {gap}");
+        // The scores are spread out, so a row scored against the wrong head would show.
+        assert!(
+            max_gap(&whole, &vec![whole[0]; whole.len()]) > 2e-3,
+            "{whole:?}"
+        );
+
+        // A max length that cuts every row inside the head scores every row whole.
+        let head_len = rows.head_len - reranker.prefix.len();
+        let max_length = reranker.prefix.len() + reranker.suffix.len() + head_len - 2;
+        let model = random_model(small_config(), 2, &Device::Cpu, DType::F32);
+        let short =
+            super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes, max_length).unwrap();
+        let rows = short.rows(None, query, &documents).unwrap();
+        assert!(rows.shares_head.iter().all(|s| !s));
+        assert_eq!(
+            short.score(None, query, &documents).unwrap(),
+            short.score_sharing(None, query, &documents, false).unwrap()
+        );
+    }
+
+    /// The tail after a shared head on Metal, in f32 and bf16, against the whole rows on Metal:
+    /// the fused kernel lines its causal mask up with the last keys.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn reranker_scores_with_the_shared_head_as_with_whole_rows_on_metal() {
+        use candle_core::{DType, Device, Tensor};
+
+        // Head dim 64, one the fused attention kernel takes.
+        let mut cfg = small_config();
+        cfg.head_dim = Some(64);
+        cfg.hidden_size = 256;
+        let device = Device::new_metal(0).unwrap();
+        let documents = reranker_documents();
+        for (dtype, tolerance) in [(DType::F32, 1e-4f32), (DType::BF16, 2e-2)] {
+            let model = random_model(cfg.clone(), 2, &device, dtype);
+            let no_yes = Tensor::randn(0f32, 0.1, (2, cfg.hidden_size), &Device::Cpu).unwrap();
+            let reranker =
+                super::Qwen3Reranker::new(model, reranker_tokenizer(), no_yes, 512).unwrap();
+            let shared = reranker.score(None, "w1 w2 w3", &documents).unwrap();
+            let whole = reranker
+                .score_sharing(None, "w1 w2 w3", &documents, false)
+                .unwrap();
+            let gap = max_gap(&shared, &whole);
+            assert!(
+                gap < tolerance,
+                "{dtype:?}: shared head against whole rows: {gap}"
+            );
+            assert!(max_gap(&whole, &vec![whole[0]; whole.len()]) > 1e-3);
+        }
     }
 
     #[test]
