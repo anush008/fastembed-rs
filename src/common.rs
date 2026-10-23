@@ -13,6 +13,7 @@ use ort::{
 use std::borrow::Cow;
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 use tokenizers::{
     AddedToken, EncodeInput, Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
 };
@@ -85,7 +86,7 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("`environment` must be specified if using multiple models per process")]
+    #[error("an ONNX Runtime environment already exists in this process, pass it with `with_environment`")]
     EnvironmentRequired,
 
     #[error("{0}")]
@@ -400,6 +401,23 @@ fn encodings_to_batch(encodings: &[Encoding]) -> Result<EncodedBatch> {
     })
 }
 
+fn default_environment() -> Result<Environment> {
+    static DEFAULT: Mutex<Option<Environment>> = Mutex::new(None);
+    let mut default = DEFAULT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(environment) = default.as_ref() {
+        return Ok(environment.clone());
+    }
+    let environment = ort::init().build().map_err(|e| {
+        if e.message().contains("only one environment") {
+            Error::EnvironmentRequired
+        } else {
+            Error::Ort(e)
+        }
+    })?;
+    *default = Some(environment.clone());
+    Ok(environment)
+}
+
 pub(crate) fn init_session_builder(
     environment: Option<Environment>,
     execution_providers: Vec<ExecutionProviderDispatch>,
@@ -422,13 +440,7 @@ pub(crate) fn init_session_builder(
 
     let environment = match environment {
         Some(environment) => environment,
-        None => ort::init().build().map_err(|e| {
-            if e.message().contains("only one environment") {
-                Error::EnvironmentRequired
-            } else {
-                Error::Ort(e)
-            }
-        })?,
+        None => default_environment()?,
     };
 
     let mut builder = ort::session::Session::builder(&environment)?
@@ -553,5 +565,12 @@ mod tests {
             vec![("session.disable_prepacking".into(), "1".into())],
         );
         assert!(builder.is_ok());
+    }
+
+    #[test]
+    fn init_session_builder_shares_one_default_environment() {
+        let first = init_session_builder(None, vec![], Some(1), vec![]);
+        let second = init_session_builder(None, vec![], Some(1), vec![]);
+        assert!(first.is_ok() && second.is_ok());
     }
 }

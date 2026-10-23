@@ -1,5 +1,8 @@
 use super::utils::{Compose, ResizeFn};
-use crate::{init::InitOptions, ImageEmbeddingModel};
+use crate::{
+    init::{InitOptions, ProviderNames},
+    ImageEmbeddingModel,
+};
 use image::DynamicImage;
 use ndarray::Array3;
 use ort::{environment::Environment, ep::ExecutionProviderDispatch, session::Session};
@@ -24,6 +27,20 @@ pub struct ImageInitOptionsUserDefined {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for ImageInitOptionsUserDefined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageInitOptionsUserDefined")
+            .field("environment", &self.environment)
+            .field(
+                "execution_providers",
+                &ProviderNames(&self.execution_providers),
+            )
+            .field("intra_threads", &self.intra_threads)
+            .field("session_config", &self.session_config)
+            .finish()
+    }
 }
 
 impl ImageInitOptionsUserDefined {

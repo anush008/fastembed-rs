@@ -3,7 +3,7 @@
 
 use crate::{
     common::{init_session_builder, Error, Result, TokenizerFiles},
-    init::{HasMaxLength, InitOptionsWithLength},
+    init::{HasMaxLength, InitOptionsWithLength, ProviderNames},
     pooling::Pooling,
     EmbeddingModel, OutputKey, QuantizationMode,
 };
@@ -48,6 +48,23 @@ pub struct InitOptionsUserDefined {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for InitOptionsUserDefined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitOptionsUserDefined")
+            .field("environment", &self.environment)
+            .field(
+                "execution_providers",
+                &ProviderNames(&self.execution_providers),
+            )
+            .field("max_length", &self.max_length)
+            .field("intra_threads", &self.intra_threads)
+            .field("disable_cpu_fallback", &self.disable_cpu_fallback)
+            .field("dimension_overrides", &self.dimension_overrides)
+            .field("session_config", &self.session_config)
+            .finish()
+    }
 }
 
 impl InitOptionsUserDefined {
@@ -152,7 +169,7 @@ impl Default for InitOptionsUserDefined {
 impl From<TextInitOptions> for InitOptionsUserDefined {
     fn from(options: TextInitOptions) -> Self {
         InitOptionsUserDefined {
-            environment: None,
+            environment: options.environment,
             execution_providers: options.execution_providers,
             max_length: options.max_length,
             intra_threads: options.intra_threads,
