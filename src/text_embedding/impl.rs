@@ -39,6 +39,7 @@ impl TextEmbedding {
             show_download_progress,
             intra_threads,
             session_config,
+            auto_device,
         } = options;
 
         let model_repo = TextEmbedding::retrieve_model(
@@ -72,6 +73,7 @@ impl TextEmbedding {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?
         .commit_from_file(model_file_reference)?;
 

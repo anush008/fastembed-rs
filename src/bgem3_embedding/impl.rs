@@ -35,6 +35,7 @@ impl Bgem3Embedding {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         } = options;
 
         let model_repo = Bgem3Embedding::retrieve_model(
@@ -66,6 +67,7 @@ impl Bgem3Embedding {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?
         .commit_from_file(model_file_reference)?;
 

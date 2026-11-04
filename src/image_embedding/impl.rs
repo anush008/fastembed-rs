@@ -37,6 +37,7 @@ impl ImageEmbedding {
             show_download_progress,
             intra_threads,
             session_config,
+            auto_device,
         } = options;
 
         let model_repo = ImageEmbedding::retrieve_model(
@@ -68,6 +69,7 @@ impl ImageEmbedding {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?
         .commit_from_file(model_file_reference)?;
 
@@ -86,6 +88,7 @@ impl ImageEmbedding {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         } = options;
 
         let preprocessor = ImagePreprocessor::new(Compose::from_bytes(model.preprocessor_file)?);
@@ -95,6 +98,7 @@ impl ImageEmbedding {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?
         .commit_from_memory(&model.onnx_file)?;
 

@@ -415,6 +415,21 @@ let model = TextEmbedding::try_new(
 
 When DirectML is detected, fastembed automatically disables memory pattern optimization and parallel execution on the ONNX Runtime session, as required by the DirectML execution provider.
 
+### Automatic device selection
+
+When no execution provider is registered, ort enables ONNX Runtime's automatic device selection with `AutoDevicePolicy::MaxEfficiency`, which registers CoreML on macOS. Registering `ort::ep::CPU` does not prevent this, because the CPU provider is built in and registers nothing. Set a policy to control the selection:
+
+```rust
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
+
+let model = TextEmbedding::try_new(
+    TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
+        .with_auto_device(AutoDevicePolicy::PreferCPU),
+)?;
+```
+
+`AutoDevicePolicy::PreferCPU` selects a CPU device, which in a standard ONNX Runtime build is the built-in CPU execution provider.
+
 ## Error handling
 
 Fastembed returns a typed [`fastembed::Error`](https://docs.rs/fastembed/latest/fastembed/enum.Error.html). The type is re-exported from the crate root. The enum is `#[non_exhaustive]`. New variants can be added in minor releases without breaking `match` arms.

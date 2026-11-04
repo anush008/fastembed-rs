@@ -1,5 +1,7 @@
 use crate::get_cache_dir;
-use ort::{environment::Environment, ep::ExecutionProviderDispatch};
+use ort::{
+    environment::Environment, ep::ExecutionProviderDispatch, session::builder::AutoDevicePolicy,
+};
 use std::{fmt, path::PathBuf};
 
 pub(crate) struct ProviderNames<'a>(pub(crate) &'a [ExecutionProviderDispatch]);
@@ -33,6 +35,13 @@ pub struct InitOptionsWithLength<M> {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+    /// Policy for ONNX Runtime's automatic execution provider selection,
+    /// applied with `SessionBuilder::with_auto_device`. `None` (the default)
+    /// keeps ort's default, `AutoDevicePolicy::MaxEfficiency`, which registers
+    /// CoreML on macOS. `Some(AutoDevicePolicy::PreferCPU)` never registers an
+    /// execution provider automatically. Execution providers passed through
+    /// `execution_providers` take precedence over automatic selection.
+    pub auto_device: Option<AutoDevicePolicy>,
 }
 
 #[derive(Clone)]
@@ -51,6 +60,13 @@ pub struct InitOptions<M> {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+    /// Policy for ONNX Runtime's automatic execution provider selection,
+    /// applied with `SessionBuilder::with_auto_device`. `None` (the default)
+    /// keeps ort's default, `AutoDevicePolicy::MaxEfficiency`, which registers
+    /// CoreML on macOS. `Some(AutoDevicePolicy::PreferCPU)` never registers an
+    /// execution provider automatically. Execution providers passed through
+    /// `execution_providers` take precedence over automatic selection.
+    pub auto_device: Option<AutoDevicePolicy>,
 }
 
 impl<M: fmt::Debug> fmt::Debug for InitOptionsWithLength<M> {
@@ -67,6 +83,7 @@ impl<M: fmt::Debug> fmt::Debug for InitOptionsWithLength<M> {
             .field("max_length", &self.max_length)
             .field("intra_threads", &self.intra_threads)
             .field("session_config", &self.session_config)
+            .field("auto_device", &self.auto_device)
             .finish()
     }
 }
@@ -84,6 +101,7 @@ impl<M: fmt::Debug> fmt::Debug for InitOptions<M> {
             .field("show_download_progress", &self.show_download_progress)
             .field("intra_threads", &self.intra_threads)
             .field("session_config", &self.session_config)
+            .field("auto_device", &self.auto_device)
             .finish()
     }
 }
@@ -99,6 +117,7 @@ impl<M: Default + HasMaxLength> Default for InitOptionsWithLength<M> {
             max_length: M::MAX_LENGTH,
             intra_threads: None,
             session_config: Vec::new(),
+            auto_device: None,
         }
     }
 }
@@ -113,6 +132,7 @@ impl<M: Default> Default for InitOptions<M> {
             show_download_progress: true,
             intra_threads: None,
             session_config: Vec::new(),
+            auto_device: None,
         }
     }
 }
@@ -168,6 +188,15 @@ impl<M: Default + HasMaxLength> InitOptionsWithLength<M> {
         self
     }
 
+    /// Set the policy for ONNX Runtime's automatic execution provider
+    /// selection, applied with `SessionBuilder::with_auto_device`.
+    /// Example: `.with_auto_device(AutoDevicePolicy::PreferCPU)` keeps every
+    /// node on the CPU when no execution provider is registered explicitly.
+    pub fn with_auto_device(mut self, policy: AutoDevicePolicy) -> Self {
+        self.auto_device = Some(policy);
+        self
+    }
+
     /// Set whether to show download progress
     pub fn with_show_download_progress(mut self, show_download_progress: bool) -> Self {
         self.show_download_progress = show_download_progress;
@@ -217,6 +246,15 @@ impl<M: Default> InitOptions<M> {
     /// Example: `.with_session_config("mlas.disable_kleidiai", "1")`.
     pub fn with_session_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.session_config.push((key.into(), value.into()));
+        self
+    }
+
+    /// Set the policy for ONNX Runtime's automatic execution provider
+    /// selection, applied with `SessionBuilder::with_auto_device`.
+    /// Example: `.with_auto_device(AutoDevicePolicy::PreferCPU)` keeps every
+    /// node on the CPU when no execution provider is registered explicitly.
+    pub fn with_auto_device(mut self, policy: AutoDevicePolicy) -> Self {
+        self.auto_device = Some(policy);
         self
     }
 

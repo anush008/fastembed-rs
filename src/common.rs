@@ -10,7 +10,7 @@ use ort::{
     environment::Environment,
     ep::ExecutionProviderDispatch,
     session::{
-        builder::{GraphOptimizationLevel, SessionBuilder},
+        builder::{AutoDevicePolicy, GraphOptimizationLevel, SessionBuilder},
         SessionInputValue,
     },
     value::Value,
@@ -452,6 +452,7 @@ pub(crate) fn init_session_builder(
     execution_providers: Vec<ExecutionProviderDispatch>,
     intra_threads: Option<usize>,
     session_config: Vec<(String, String)>,
+    auto_device: Option<AutoDevicePolicy>,
 ) -> Result<SessionBuilder> {
     let threads = match intra_threads {
         Some(n) => n,
@@ -484,6 +485,10 @@ pub(crate) fn init_session_builder(
         builder = builder
             .with_config_entry(&key, &value)
             .map_err(builder_error)?;
+    }
+
+    if let Some(policy) = auto_device {
+        builder = builder.with_auto_device(policy).map_err(builder_error)?;
     }
 
     if has_directml {
@@ -592,14 +597,27 @@ mod tests {
             vec![],
             Some(1),
             vec![("session.disable_prepacking".into(), "1".into())],
+            None,
+        );
+        assert!(builder.is_ok());
+    }
+
+    #[test]
+    fn init_session_builder_applies_auto_device_policy() {
+        let builder = init_session_builder(
+            None,
+            vec![],
+            Some(1),
+            vec![],
+            Some(AutoDevicePolicy::PreferCPU),
         );
         assert!(builder.is_ok());
     }
 
     #[test]
     fn init_session_builder_shares_one_default_environment() {
-        let first = init_session_builder(None, vec![], Some(1), vec![]);
-        let second = init_session_builder(None, vec![], Some(1), vec![]);
+        let first = init_session_builder(None, vec![], Some(1), vec![], None);
+        let second = init_session_builder(None, vec![], Some(1), vec![], None);
         assert!(first.is_ok() && second.is_ok());
     }
 }
