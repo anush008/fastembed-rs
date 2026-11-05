@@ -54,6 +54,7 @@ impl TextRerank {
             show_download_progress,
             intra_threads,
             session_config,
+            auto_device,
         } = options;
 
         let model_repo = pull_from_hf(model_name.to_string(), cache_dir, show_download_progress)?;
@@ -80,6 +81,7 @@ impl TextRerank {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?
         .commit_from_file(model_file_reference)?;
 
@@ -102,6 +104,7 @@ impl TextRerank {
             disable_cpu_fallback,
             dimension_overrides,
             session_config,
+            auto_device,
         } = options;
 
         let mut session_builder = init_session_builder(
@@ -109,6 +112,7 @@ impl TextRerank {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?;
         let builder_error = |err: ort::Error<ort::session::builder::SessionBuilder>| {
             Error::OrtBuilder(err.to_string())

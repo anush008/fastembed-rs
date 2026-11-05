@@ -116,6 +116,8 @@ mod text_embedding;
 
 #[cfg(feature = "onnx")]
 pub use ort::ep::ExecutionProviderDispatch;
+#[cfg(feature = "onnx")]
+pub use ort::session::builder::AutoDevicePolicy;
 
 pub use crate::common::{get_cache_dir, Embedding, Error, Result, SparseEmbedding, TokenizerFiles};
 #[cfg(feature = "onnx")]

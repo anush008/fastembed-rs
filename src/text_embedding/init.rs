@@ -10,7 +10,10 @@ use crate::{
 use ort::{
     environment::Environment,
     ep::ExecutionProviderDispatch,
-    session::{builder::SessionBuilder, Session},
+    session::{
+        builder::{AutoDevicePolicy, SessionBuilder},
+        Session,
+    },
 };
 use tokenizers::Tokenizer;
 
@@ -48,6 +51,13 @@ pub struct InitOptionsUserDefined {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+    /// Policy for ONNX Runtime's automatic execution provider selection,
+    /// applied with `SessionBuilder::with_auto_device`. `None` (the default)
+    /// keeps ort's default, `AutoDevicePolicy::MaxEfficiency`, which registers
+    /// CoreML on macOS. `Some(AutoDevicePolicy::PreferCPU)` never registers an
+    /// execution provider automatically. Execution providers passed through
+    /// `execution_providers` take precedence over automatic selection.
+    pub auto_device: Option<AutoDevicePolicy>,
 }
 
 impl std::fmt::Debug for InitOptionsUserDefined {
@@ -63,6 +73,7 @@ impl std::fmt::Debug for InitOptionsUserDefined {
             .field("disable_cpu_fallback", &self.disable_cpu_fallback)
             .field("dimension_overrides", &self.dimension_overrides)
             .field("session_config", &self.session_config)
+            .field("auto_device", &self.auto_device)
             .finish()
     }
 }
@@ -118,6 +129,15 @@ impl InitOptionsUserDefined {
         self
     }
 
+    /// Set the policy for ONNX Runtime's automatic execution provider
+    /// selection, applied with `SessionBuilder::with_auto_device`.
+    /// Example: `.with_auto_device(AutoDevicePolicy::PreferCPU)` keeps every
+    /// node on the CPU when no execution provider is registered explicitly.
+    pub fn with_auto_device(mut self, policy: AutoDevicePolicy) -> Self {
+        self.auto_device = Some(policy);
+        self
+    }
+
     /// A session builder with every option applied, plus the requested tokenizer max length.
     pub(crate) fn into_session_builder(self) -> Result<(SessionBuilder, usize)> {
         let Self {
@@ -128,6 +148,7 @@ impl InitOptionsUserDefined {
             disable_cpu_fallback,
             dimension_overrides,
             session_config,
+            auto_device,
         } = self;
 
         let builder_error = |err: ort::Error<SessionBuilder>| Error::OrtBuilder(err.to_string());
@@ -136,6 +157,7 @@ impl InitOptionsUserDefined {
             execution_providers,
             intra_threads,
             session_config,
+            auto_device,
         )?;
         if disable_cpu_fallback {
             builder = builder.with_disable_cpu_fallback().map_err(builder_error)?;
@@ -159,6 +181,7 @@ impl Default for InitOptionsUserDefined {
             disable_cpu_fallback: false,
             dimension_overrides: Vec::new(),
             session_config: Vec::new(),
+            auto_device: None,
         }
     }
 }
@@ -176,6 +199,7 @@ impl From<TextInitOptions> for InitOptionsUserDefined {
             disable_cpu_fallback: false,
             dimension_overrides: Vec::new(),
             session_config: options.session_config,
+            auto_device: options.auto_device,
         }
     }
 }
@@ -281,5 +305,20 @@ mod tests {
             user_defined.session_config,
             vec![("a".into(), "1".into()), ("b".into(), "2".into())]
         );
+    }
+
+    #[test]
+    fn auto_device_defaults_to_none_and_is_carried_by_from() {
+        assert_eq!(
+            TextInitOptions::new(EmbeddingModel::AllMiniLML6V2).auto_device,
+            None
+        );
+
+        let opts = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
+        assert_eq!(opts.auto_device, Some(AutoDevicePolicy::PreferCPU));
+
+        let user_defined = InitOptionsUserDefined::from(opts);
+        assert_eq!(user_defined.auto_device, Some(AutoDevicePolicy::PreferCPU));
     }
 }

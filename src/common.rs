@@ -10,7 +10,7 @@ use ort::{
     environment::Environment,
     ep::ExecutionProviderDispatch,
     session::{
-        builder::{GraphOptimizationLevel, SessionBuilder},
+        builder::{AutoDevicePolicy, GraphOptimizationLevel, SessionBuilder},
         SessionInputValue,
     },
     value::Value,
@@ -452,6 +452,7 @@ pub(crate) fn init_session_builder(
     execution_providers: Vec<ExecutionProviderDispatch>,
     intra_threads: Option<usize>,
     session_config: Vec<(String, String)>,
+    auto_device: Option<AutoDevicePolicy>,
 ) -> Result<SessionBuilder> {
     let threads = match intra_threads {
         Some(n) => n,
@@ -486,6 +487,10 @@ pub(crate) fn init_session_builder(
             .map_err(builder_error)?;
     }
 
+    if let Some(policy) = auto_device {
+        builder = builder.with_auto_device(policy).map_err(builder_error)?;
+    }
+
     if has_directml {
         builder = builder
             .with_memory_pattern(false)
@@ -500,6 +505,7 @@ pub(crate) fn init_session_builder(
 #[cfg(all(test, feature = "onnx"))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn minimal_tokenizer_bytes() -> Vec<u8> {
         // Minimal valid tokenizer.json (word-level model with a tiny vocab).
@@ -592,14 +598,99 @@ mod tests {
             vec![],
             Some(1),
             vec![("session.disable_prepacking".into(), "1".into())],
+            None,
         );
         assert!(builder.is_ok());
     }
 
+    /// Encodes a protobuf field tag followed by a length-delimited payload.
+    fn protobuf_bytes(field: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(field << 3) | 2];
+        let mut len = payload.len();
+        while len >= 0x80 {
+            out.push((len as u8 & 0x7f) | 0x80);
+            len >>= 7;
+        }
+        out.push(len as u8);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A one-node ONNX model, `y = Relu(x)` over a float tensor of shape [1, 4].
+    fn relu_model_bytes() -> Vec<u8> {
+        let value_info = |name: &str| {
+            let dim = |size: u8| protobuf_bytes(1, &[0x08, size]);
+            let shape = protobuf_bytes(2, &[dim(1), dim(4)].concat());
+            let tensor_type = protobuf_bytes(1, &[vec![0x08, 0x01], shape].concat());
+            [
+                protobuf_bytes(1, name.as_bytes()),
+                protobuf_bytes(2, &tensor_type),
+            ]
+            .concat()
+        };
+        let node = [
+            protobuf_bytes(1, b"x"),
+            protobuf_bytes(2, b"y"),
+            protobuf_bytes(4, b"Relu"),
+        ]
+        .concat();
+        let graph = [
+            protobuf_bytes(1, &node),
+            protobuf_bytes(2, b"relu"),
+            protobuf_bytes(11, &value_info("x")),
+            protobuf_bytes(12, &value_info("y")),
+        ]
+        .concat();
+        [
+            vec![0x08, 0x08],
+            protobuf_bytes(7, &graph),
+            protobuf_bytes(8, &[0x10, 0x11]),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn init_session_builder_applies_auto_device_policy() {
+        let messages = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&messages);
+        let logger: ort::logging::LoggerFunction = Arc::new(move |_, _, _, _, message: &str| {
+            if message.contains("placed on") {
+                captured
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(message.to_owned());
+            }
+        });
+        init_session_builder(
+            None,
+            vec![],
+            Some(1),
+            vec![],
+            Some(AutoDevicePolicy::PreferCPU),
+        )
+        .unwrap()
+        .with_logger(logger)
+        .unwrap()
+        .with_log_level(ort::logging::LogLevel::Verbose)
+        .unwrap()
+        .commit_from_memory(&relu_model_bytes())
+        .unwrap();
+
+        // Without the policy, ort's default `MaxEfficiency` places the node on CoreML on macOS.
+        let messages = messages.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!messages.is_empty(), "no node placement was logged");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.contains("[CPUExecutionProvider]")),
+            "nodes were placed off the CPU: {messages:?}"
+        );
+    }
+
     #[test]
     fn init_session_builder_shares_one_default_environment() {
-        let first = init_session_builder(None, vec![], Some(1), vec![]);
-        let second = init_session_builder(None, vec![], Some(1), vec![]);
+        let first = init_session_builder(None, vec![], Some(1), vec![], None);
+        let second = init_session_builder(None, vec![], Some(1), vec![], None);
         assert!(first.is_ok() && second.is_ok());
     }
 }

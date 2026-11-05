@@ -3,7 +3,11 @@ use crate::{
     init::{HasMaxLength, InitOptionsWithLength, ProviderNames},
     RerankerModel, TokenizerFiles,
 };
-use ort::{environment::Environment, ep::ExecutionProviderDispatch, session::Session};
+use ort::{
+    environment::Environment,
+    ep::ExecutionProviderDispatch,
+    session::{builder::AutoDevicePolicy, Session},
+};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -44,6 +48,13 @@ pub struct RerankInitOptionsUserDefined {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+    /// Policy for ONNX Runtime's automatic execution provider selection,
+    /// applied with `SessionBuilder::with_auto_device`. `None` (the default)
+    /// keeps ort's default, `AutoDevicePolicy::MaxEfficiency`, which registers
+    /// CoreML on macOS. `Some(AutoDevicePolicy::PreferCPU)` never registers an
+    /// execution provider automatically. Execution providers passed through
+    /// `execution_providers` take precedence over automatic selection.
+    pub auto_device: Option<AutoDevicePolicy>,
 }
 
 impl Default for RerankInitOptionsUserDefined {
@@ -56,6 +67,7 @@ impl Default for RerankInitOptionsUserDefined {
             disable_cpu_fallback: false,
             dimension_overrides: Vec::new(),
             session_config: Vec::new(),
+            auto_device: None,
         }
     }
 }
@@ -73,6 +85,7 @@ impl std::fmt::Debug for RerankInitOptionsUserDefined {
             .field("disable_cpu_fallback", &self.disable_cpu_fallback)
             .field("dimension_overrides", &self.dimension_overrides)
             .field("session_config", &self.session_config)
+            .field("auto_device", &self.auto_device)
             .finish()
     }
 }
@@ -127,6 +140,15 @@ impl RerankInitOptionsUserDefined {
         self.session_config.push((key.into(), value.into()));
         self
     }
+
+    /// Set the policy for ONNX Runtime's automatic execution provider
+    /// selection, applied with `SessionBuilder::with_auto_device`.
+    /// Example: `.with_auto_device(AutoDevicePolicy::PreferCPU)` keeps every
+    /// node on the CPU when no execution provider is registered explicitly.
+    pub fn with_auto_device(mut self, policy: AutoDevicePolicy) -> Self {
+        self.auto_device = Some(policy);
+        self
+    }
 }
 
 /// Convert RerankInitOptions to RerankInitOptionsUserDefined
@@ -142,6 +164,7 @@ impl From<RerankInitOptions> for RerankInitOptionsUserDefined {
             disable_cpu_fallback: false,
             dimension_overrides: Vec::new(),
             session_config: options.session_config,
+            auto_device: options.auto_device,
         }
     }
 }
@@ -226,5 +249,20 @@ mod tests {
             user_defined.session_config,
             vec![("a".into(), "1".into()), ("b".into(), "2".into())]
         );
+    }
+
+    #[test]
+    fn auto_device_defaults_to_none_and_is_carried_by_from() {
+        assert_eq!(
+            RerankInitOptions::new(RerankerModel::default()).auto_device,
+            None
+        );
+
+        let opts = RerankInitOptions::new(RerankerModel::default())
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
+        assert_eq!(opts.auto_device, Some(AutoDevicePolicy::PreferCPU));
+
+        let user_defined = RerankInitOptionsUserDefined::from(opts);
+        assert_eq!(user_defined.auto_device, Some(AutoDevicePolicy::PreferCPU));
     }
 }

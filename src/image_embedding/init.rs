@@ -5,7 +5,11 @@ use crate::{
 };
 use image::DynamicImage;
 use ndarray::Array3;
-use ort::{environment::Environment, ep::ExecutionProviderDispatch, session::Session};
+use ort::{
+    environment::Environment,
+    ep::ExecutionProviderDispatch,
+    session::{builder::AutoDevicePolicy, Session},
+};
 use std::sync::Arc;
 
 /// Options for initializing the ImageEmbedding model
@@ -27,6 +31,13 @@ pub struct ImageInitOptionsUserDefined {
     /// `SessionBuilder::with_config_entry`. Use this for settings that have
     /// no dedicated builder method, such as `mlas.disable_kleidiai`.
     pub session_config: Vec<(String, String)>,
+    /// Policy for ONNX Runtime's automatic execution provider selection,
+    /// applied with `SessionBuilder::with_auto_device`. `None` (the default)
+    /// keeps ort's default, `AutoDevicePolicy::MaxEfficiency`, which registers
+    /// CoreML on macOS. `Some(AutoDevicePolicy::PreferCPU)` never registers an
+    /// execution provider automatically. Execution providers passed through
+    /// `execution_providers` take precedence over automatic selection.
+    pub auto_device: Option<AutoDevicePolicy>,
 }
 
 impl std::fmt::Debug for ImageInitOptionsUserDefined {
@@ -39,6 +50,7 @@ impl std::fmt::Debug for ImageInitOptionsUserDefined {
             )
             .field("intra_threads", &self.intra_threads)
             .field("session_config", &self.session_config)
+            .field("auto_device", &self.auto_device)
             .finish()
     }
 }
@@ -76,6 +88,15 @@ impl ImageInitOptionsUserDefined {
         self.session_config.push((key.into(), value.into()));
         self
     }
+
+    /// Set the policy for ONNX Runtime's automatic execution provider
+    /// selection, applied with `SessionBuilder::with_auto_device`.
+    /// Example: `.with_auto_device(AutoDevicePolicy::PreferCPU)` keeps every
+    /// node on the CPU when no execution provider is registered explicitly.
+    pub fn with_auto_device(mut self, policy: AutoDevicePolicy) -> Self {
+        self.auto_device = Some(policy);
+        self
+    }
 }
 
 /// Convert ImageInitOptions to ImageInitOptionsUserDefined
@@ -88,6 +109,7 @@ impl From<ImageInitOptions> for ImageInitOptionsUserDefined {
             execution_providers: options.execution_providers,
             intra_threads: options.intra_threads,
             session_config: options.session_config,
+            auto_device: options.auto_device,
         }
     }
 }
@@ -164,6 +186,14 @@ mod tests {
     use image::RgbImage;
 
     use super::*;
+
+    #[test]
+    fn auto_device_is_carried_by_from() {
+        let opts = ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32)
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
+        let user_defined = ImageInitOptionsUserDefined::from(opts);
+        assert_eq!(user_defined.auto_device, Some(AutoDevicePolicy::PreferCPU));
+    }
 
     #[test]
     fn cloneable_preprocessor_supports_a_custom_resizer() {
