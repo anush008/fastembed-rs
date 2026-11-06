@@ -15,14 +15,21 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+fn dot_f64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| f64::from(x) * f64::from(y))
+        .sum()
+}
+
 /// Cosine similarity in `[-1.0, 1.0]`. `0.0` if either vector is all-zeros.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let na = dot(a, a).sqrt();
-    let nb = dot(b, b).sqrt();
+    let na = dot_f64(a, a).sqrt();
+    let nb = dot_f64(b, b).sqrt();
     if na == 0.0 || nb == 0.0 {
         return 0.0;
     }
-    dot(a, b) / (na * nb)
+    (dot_f64(a, b) / (na * nb)).clamp(-1.0, 1.0) as f32
 }
 
 /// The `k` closest vectors in `corpus` to `query` as `(index, score)`, best first.
@@ -42,6 +49,25 @@ pub fn top_k<V: AsRef<[f32]>>(query: &[f32], corpus: &[V], k: usize) -> Vec<(usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosine_handles_large_finite_vectors() {
+        assert_eq!(cosine_similarity(&[1e30], &[1e30]), 1.0);
+        assert_eq!(cosine_similarity(&[1e30], &[-1e30]), -1.0);
+    }
+
+    #[test]
+    fn cosine_handles_small_finite_vectors() {
+        assert_eq!(cosine_similarity(&[1e-24], &[1e-24]), 1.0);
+        assert_eq!(cosine_similarity(&[1e-24], &[0.0]), 0.0);
+    }
+
+    #[test]
+    fn top_k_ranks_finite_vectors_of_different_magnitudes() {
+        let corpus = [[-1e30, 0.0], [0.0, 1e-24], [1e30, 0.0]];
+        let hits = top_k(&[1e-24, 0.0], &corpus, 3);
+        assert_eq!(hits, vec![(2, 1.0), (1, 0.0), (0, -1.0)]);
+    }
 
     #[test]
     fn similarity_and_ranking() {
