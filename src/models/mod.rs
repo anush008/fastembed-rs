@@ -20,7 +20,7 @@ pub mod text_embedding;
 pub mod qwen3;
 #[cfg(feature = "qwen3-text")]
 pub(crate) mod qwen3_qk_norm_rope;
-#[cfg(feature = "qwen3-text")]
+#[cfg(any(feature = "qwen3-text", feature = "bert-text"))]
 pub(crate) mod qwen3_sdpa_bthd;
 #[cfg(feature = "qwen3-text")]
 pub(crate) mod qwen3_silu_mul;
@@ -29,6 +29,11 @@ pub mod qwen3_vl;
 
 #[cfg(feature = "nomic-v2-moe")]
 pub mod nomic_v2_moe;
+
+#[cfg(feature = "bert-text")]
+pub mod bert_embedding;
+#[cfg(feature = "bert-text")]
+pub(crate) mod bert_fused_ops;
 
 #[cfg(feature = "onnx")]
 pub trait ModelTrait {
