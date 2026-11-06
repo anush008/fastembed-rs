@@ -20,7 +20,7 @@ pub mod text_embedding;
 pub mod qwen3;
 #[cfg(feature = "qwen3-text")]
 pub(crate) mod qwen3_qk_norm_rope;
-#[cfg(feature = "qwen3-text")]
+#[cfg(any(feature = "qwen3-text", feature = "bert-text"))]
 pub(crate) mod qwen3_sdpa_bthd;
 #[cfg(feature = "qwen3-text")]
 pub(crate) mod qwen3_silu_mul;
