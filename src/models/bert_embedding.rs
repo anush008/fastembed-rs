@@ -8,7 +8,9 @@
 //! path already uses — and flattens the projections to 2D matmuls.
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Module, VarBuilder};
+use candle_nn::{
+    embedding, layer_norm, linear_no_bias, Embedding, LayerNorm, Linear, Module, VarBuilder,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tokenizers::{Tokenizer, TruncationParams};
@@ -38,10 +40,14 @@ impl BertConfig {
 struct BertLayer {
     qkv: Linear,
     out_proj: Linear,
-    attn_ln: LayerNorm,
+    /// Projection bias, LayerNorm weight and LayerNorm bias, one `[3, h]` row stack.
+    attn_wb: Tensor,
     intermediate: Linear,
+    up_bias: Tensor,
     output: Linear,
-    output_ln: LayerNorm,
+    /// Same stack for the MLP output projection.
+    out_wb: Tensor,
+    eps: f64,
 }
 
 impl BertLayer {
@@ -61,13 +67,33 @@ impl BertLayer {
             Tensor::cat(&[q_w, k_w, v_w], 0)?,
             Some(Tensor::cat(&[q_b, k_b, v_b], 0)?),
         );
+        let stack = |names: [&str; 3]| -> Result<Tensor> {
+            let mut rows = Vec::with_capacity(3);
+            for (name, width) in [(names[0], h), (names[1], h), (names[2], h)] {
+                rows.push(vb.get((width,), name)?);
+            }
+            Tensor::cat(&rows, 0)?.reshape((3, h))
+        };
+        let attn_wb = stack([
+            "attention.output.dense.bias",
+            "attention.output.LayerNorm.weight",
+            "attention.output.LayerNorm.bias",
+        ])?;
+        let out_wb = stack([
+            "output.dense.bias",
+            "output.LayerNorm.weight",
+            "output.LayerNorm.bias",
+        ])?;
+        let up_bias = vb.get((cfg.intermediate_size,), "intermediate.dense.bias")?;
         Ok(Self {
             qkv,
-            out_proj: linear(h, h, vb.pp("attention.output.dense"))?,
-            attn_ln: layer_norm(h, cfg.layer_norm_eps, vb.pp("attention.output.LayerNorm"))?,
-            intermediate: linear(h, cfg.intermediate_size, vb.pp("intermediate.dense"))?,
-            output: linear(cfg.intermediate_size, h, vb.pp("output.dense"))?,
-            output_ln: layer_norm(h, cfg.layer_norm_eps, vb.pp("output.LayerNorm"))?,
+            out_proj: linear_no_bias(h, h, vb.pp("attention.output.dense"))?,
+            attn_wb,
+            intermediate: linear_no_bias(h, cfg.intermediate_size, vb.pp("intermediate.dense"))?,
+            up_bias,
+            output: linear_no_bias(cfg.intermediate_size, h, vb.pp("output.dense"))?,
+            out_wb,
+            eps: cfg.layer_norm_eps,
         })
     }
 
@@ -78,6 +104,7 @@ impl BertLayer {
         heads: usize,
         head_dim: usize,
         scale: f32,
+        eps: f64,
     ) -> Result<Tensor> {
         let (b, t, _) = xs.dims3()?;
         let h = heads * head_dim;
@@ -95,16 +122,26 @@ impl BertLayer {
             .narrow(2, 2 * h, h)?
             .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?;
+        let eps = self.eps;
         let attn = attention(&q, &k, &v, mask, scale)?.reshape((b * t, h))?;
-        let attn = self.out_proj.forward(&attn)?.reshape((b, t, h))?;
-        let xs = (attn + xs)?;
-        let xs = self.attn_ln.forward(&xs)?;
-        let residual = xs.clone();
+        let attn = self.out_proj.forward(&attn)?;
+        let xs = crate::models::bert_fused_ops::add_layernorm(
+            &attn,
+            &xs.reshape((b * t, h))?,
+            &self.attn_wb,
+            self.eps,
+        )?;
         let flat = xs.reshape((b * t, h))?;
-        let mlp = self.intermediate.forward(&flat)?.gelu_erf()?;
-        let mlp = self.output.forward(&mlp)?.reshape((b, t, h))?;
-        let xs = (mlp + residual)?;
-        self.output_ln.forward(&xs)
+        let up = self.intermediate.forward(&flat)?;
+        let up = crate::models::bert_fused_ops::bias_gelu(&up, &self.up_bias)?;
+        let mlp = self.output.forward(&up)?;
+        let fused = crate::models::bert_fused_ops::add_layernorm(
+            &mlp,
+            &xs.reshape((b * t, h))?,
+            &self.out_wb,
+            self.eps,
+        )?;
+        Ok(fused.reshape((b, t, h))?)
     }
 }
 
@@ -155,12 +192,9 @@ impl BertTextEmbedding {
         dtype: DType,
         max_length: usize,
     ) -> Result<Self> {
-        let repo = crate::common::pull_from_hf(
-            repo_id.to_string(),
-            crate::get_cache_dir().into(),
-            true,
-        )
-        .map_err(map_err)?;
+        let repo =
+            crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
+                .map_err(map_err)?;
         let cfg_path: PathBuf = repo.get("config.json").map_err(map_err)?;
         let cfg_bytes = std::fs::read(&cfg_path).map_err(map_err)?;
         let cfg: BertConfig = serde_json::from_slice(&cfg_bytes).map_err(map_err)?;
@@ -170,9 +204,7 @@ impl BertTextEmbedding {
 
         // HF BERT checkpoints prefix every tensor with `bert.`; accept a bare
         // prefix too (some converted sentence-transformer repos drop it).
-        let load = |vb: VarBuilder| -> Result<Self> {
-            Self::load_weights(vb, &cfg, dtype)
-        };
+        let load = |vb: VarBuilder| -> Result<Self> { Self::load_weights(vb, &cfg, dtype) };
         let mut this = match load(vb.clone().pp("bert")) {
             Ok(m) => m,
             Err(_) => load(vb).map_err(|e| e)?,
@@ -196,11 +228,7 @@ impl BertTextEmbedding {
 
     fn load_weights(vb: VarBuilder, cfg: &BertConfig, dtype: DType) -> Result<Self> {
         let h = cfg.hidden_size;
-        let word_embeddings = embedding(
-            cfg.vocab_size,
-            h,
-            vb.pp("embeddings.word_embeddings"),
-        )?;
+        let word_embeddings = embedding(cfg.vocab_size, h, vb.pp("embeddings.word_embeddings"))?;
         let position_embeddings = embedding(
             cfg.max_position_embeddings,
             h,
@@ -211,14 +239,10 @@ impl BertTextEmbedding {
             h,
             vb.pp("embeddings.token_type_embeddings"),
         )?;
-        let embeddings_ln =
-            layer_norm(h, cfg.layer_norm_eps, vb.pp("embeddings.LayerNorm"))?;
+        let embeddings_ln = layer_norm(h, cfg.layer_norm_eps, vb.pp("embeddings.LayerNorm"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(BertLayer::load(
-                vb.pp(format!("encoder.layer.{i}")),
-                cfg,
-            )?);
+            layers.push(BertLayer::load(vb.pp(format!("encoder.layer.{i}")), cfg)?);
         }
         let _ = dtype;
         Ok(Self {
@@ -258,7 +282,6 @@ impl BertTextEmbedding {
         let mut order: Vec<usize> = (0..encodings.len()).collect();
         order.sort_by_key(|&i| encodings[i].get_ids().len());
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); encodings.len()];
-        let head_dim = self.cfg.head_dim();
         for chunk in order.chunks(self.batch_size) {
             let seq = chunk
                 .iter()
@@ -282,13 +305,16 @@ impl BertTextEmbedding {
             let input_ids = Tensor::from_vec(ids, (batch, seq), device)?;
             let token_type_ids = Tensor::zeros((batch, seq), DType::U32, device)?;
             let attention_mask = Tensor::from_vec(mask, (batch, seq), device)?;
-            let padded = chunk
-                .iter()
-                .any(|&i| encodings[i].get_ids().len() < seq);
+            let padded = chunk.iter().any(|&i| encodings[i].get_ids().len() < seq);
             let hidden = self.forward(&input_ids, &token_type_ids, &attention_mask, padded)?;
             let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
             let norm = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
-            for (row, &i) in cls.broadcast_div(&norm)?.to_vec2::<f32>()?.iter().zip(chunk) {
+            for (row, &i) in cls
+                .broadcast_div(&norm)?
+                .to_vec2::<f32>()?
+                .iter()
+                .zip(chunk)
+            {
                 out[i] = row.clone();
             }
         }
@@ -330,7 +356,14 @@ impl BertTextEmbedding {
         };
         let mut xs = xs;
         for layer in &self.layers {
-            xs = layer.forward(&xs, additive.as_ref(), self.cfg.num_attention_heads, self.cfg.head_dim(), 1.0 / (self.cfg.head_dim() as f32).sqrt())?;
+            xs = layer.forward(
+                &xs,
+                additive.as_ref(),
+                self.cfg.num_attention_heads,
+                self.cfg.head_dim(),
+                1.0 / (self.cfg.head_dim() as f32).sqrt(),
+                self.cfg.layer_norm_eps,
+            )?;
         }
         Ok(xs)
     }

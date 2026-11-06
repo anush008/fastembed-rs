@@ -32,6 +32,8 @@ pub mod nomic_v2_moe;
 
 #[cfg(feature = "bert-text")]
 pub mod bert_embedding;
+#[cfg(feature = "bert-text")]
+pub(crate) mod bert_fused_ops;
 
 #[cfg(feature = "onnx")]
 pub trait ModelTrait {
