@@ -30,6 +30,9 @@ pub mod qwen3_vl;
 #[cfg(feature = "nomic-v2-moe")]
 pub mod nomic_v2_moe;
 
+#[cfg(feature = "bert-text")]
+pub mod bert_embedding;
+
 #[cfg(feature = "onnx")]
 pub trait ModelTrait {
     type Model;
