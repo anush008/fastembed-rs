@@ -12,7 +12,8 @@ use candle_core::{Result, Tensor};
 /// `[B, H, T, S]`. On Metal this is candle's full attention kernel writing `[B, T, H, D]`
 /// directly, for one query position too: candle's sdpa sends a single query to its vector
 /// kernel, which takes no mask, so a padded batch's last row would see its padding. Elsewhere it
-/// is `candle_nn::ops::sdpa` and a copy.
+/// is plain tensor math: candle's `sdpa` custom op has no CUDA/CPU implementation, so the
+/// fallback expands GQA heads and applies the causal mask itself.
 pub(crate) fn sdpa_bthd(
     q: &Tensor,
     k: &Tensor,
@@ -30,8 +31,77 @@ pub(crate) fn sdpa_bthd(
         };
         return q.apply_op3_no_bwd(k, v, &op);
     }
-    candle_nn::ops::sdpa(q, k, v, mask, do_causal, scale, 1.0)?
-        .transpose(1, 2)?
+    sdpa_plain_bthd(q, k, v, mask, do_causal, scale)
+}
+
+/// Device-generic attention with the same contract as [`sdpa_bthd`]: q `[B, H, T, D]`,
+/// k/v `[B, Hkv, S, D]`, optional additive mask broadcastable to `[B, H, T, S]`, and a
+/// causal mask over the last `T` query rows. Used on CUDA and CPU, where candle's
+/// Metal-only `sdpa` op cannot run.
+fn sdpa_plain_bthd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    do_causal: bool,
+    scale: f32,
+) -> Result<Tensor> {
+    let (b, h, tq, d) = q.dims4()?;
+    let (bk, hkv, s, dk) = k.dims4()?;
+    if b != bk || d != dk || d == 0 || tq == 0 || s == 0 {
+        candle_core::bail!(
+            "attention q is {:?} but k is {:?}",
+            q.dims(),
+            k.dims()
+        )
+    }
+    if h % hkv != 0 {
+        candle_core::bail!("attention q heads {h} are not a multiple of kv heads {hkv}")
+    }
+    let groups = h / hkv;
+    let k = repeat_kv(k, groups)?;
+    let v = repeat_kv(v, groups)?;
+    let dtype = q.dtype();
+    let q = q.contiguous()?;
+    let kt = k.transpose(2, 3)?.contiguous()?;
+    let mut scores = q.matmul(&kt)?;
+    if scale != 1.0 {
+        scores = scores.affine(scale as f64, 0.0)?;
+    }
+    if let Some(mask) = mask {
+        let mask = mask.to_dtype(dtype)?.contiguous()?;
+        scores = scores.broadcast_add(&mask)?;
+    }
+    if do_causal {
+        let additive = causal_additive(tq, s, dtype, q.device())?;
+        scores = scores.broadcast_add(&additive)?;
+    }
+    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    probs.matmul(&v.contiguous()?)?.transpose(1, 2)?.contiguous()
+}
+
+/// `[Tq, S]` additive causal mask aligned like the fused kernel's `qL_off`: the last
+/// query row sees every key, its first row sees `S - Tq + 1`.
+fn causal_additive(tq: usize, s: usize, dtype: candle_core::DType, device: &candle_core::Device) -> Result<Tensor> {
+    if tq > s {
+        candle_core::bail!("causal attention has {tq} queries for {s} keys")
+    }
+    let all = Tensor::tril2(s, candle_core::DType::F32, device)?;
+    let last = all.narrow(0, s - tq, tq)?;
+    // 1 at allowed positions, 0 at masked ones; masked becomes ~ -inf in the score dtype.
+    let masked = last.affine(-1.0, 1.0)?;
+    masked.affine(-1e9, 0.0)?.to_dtype(dtype)
+}
+
+/// `[B, Hkv, S, D]` → `[B, Hkv * groups, S, D]` by repeating each kv head contiguously.
+fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
+    if groups == 1 {
+        return x.contiguous();
+    }
+    let (b, hkv, s, d) = x.dims4()?;
+    x.unsqueeze(2)?
+        .broadcast_as((b, groups, hkv, s, d))?
+        .reshape((b, hkv * groups, s, d))?
         .contiguous()
 }
 

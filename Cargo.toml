@@ -81,7 +81,7 @@ mkl = ["qwen3", "nomic-v2-moe", "dep:intel-mkl-src", "candle-nn/mkl", "candle-co
 accelerate = ["qwen3", "nomic-v2-moe", "dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
 directml = ["onnx", "ort/directml"]
 webgpu = ["onnx", "ort/webgpu"]
-cuda = ["qwen3", "nomic-v2-moe", "candle-core/cuda", "candle-nn/cuda"]
+cuda = ["qwen3", "nomic-v2-moe", "bert-text", "candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["qwen3", "nomic-v2-moe", "candle-core/cudnn", "candle-nn/cudnn", "cuda"]
 metal = ["qwen3", "nomic-v2-moe", "bert-text", "candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
 
