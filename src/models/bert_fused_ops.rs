@@ -75,20 +75,20 @@ impl candle_core::CustomOp3 for AddLayerNorm {
         l_wb: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
         let (rows, cols) = check(l_x, l_r, l_wb)?;
+        fn sliced<'a, T: WithDType>(storage: &'a [T], layout: &Layout, len: usize) -> &'a [T] {
+            &storage[layout.start_offset()..layout.start_offset() + len]
+        }
         fn f<T: WithDType>(
             x: &[T],
             r: &[T],
             wb: &[T],
-            lx: &Layout,
-            lr: &Layout,
-            lwb: &Layout,
             rows: usize,
             cols: usize,
             eps: f64,
         ) -> Vec<T> {
-            let xs = &x[lx.start_offset()..lx.start_offset() + rows * cols];
-            let rs = &r[lr.start_offset()..lr.start_offset() + rows * cols];
-            let wbs = &wb[lwb.start_offset()..lwb.start_offset() + 3 * cols];
+            let xs = &x[..rows * cols];
+            let rs = &r[..rows * cols];
+            let wbs = &wb[..3 * cols];
             let (bias, weight, ln_bias) = (&wbs[..cols], &wbs[cols..2 * cols], &wbs[2 * cols..]);
             let mut out = Vec::with_capacity(rows * cols);
             for row in 0..rows {
@@ -112,14 +112,31 @@ impl candle_core::CustomOp3 for AddLayerNorm {
             out
         }
         let out = match (s_x, s_r, s_wb) {
-            (CpuStorage::F32(x), CpuStorage::F32(r), CpuStorage::F32(wb)) => {
-                CpuStorage::F32(f(x, r, wb, l_x, l_r, l_wb, rows, cols, self.eps))
-            }
-            (CpuStorage::F16(x), CpuStorage::F16(r), CpuStorage::F16(wb)) => {
-                CpuStorage::F16(f(x, r, wb, l_x, l_r, l_wb, rows, cols, self.eps))
-            }
+            (CpuStorage::F32(x), CpuStorage::F32(r), CpuStorage::F32(wb)) => CpuStorage::F32(f(
+                sliced(x, l_x, rows * cols),
+                sliced(r, l_r, rows * cols),
+                sliced(wb, l_wb, 3 * cols),
+                rows,
+                cols,
+                self.eps,
+            )),
+            (CpuStorage::F16(x), CpuStorage::F16(r), CpuStorage::F16(wb)) => CpuStorage::F16(f(
+                sliced(x, l_x, rows * cols),
+                sliced(r, l_r, rows * cols),
+                sliced(wb, l_wb, 3 * cols),
+                rows,
+                cols,
+                self.eps,
+            )),
             (CpuStorage::BF16(x), CpuStorage::BF16(r), CpuStorage::BF16(wb)) => {
-                CpuStorage::BF16(f(x, r, wb, l_x, l_r, l_wb, rows, cols, self.eps))
+                CpuStorage::BF16(f(
+                    sliced(x, l_x, rows * cols),
+                    sliced(r, l_r, rows * cols),
+                    sliced(wb, l_wb, 3 * cols),
+                    rows,
+                    cols,
+                    self.eps,
+                ))
             }
             _ => candle_core::bail!("add-layernorm needs one float dtype for all inputs"),
         };
@@ -176,7 +193,7 @@ impl candle_core::CustomOp2 for BiasGelu {
                 for i in 0..cols {
                     let v = xs[row * cols + i].to_f64() + bs[i].to_f64();
                     // 0.5 * v * (1 + erf(v / sqrt(2)))
-                    let c = 0.7978845608028654 * 0.5f64.sqrt() * v; // 1/sqrt(2)
+                    let c = 0.5f64.sqrt() * v; // v / sqrt(2)
                     out.push(T::from_f64(0.5 * v * (1.0 + erf(c))));
                 }
             }
@@ -234,9 +251,10 @@ mod metal {
 
     const SOURCE: &str = include_str!("bert_fused_ops.metal");
 
+    type PipelineCache = Mutex<HashMap<(DeviceId, DType, String), ComputePipeline>>;
+
     fn pipeline(device: &MetalDevice, dtype: DType, kernel: &str) -> Result<ComputePipeline> {
-        static PIPELINES: OnceLock<Mutex<HashMap<(DeviceId, DType, String), ComputePipeline>>> =
-            OnceLock::new();
+        static PIPELINES: OnceLock<PipelineCache> = OnceLock::new();
         let suffix = match dtype {
             DType::F32 => "f32",
             DType::F16 => "f16",
@@ -366,11 +384,12 @@ mod metal {
 }
 
 /// Threadgroup width shared with the Metal shader (must match `TG` there).
+#[cfg(feature = "metal")]
 const TG: usize = 256;
 
 #[cfg(test)]
 mod tests {
-    use super::{add_layernorm, bias_gelu};
+    use super::{add_layernorm, bias_gelu, BiasGelu};
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{LayerNorm, Module};
 
@@ -423,6 +442,22 @@ mod tests {
         let (x, _, wb) = shared(rows, cols);
         let bias = wb.narrow(0, 0, 1).unwrap().reshape(cols).unwrap();
         let got = bias_gelu(&x, &bias).unwrap();
+        let want = x.broadcast_add(&bias).unwrap().gelu_erf().unwrap();
+        assert!(
+            max_abs_diff(&got, &want) < 1e-4,
+            "diff {}",
+            max_abs_diff(&got, &want)
+        );
+    }
+
+    /// `bias_gelu` only takes the custom-op path on Metal, so the test above compares the
+    /// unfused fallback with itself. Drive the op's `cpu_fwd` directly to pin its arithmetic.
+    #[test]
+    fn bias_gelu_cpu_kernel_matches_gelu_of_the_sum() {
+        let (rows, cols) = (3usize, 317usize);
+        let (x, _, wb) = shared(rows, cols);
+        let bias = wb.narrow(0, 0, 1).unwrap().reshape(cols).unwrap();
+        let got = x.apply_op2_no_bwd(&bias, &BiasGelu).unwrap();
         let want = x.broadcast_add(&bias).unwrap().gelu_erf().unwrap();
         assert!(
             max_abs_diff(&got, &want) < 1e-4,
