@@ -1,6 +1,11 @@
 #[cfg(all(
     feature = "hf-hub",
-    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
 ))]
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 #[cfg(feature = "onnx")]
@@ -19,7 +24,12 @@ use ort::{
 use std::borrow::Cow;
 #[cfg(all(
     feature = "hf-hub",
-    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
 ))]
 use std::path::PathBuf;
 #[cfg(feature = "onnx")]
@@ -276,7 +286,12 @@ pub fn normalize(v: &[f32]) -> Vec<f32> {
 /// `huggingface-cli login` is used when present.
 #[cfg(all(
     feature = "hf-hub",
-    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
 ))]
 pub fn pull_from_hf(
     model_name: String,
@@ -312,7 +327,12 @@ pub fn pull_from_hf(
 /// Token written by `huggingface-cli login`. `Cache::default` panics without a home dir.
 #[cfg(all(
     feature = "hf-hub",
-    any(feature = "onnx", feature = "qwen3-text", feature = "nomic-v2-moe")
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
 ))]
 fn default_hf_token() -> Option<String> {
     let has_home = std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some();
@@ -322,7 +342,11 @@ fn default_hf_token() -> Option<String> {
 /// Safetensors files of a repo, resolving `model.safetensors.index.json` for sharded checkpoints.
 #[cfg(all(
     feature = "hf-hub",
-    any(feature = "qwen3-text", feature = "nomic-v2-moe")
+    any(
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
 ))]
 pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     const SINGLE_FILE: &str = "model.safetensors";
