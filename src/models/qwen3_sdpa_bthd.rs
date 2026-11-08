@@ -49,11 +49,7 @@ fn sdpa_plain_bthd(
     let (b, h, tq, d) = q.dims4()?;
     let (bk, hkv, s, dk) = k.dims4()?;
     if b != bk || d != dk || d == 0 || tq == 0 || s == 0 {
-        candle_core::bail!(
-            "attention q is {:?} but k is {:?}",
-            q.dims(),
-            k.dims()
-        )
+        candle_core::bail!("attention q is {:?} but k is {:?}", q.dims(), k.dims())
     }
     if h % hkv != 0 {
         candle_core::bail!("attention q heads {h} are not a multiple of kv heads {hkv}")
@@ -77,12 +73,20 @@ fn sdpa_plain_bthd(
         scores = scores.broadcast_add(&additive)?;
     }
     let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-    probs.matmul(&v.contiguous()?)?.transpose(1, 2)?.contiguous()
+    probs
+        .matmul(&v.contiguous()?)?
+        .transpose(1, 2)?
+        .contiguous()
 }
 
 /// `[Tq, S]` additive causal mask aligned like the fused kernel's `qL_off`: the last
 /// query row sees every key, its first row sees `S - Tq + 1`.
-fn causal_additive(tq: usize, s: usize, dtype: candle_core::DType, device: &candle_core::Device) -> Result<Tensor> {
+fn causal_additive(
+    tq: usize,
+    s: usize,
+    dtype: candle_core::DType,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
     if tq > s {
         candle_core::bail!("causal attention has {tq} queries for {s} keys")
     }
@@ -100,7 +104,7 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
     }
     let (b, hkv, s, d) = x.dims4()?;
     x.unsqueeze(2)?
-        .broadcast_as((b, groups, hkv, s, d))?
+        .broadcast_as((b, hkv, groups, s, d))?
         .reshape((b, hkv * groups, s, d))?
         .contiguous()
 }
@@ -350,5 +354,88 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// The Metal tests above cover only the fused kernel, which expands grouped heads itself.
+/// Off Metal the fallback does it in tensor math, so pin that path with `hkv != groups`.
+#[cfg(test)]
+mod plain_tests {
+    use super::{repeat_kv, sdpa_bthd};
+    use candle_core::{Device, Tensor};
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn repeat_kv_repeats_each_kv_head_contiguously() {
+        let device = Device::Cpu;
+        // Two kv heads with distinct values, four query heads per kv head.
+        let x = Tensor::from_vec(
+            vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            (1, 2, 2, 2),
+            &device,
+        )
+        .unwrap();
+        let got = repeat_kv(&x, 4).unwrap();
+        assert_eq!(got.dims(), &[1, 8, 2, 2]);
+        let mut want = Vec::new();
+        for head in [[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]] {
+            for _ in 0..4 {
+                want.extend_from_slice(&head);
+            }
+        }
+        let want = Tensor::from_vec(want, (1, 8, 2, 2), &device).unwrap();
+        assert_eq!(max_abs_diff(&got, &want), 0.0);
+    }
+
+    #[test]
+    fn plain_sdpa_expands_grouped_kv_heads() {
+        let device = Device::Cpu;
+        // `hkv != groups` (and both above one): the case the old axis order got wrong.
+        let (b, tq, s, h, hkv, d) = (1usize, 3usize, 4usize, 6usize, 2usize, 3usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, tq, d), &device).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, hkv, s, d), &device).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, hkv, s, d), &device).unwrap();
+        let groups = h / hkv;
+        let expand = |x: &Tensor| {
+            let mut heads = Vec::with_capacity(h);
+            for head in 0..hkv {
+                for _ in 0..groups {
+                    heads.push(x.narrow(1, head, 1).unwrap());
+                }
+            }
+            Tensor::cat(&heads, 1).unwrap()
+        };
+        let (k_exp, v_exp) = (expand(&k), expand(&v));
+        let scale = (d as f32).powf(-0.5);
+        let scores = q
+            .matmul(&k_exp.transpose(2, 3).unwrap().contiguous().unwrap())
+            .unwrap();
+        let want = candle_nn::ops::softmax_last_dim(&scores.affine(scale as f64, 0.0).unwrap())
+            .unwrap()
+            .matmul(&v_exp)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let got = sdpa_bthd(&q, &k, &v, None, false, scale).unwrap();
+        assert_eq!(got.dims(), &[b, tq, h, d]);
+        assert!(
+            max_abs_diff(&got, &want) < 1e-5,
+            "diff {}",
+            max_abs_diff(&got, &want)
+        );
     }
 }
