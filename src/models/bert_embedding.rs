@@ -104,7 +104,6 @@ impl BertLayer {
         heads: usize,
         head_dim: usize,
         scale: f32,
-        eps: f64,
     ) -> Result<Tensor> {
         let (b, t, _) = xs.dims3()?;
         let h = heads * head_dim;
@@ -122,7 +121,6 @@ impl BertLayer {
             .narrow(2, 2 * h, h)?
             .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?;
-        let eps = self.eps;
         let attn = attention(&q, &k, &v, mask, scale)?.reshape((b * t, h))?;
         let attn = self.out_proj.forward(&attn)?;
         let xs = crate::models::bert_fused_ops::add_layernorm(
@@ -141,7 +139,7 @@ impl BertLayer {
             &self.out_wb,
             self.eps,
         )?;
-        Ok(fused.reshape((b, t, h))?)
+        fused.reshape((b, t, h))
     }
 }
 
@@ -207,7 +205,7 @@ impl BertTextEmbedding {
         let load = |vb: VarBuilder| -> Result<Self> { Self::load_weights(vb, &cfg, dtype) };
         let mut this = match load(vb.clone().pp("bert")) {
             Ok(m) => m,
-            Err(_) => load(vb).map_err(|e| e)?,
+            Err(_) => load(vb)?,
         };
 
         let tok_path: PathBuf = repo.get("tokenizer.json").map_err(map_err)?;
@@ -298,9 +296,9 @@ impl BertTextEmbedding {
                 let e = &encodings[i];
                 let n = e.get_ids().len();
                 ids.extend_from_slice(e.get_ids());
-                ids.extend(std::iter::repeat(self.pad_id).take(seq - n));
-                mask.extend(std::iter::repeat(1u32).take(n));
-                mask.extend(std::iter::repeat(0u32).take(seq - n));
+                ids.extend(std::iter::repeat_n(self.pad_id, seq - n));
+                mask.extend(std::iter::repeat_n(1u32, n));
+                mask.extend(std::iter::repeat_n(0u32, seq - n));
             }
             let input_ids = Tensor::from_vec(ids, (batch, seq), device)?;
             let token_type_ids = Tensor::zeros((batch, seq), DType::U32, device)?;
@@ -362,7 +360,6 @@ impl BertTextEmbedding {
                 self.cfg.num_attention_heads,
                 self.cfg.head_dim(),
                 1.0 / (self.cfg.head_dim() as f32).sqrt(),
-                self.cfg.layer_norm_eps,
             )?;
         }
         Ok(xs)
