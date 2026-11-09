@@ -73,6 +73,7 @@ qwen3 = ["qwen3-text", "qwen3-vl", "hf-hub"]
 qwen3-text = ["dep:candle-core", "dep:candle-nn"]
 # Qwen3-VL loads only through `from_hf`, so it needs hf-hub.
 qwen3-vl = ["qwen3-text", "dep:image", "hf-hub"]
+bert-text = ["dep:candle-core", "dep:candle-nn", "hf-hub"]
 nomic-v2-moe = ["dep:candle-core", "dep:candle-nn", "hf-hub"]
 
 image-models = ["onnx", "dep:image"]
@@ -80,9 +81,9 @@ mkl = ["qwen3", "nomic-v2-moe", "dep:intel-mkl-src", "candle-nn/mkl", "candle-co
 accelerate = ["qwen3", "nomic-v2-moe", "dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
 directml = ["onnx", "ort/directml"]
 webgpu = ["onnx", "ort/webgpu"]
-cuda = ["qwen3", "nomic-v2-moe", "candle-core/cuda", "candle-nn/cuda"]
+cuda = ["qwen3", "nomic-v2-moe", "bert-text", "candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["qwen3", "nomic-v2-moe", "candle-core/cudnn", "candle-nn/cudnn", "cuda"]
-metal = ["qwen3", "nomic-v2-moe", "candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
+metal = ["qwen3", "nomic-v2-moe", "bert-text", "candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels"]
 
 # This feature does not change any code, but is used to limit tests if
 # the user does not have `optimum-cli` or even python installed.

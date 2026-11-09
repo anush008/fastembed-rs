@@ -189,6 +189,10 @@ pub use crate::models::qwen3::{
     QWEN3_RERANKER_DEFAULT_INSTRUCTION,
 };
 
+// For BERT-family (candle backend: mxbai-embed-large-v1 and friends)
+#[cfg(feature = "bert-text")]
+pub use crate::models::bert_embedding::BertTextEmbedding;
+
 // For Nomic Embed Text v2 MoE (candle backend)
 #[cfg(feature = "nomic-v2-moe")]
 pub use crate::models::nomic_v2_moe::{NomicBertModel, NomicConfig, NomicV2MoeTextEmbedding};
