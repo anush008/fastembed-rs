@@ -39,7 +39,7 @@
 - [**intfloat/multilingual-e5-small**](https://huggingface.co/intfloat/multilingual-e5-small)
 - [**intfloat/multilingual-e5-base**](https://huggingface.co/intfloat/multilingual-e5-base)
 - [**intfloat/multilingual-e5-large**](https://huggingface.co/intfloat/multilingual-e5-large)
-- [**mixedbread-ai/mxbai-embed-large-v1**](https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1)
+- [**mixedbread-ai/mxbai-embed-large-v1**](https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1) - also available on the candle backend with the `bert-text` feature
 - [**Alibaba-NLP/gte-base-en-v1.5**](https://huggingface.co/Alibaba-NLP/gte-base-en-v1.5)
 - [**Alibaba-NLP/gte-large-en-v1.5**](https://huggingface.co/Alibaba-NLP/gte-large-en-v1.5)
 - [**lightonai/ModernBERT-embed-large**](https://huggingface.co/lightonai/modernbert-embed-large)
@@ -347,6 +347,43 @@ let model = NomicV2MoeTextEmbedding::from_hf(
 let embeddings = model.embed(&["search_query: ...", "search_document: ..."])?;
 println!("Embeddings length: {}", embeddings.len());
 ```
+
+### BERT Embeddings
+
+BERT-family encoders are available behind the `bert-text` feature flag (candle backend). Any BERT checkpoint with CLS pooling loads through `BertTextEmbedding`, which returns L2-normalized vectors; [`mixedbread-ai/mxbai-embed-large-v1`](https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1) is the tested one.
+
+```toml
+[dependencies]
+fastembed = { version = "7", features = ["bert-text"] }
+```
+
+```rust
+use candle_core::{DType, Device};
+use fastembed::BertTextEmbedding;
+
+let device = Device::Cpu;
+let model = BertTextEmbedding::from_hf(
+    "mixedbread-ai/mxbai-embed-large-v1",
+    &device,
+    DType::F32, // this checkpoint's LayerNorm is not f16-safe
+    512,        // truncate inputs longer than this many tokens
+)?;
+
+let embeddings = model.embed(&[
+    "What is the capital of France?",
+    "Paris is the capital of France.",
+])?;
+println!("Embeddings length: {}", embeddings.len());
+println!("Dimensions: {}", embeddings[0].len());
+```
+
+Texts longer than the last argument are truncated. Batches are grouped by length under the hood, but the vectors still come back in input order; `with_batch_size` caps how many texts go through one forward pass:
+
+```rust
+let model = model.with_batch_size(8);
+```
+
+On Apple silicon, enable `metal` instead (it enables `bert-text`) and pass `&Device::new_metal(0)?`; on NVIDIA GPUs enable `cuda` and pass `&Device::new_cuda(0)?`. The Metal build runs attention through candle's fused SDPA kernel and fuses the projection bias, residual, LayerNorm and GELU epilogues; CUDA and CPU use plain tensor attention.
 
 ### BGE-M3 Joint Embeddings
 
