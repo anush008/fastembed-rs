@@ -377,13 +377,7 @@ println!("Embeddings length: {}", embeddings.len());
 println!("Dimensions: {}", embeddings[0].len());
 ```
 
-Texts longer than the last argument are truncated. Batches are grouped by length under the hood, but the vectors still come back in input order; `with_batch_size` caps how many texts go through one forward pass:
-
-```rust
-let model = model.with_batch_size(8);
-```
-
-On Apple silicon, enable `metal` instead (it enables `bert-text`) and pass `&Device::new_metal(0)?`; on NVIDIA GPUs enable `cuda` and pass `&Device::new_cuda(0)?`. The Metal build runs attention through candle's fused SDPA kernel and fuses the projection bias, residual, LayerNorm and GELU epilogues; CUDA and CPU use plain tensor attention.
+On Apple silicon, enable `metal` instead (it enables `bert-text`) and pass `&Device::new_metal(0)?`. On NVIDIA GPUs enable `cuda` and pass `&Device::new_cuda(0)?`. The Metal build runs attention through candle's fused SDPA kernel and fuses the projection bias, residual, LayerNorm and GELU epilogues. CUDA and CPU use plain tensor attention.
 
 ### BGE-M3 Joint Embeddings
 
