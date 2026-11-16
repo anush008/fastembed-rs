@@ -414,8 +414,8 @@ impl HubRepo {
     /// The path of `file` in the cache. The file is downloaded when it is not there.
     ///
     /// hf-hub returns an error for a file that another thread or process has been downloading
-    /// for five seconds. This waits while that download writes to disk, and then finds the
-    /// file in the cache.
+    /// for five seconds. This waits while that download writes to disk, and through a minute
+    /// in which it writes nothing, and then finds the file in the cache.
     pub fn get(&self, file: &str) -> std::result::Result<PathBuf, ApiError> {
         wait_for_download(
             || self.0.get(file),
@@ -425,7 +425,7 @@ impl HubRepo {
 }
 
 /// `fetch`, tried again when it fails on the lock of a download that writes to disk. `pause`
-/// is the wait between two looks at the partial file of that download.
+/// is the wait between two looks at the partial file of that download: one second.
 #[cfg(all(
     feature = "hf-hub",
     any(
@@ -439,18 +439,25 @@ fn wait_for_download<T>(
     mut fetch: impl FnMut() -> std::result::Result<T, ApiError>,
     mut pause: impl FnMut(),
 ) -> std::result::Result<T, ApiError> {
+    // A download that writes nothing for this many pauses in a row is stalled. A network that
+    // stops for a moment is not.
+    const STALLED_AFTER_PAUSES: u32 = 60;
+
     let mut partial_size = None;
     loop {
         match fetch() {
             Err(ApiError::LockAcquisition(lock))
                 if partial_file_changed(&lock, &mut partial_size) =>
             {
-                // A finished download renames its partial file.
-                while partial_size.is_some() {
+                // A finished download renames its partial file. A stalled one may have
+                // died, and then the next try takes its place.
+                let mut idle = 0;
+                while partial_size.is_some() && idle < STALLED_AFTER_PAUSES {
                     pause();
-                    if !partial_file_changed(&lock, &mut partial_size) {
-                        break;
-                    }
+                    idle = match partial_file_changed(&lock, &mut partial_size) {
+                        true => 0,
+                        false => idle + 1,
+                    };
                 }
             }
             result => return result,
@@ -993,7 +1000,7 @@ pub(crate) mod tests {
         assert!(matches!(result, Err(ApiError::LockAcquisition(_))));
         assert_eq!((tries, pauses), (1, 0));
 
-        // A partial file that does not grow: one more try, then the lock error.
+        // A partial file that does not grow for 60 pauses: one more try, then the lock error.
         std::fs::write(&partial, [0; 3]).unwrap();
         let (mut tries, mut pauses) = (0, 0);
         let result = wait_for_download(
@@ -1004,9 +1011,10 @@ pub(crate) mod tests {
             || pauses += 1,
         );
         assert!(matches!(result, Err(ApiError::LockAcquisition(_))));
-        assert_eq!((tries, pauses), (2, 1));
+        assert_eq!((tries, pauses), (2, 60));
 
-        // A partial file that grows three times and is then renamed: the next try succeeds.
+        // A download that grows, writes nothing for 59 pauses, grows again and is then
+        // renamed: the next try succeeds.
         let (mut tries, mut pauses) = (0, 0);
         let result = wait_for_download(
             || {
@@ -1016,14 +1024,15 @@ pub(crate) mod tests {
             || {
                 pauses += 1;
                 match pauses {
-                    1..=3 => std::fs::write(&partial, vec![0; 3 + pauses]).unwrap(),
+                    1..=3 | 63 => std::fs::write(&partial, vec![0; 3 + pauses]).unwrap(),
+                    4..=62 => {}
                     _ => std::fs::remove_file(&partial).unwrap(),
                 }
             },
         );
         std::fs::remove_dir_all(&blobs).unwrap();
         assert_eq!(result.unwrap(), "model.onnx");
-        assert_eq!((tries, pauses), (2, 4));
+        assert_eq!((tries, pauses), (2, 64));
     }
 
     #[cfg(feature = "hf-hub")]

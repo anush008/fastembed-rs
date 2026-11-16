@@ -29,6 +29,11 @@ impl TransformData {
 pub(crate) type ResizeFn =
     dyn Fn(DynamicImage, u32, u32, FilterType) -> Result<DynamicImage> + Send + Sync;
 
+/// The `image` decoders allow 512 MiB for one decoded image, and each buffer of a resize keeps
+/// that limit. An image that is a few pixels wide and thousands of pixels tall resizes to
+/// gigabytes.
+const MAX_RESIZE_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
+
 fn default_resize(
     image: DynamicImage,
     width: u32,
@@ -36,7 +41,7 @@ fn default_resize(
     filter: FilterType,
 ) -> Result<DynamicImage> {
     // `resize_exact` allocates an RGBA f32 image of the source width and the new height, and
-    // then the result. An allocation that fails aborts the process, so both are tried first.
+    // then the result.
     let bytes = |width: u32, height: u32, per_pixel: u64| {
         u64::from(width)
             .saturating_mul(u64::from(height))
@@ -46,6 +51,14 @@ fn default_resize(
         bytes(image.width(), height, 16),
         bytes(width, height, u64::from(image.color().bytes_per_pixel())),
     ];
+    if buffers.iter().any(|&size| size > MAX_RESIZE_BUFFER_BYTES) {
+        return Err(Error::ImageTransform(format!(
+            "The resize of a {}x{} image to {width}x{height} needs a buffer above 512 MiB",
+            image.width(),
+            image.height()
+        )));
+    }
+    // An allocation that fails aborts the process, so both are tried first.
     if !can_allocate(&buffers) {
         return Err(Error::ImageTransform(format!(
             "Not enough memory to resize a {}x{} image to {width}x{height}",
@@ -515,30 +528,39 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_that_cannot_be_allocated_is_an_error() {
+    fn a_resize_with_a_buffer_above_the_limit_is_an_error() {
+        let above_the_limit = |resize: Resize, image: TransformData| {
+            let err = resize.transform(image).err().unwrap().to_string();
+            assert!(err.contains("above 512 MiB"), "error was: {err}");
+        };
+        let shortest_edge = || Resize {
+            size: ResizeSize::ShortestEdge(224),
+            resample: FilterType::Nearest,
+        };
+        // The result has 224 x 22,400,000 pixels of three bytes.
+        above_the_limit(shortest_edge(), image(1, 100_000));
+        // The first pass keeps the source width: 40,000 x 1,000 pixels of 16 bytes.
+        let exact = |width: u32, height: u32| Resize {
+            size: ResizeSize::Exact { width, height },
+            resample: FilterType::Nearest,
+        };
+        above_the_limit(exact(1, 1000), image(40_000, 1));
+        above_the_limit(exact(u32::MAX, u32::MAX), image(1, 1));
+
+        let out = shortest_edge()
+            .transform(image(1, 30))
+            .unwrap()
+            .image()
+            .unwrap();
+        assert_eq!(out.dimensions(), (224, 6720));
+    }
+
+    #[test]
+    fn an_allocation_that_fails_is_seen_before_the_resize() {
         // No allocator gives out this many bytes, so nothing is allocated here.
         assert!(!can_allocate(&[16, u64::MAX]));
         assert!(can_allocate(&[16, 1024]));
         assert!(can_allocate(&[]));
-
-        let largest = Resize {
-            size: ResizeSize::Exact {
-                width: u32::MAX,
-                height: u32::MAX,
-            },
-            resample: FilterType::Nearest,
-        };
-        assert!(matches!(
-            largest.transform(image(1, 1)),
-            Err(Error::ImageTransform(_))
-        ));
-
-        let resize = Resize {
-            size: ResizeSize::ShortestEdge(224),
-            resample: FilterType::Nearest,
-        };
-        let out = resize.transform(image(1, 30)).unwrap().image().unwrap();
-        assert_eq!(out.dimensions(), (224, 6720));
     }
 
     #[test]
