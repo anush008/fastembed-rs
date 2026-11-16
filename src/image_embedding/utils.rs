@@ -112,7 +112,10 @@ impl Transform for Resize {
         if (new_width, new_height) == (width, height) {
             return Ok(TransformData::Image(image));
         }
-        if u64::from(new_width) * u64::from(new_height) * 3 > MAX_RESIZED_BYTES {
+        let resized_bytes = u64::from(new_width)
+            .saturating_mul(u64::from(new_height))
+            .saturating_mul(3);
+        if resized_bytes > MAX_RESIZED_BYTES {
             return Err(Error::ImageTransform(format!(
                 "A {width}x{height} image resizes to {new_width}x{new_height}, above the 512 MiB limit"
             )));
@@ -488,6 +491,17 @@ mod tests {
         // 224 x 806,400 pixels, three bytes each.
         assert!(matches!(
             resize.transform(image(1, 3600)),
+            Err(Error::ImageTransform(_))
+        ));
+        let largest = Resize {
+            size: ResizeSize::Exact {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            resample: FilterType::Nearest,
+        };
+        assert!(matches!(
+            largest.transform(image(1, 1)),
             Err(Error::ImageTransform(_))
         ));
         let out = resize.transform(image(1, 30)).unwrap().image().unwrap();
