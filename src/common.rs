@@ -373,7 +373,7 @@ pub fn pull_from_hf(
         .map(PathBuf::from)
         .unwrap_or(default_cache_dir);
 
-    let endpoint = env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+    let endpoint = hf_endpoint(env::var("HF_ENDPOINT").ok());
 
     let token = env::var("HF_TOKEN")
         .ok()
@@ -391,6 +391,24 @@ pub fn pull_from_hf(
 
     let repo = api.model(model_name);
     Ok(repo)
+}
+
+/// An empty `HF_ENDPOINT` has no host to download from, so it means the default one. An empty
+/// `HF_HOME` or `FASTEMBED_CACHE_DIR` keeps meaning the working directory, where caches made
+/// with it already are.
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+fn hf_endpoint(value: Option<String>) -> String {
+    value
+        .filter(|endpoint| !endpoint.is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".to_string())
 }
 
 /// Token written by `huggingface-cli login`. `Cache::default` panics without a home dir.
@@ -704,6 +722,17 @@ pub(crate) mod tests {
             special_tokens_map_file: b"{}".to_vec(),
             tokenizer_config_file: tokenizer_config.as_bytes().to_vec(),
         }
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[test]
+    fn hf_endpoint_defaults_when_unset_or_empty() {
+        assert_eq!(hf_endpoint(None), "https://huggingface.co");
+        assert_eq!(hf_endpoint(Some(String::new())), "https://huggingface.co");
+        assert_eq!(
+            hf_endpoint(Some("https://hf-mirror.example".into())),
+            "https://hf-mirror.example"
+        );
     }
 
     #[test]
