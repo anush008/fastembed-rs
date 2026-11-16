@@ -746,8 +746,15 @@ mod tests {
     #[test]
     fn the_patch_convolution_runs_in_bf16_on_the_cpu() {
         let device = Device::Cpu;
-        let weight = Tensor::randn(0f32, 1.0, (4, 3, 2, 2, 2), &device).unwrap();
-        let xs = Tensor::randn(0f32, 1.0, (5, 3, 2, 2, 2), &device).unwrap();
+        // Small whole numbers: bf16 holds them, their products and the sums without rounding.
+        let whole = |len: usize, values: i64, shape: (usize, usize, usize, usize, usize)| {
+            let data: Vec<f32> = (0..len as i64)
+                .map(|i| ((i * 7) % values - values / 2) as f32)
+                .collect();
+            Tensor::from_vec(data, shape, &device).unwrap()
+        };
+        let weight = whole(4 * 3 * 8, 3, (4, 3, 2, 2, 2));
+        let xs = whole(5 * 3 * 8, 5, (5, 3, 2, 2, 2));
         let conv = |dtype: DType| {
             let tensors = HashMap::from([("weight".to_string(), weight.to_dtype(dtype).unwrap())]);
             let vb = VarBuilder::from_tensors(tensors, dtype, &device);
@@ -764,17 +771,12 @@ mod tests {
             .unwrap();
         assert_eq!(got.dtype(), DType::BF16);
         assert_eq!(got.dims(), want.dims());
-        let diff = (got.to_dtype(DType::F32).unwrap() - want)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(diff < 0.1, "bf16 differs from f32 by {diff}");
+        let values = |tensor: &Tensor| {
+            let tensor = tensor.to_dtype(DType::F32).unwrap();
+            tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        assert!(values(&want).iter().any(|value| *value != 0.0));
+        assert_eq!(values(&got), values(&want));
     }
 
     #[test]

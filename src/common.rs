@@ -379,14 +379,18 @@ pub fn pull_from_hf(
         .or_else(default_hf_token);
 
     // `ApiBuilder::new` panics without a home dir.
-    let api = ApiBuilder::from_cache(hf_hub::Cache::new(cache_dir))
+    let cache = hf_hub::Cache::new(cache_dir);
+    let api = ApiBuilder::from_cache(cache.clone())
         .with_endpoint(endpoint)
         .with_token(token)
         .with_progress(show_download_progress)
         .build()
         .map_err(|e| Error::Other(format!("Failed to initialize HuggingFace API: {e}")))?;
 
-    Ok(HubRepo(api.model(model_name)))
+    Ok(HubRepo {
+        cache: cache.model(model_name.clone()),
+        repo: api.model(model_name),
+    })
 }
 
 /// A model repository on the Hugging Face Hub.
@@ -399,7 +403,10 @@ pub fn pull_from_hf(
         feature = "bert-text"
     )
 ))]
-pub struct HubRepo(ApiRepo);
+pub struct HubRepo {
+    repo: ApiRepo,
+    cache: hf_hub::CacheRepo,
+}
 
 #[cfg(all(
     feature = "hf-hub",
@@ -418,14 +425,16 @@ impl HubRepo {
     /// in which it writes nothing, and then finds the file in the cache.
     pub fn get(&self, file: &str) -> std::result::Result<PathBuf, ApiError> {
         wait_for_download(
-            || self.0.get(file),
+            || self.repo.get(file),
+            || self.cache.get(file),
             || std::thread::sleep(std::time::Duration::from_secs(1)),
         )
     }
 }
 
-/// `fetch`, tried again when it fails on the lock of a download that writes to disk. `pause`
-/// is the wait between two looks at the partial file of that download: one second.
+/// `fetch`, tried again when it fails on the lock of a download that writes to disk. `cached`
+/// looks for the file in the cache. `pause` is the wait between two looks at the partial
+/// file of that download: one second.
 #[cfg(all(
     feature = "hf-hub",
     any(
@@ -437,6 +446,7 @@ impl HubRepo {
 ))]
 fn wait_for_download<T>(
     mut fetch: impl FnMut() -> std::result::Result<T, ApiError>,
+    cached: impl Fn() -> Option<T>,
     mut pause: impl FnMut(),
 ) -> std::result::Result<T, ApiError> {
     // A download that writes nothing for this many pauses in a row is stalled. A network that
@@ -445,22 +455,27 @@ fn wait_for_download<T>(
 
     let mut partial_size = None;
     loop {
-        match fetch() {
-            Err(ApiError::LockAcquisition(lock))
-                if partial_file_changed(&lock, &mut partial_size) =>
-            {
-                // A finished download renames its partial file. A stalled one may have
-                // died, and then the next try takes its place.
-                let mut idle = 0;
-                while partial_size.is_some() && idle < STALLED_AFTER_PAUSES {
-                    pause();
-                    idle = match partial_file_changed(&lock, &mut partial_size) {
-                        true => 0,
-                        false => idle + 1,
-                    };
-                }
-            }
+        let lock = match fetch() {
+            Err(ApiError::LockAcquisition(lock)) => lock,
             result => return result,
+        };
+        // Callers that start together pass the lock from one to the next. The file is in the
+        // cache from the first of them on, also when the lock is held again.
+        if let Some(file) = cached() {
+            return Ok(file);
+        }
+        if !partial_file_changed(&lock, &mut partial_size) {
+            return Err(ApiError::LockAcquisition(lock));
+        }
+        // A finished download renames its partial file. A stalled one may have died, and then
+        // the next try takes its place.
+        let mut idle = 0;
+        while partial_size.is_some() && idle < STALLED_AFTER_PAUSES {
+            pause();
+            idle = match partial_file_changed(&lock, &mut partial_size) {
+                true => 0,
+                false => idle + 1,
+            };
         }
     }
 }
@@ -576,8 +591,8 @@ pub(crate) fn safetensors_weight_files(repo: &HubRepo) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// `err` as text, with the cause that its `Display` leaves out. The candle loaders carry
-/// errors as text.
+/// `err` as text, with the cause that the `Display` of a failed download leaves out. The
+/// candle loaders carry errors as text.
 #[cfg(all(
     feature = "hf-hub",
     any(
@@ -587,9 +602,9 @@ pub(crate) fn safetensors_weight_files(repo: &HubRepo) -> Result<Vec<PathBuf>> {
     )
 ))]
 pub(crate) fn error_with_cause(err: Error) -> String {
-    match std::error::Error::source(&err) {
-        Some(cause) => format!("{err}: {cause}"),
-        None => err.to_string(),
+    match &err {
+        Error::ModelRetrieval { source, .. } => format!("{err}: {source}"),
+        _ => err.to_string(),
     }
 }
 
@@ -995,10 +1010,15 @@ pub(crate) mod tests {
                 tries += 1;
                 locked()
             },
+            || None,
             || pauses += 1,
         );
         assert!(matches!(result, Err(ApiError::LockAcquisition(_))));
         assert_eq!((tries, pauses), (1, 0));
+
+        // The lock is held, and an earlier download has put the file in the cache.
+        let result = wait_for_download(locked, || Some("model.onnx"), || unreachable!());
+        assert_eq!(result.unwrap(), "model.onnx");
 
         // A partial file that does not grow for 60 pauses: one more try, then the lock error.
         std::fs::write(&partial, [0; 3]).unwrap();
@@ -1008,6 +1028,7 @@ pub(crate) mod tests {
                 tries += 1;
                 fetch()
             },
+            || None,
             || pauses += 1,
         );
         assert!(matches!(result, Err(ApiError::LockAcquisition(_))));
@@ -1021,6 +1042,7 @@ pub(crate) mod tests {
                 tries += 1;
                 fetch()
             },
+            || None,
             || {
                 pauses += 1;
                 match pauses {
@@ -1112,6 +1134,9 @@ pub(crate) mod tests {
             "Failed to retrieve model file 'model.safetensors': status code 401"
         );
         assert_eq!(error_with_cause(Error::Other("plain".into())), "plain");
+        // This `Display` has its cause already.
+        let io = Error::Io(std::io::Error::other("disk full"));
+        assert_eq!(error_with_cause(io), "I/O error: disk full");
     }
 
     #[test]

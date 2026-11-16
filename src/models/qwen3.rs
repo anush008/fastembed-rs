@@ -46,7 +46,7 @@ pub struct Config {
     pub rope_scaling: Option<serde_json::Value>,
     pub rope_theta: f64,
     pub sliding_window: Option<usize>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default = "default_true")]
     pub use_cache: bool,
@@ -4650,7 +4650,7 @@ mod tests {
         let (cfg, prefix) = parse_config_and_weight_prefix(config.as_bytes()).unwrap();
         assert_eq!(prefix, Some("model.language_model"));
         assert_eq!(cfg.rope_theta, 5e6);
-        assert!(cfg.tie_word_embeddings);
+        assert!(!cfg.tie_word_embeddings);
         let rotary = super::Qwen3RotaryEmbedding::new(&cfg, &candle_core::Device::Cpu).unwrap();
         assert!(rotary.mrope_interleaved);
         assert_eq!(rotary.mrope_section, [24, 20, 20]);
@@ -4733,7 +4733,7 @@ mod tests {
         assert_eq!(tokens(4), 4);
         assert_eq!(tokens(100), 16);
         // The pixel count of these budgets is above `usize::MAX`.
-        assert_eq!(tokens(1 << 54), 16);
+        assert_eq!(tokens(usize::MAX / 1024 + 1), 16);
         assert_eq!(tokens(usize::MAX), 16);
     }
 

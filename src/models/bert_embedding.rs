@@ -29,10 +29,11 @@ pub struct BertConfig {
     pub max_position_embeddings: usize,
     pub type_vocab_size: usize,
     pub layer_norm_eps: f64,
+    // Kept as JSON: a value of another type than expected counts as no value.
     #[serde(default)]
-    pub model_type: Option<String>,
+    pub model_type: Option<serde_json::Value>,
     #[serde(default)]
-    pub pad_token_id: Option<u32>,
+    pub pad_token_id: Option<serde_json::Value>,
 }
 
 impl BertConfig {
@@ -43,11 +44,13 @@ impl BertConfig {
     /// The padding id that RoBERTa-style position ids count from: token `i` of a text has
     /// position `padding id + 1 + i`. `None` for BERT, which counts from 0.
     fn position_padding_idx(&self) -> Option<u32> {
-        matches!(
-            self.model_type.as_deref(),
-            Some("roberta" | "xlm-roberta" | "camembert")
-        )
-        .then(|| self.pad_token_id.unwrap_or(1))
+        let model_type = self.model_type.as_ref().and_then(|value| value.as_str());
+        matches!(model_type, Some("roberta" | "xlm-roberta" | "camembert")).then(|| {
+            let padding_idx = self.pad_token_id.as_ref().and_then(|value| value.as_u64());
+            padding_idx
+                .and_then(|idx| u32::try_from(idx).ok())
+                .unwrap_or(1)
+        })
     }
 
     /// The longest text that the position table has rows for.
@@ -467,8 +470,8 @@ mod tests {
             max_position_embeddings: 18,
             type_vocab_size: 1,
             layer_norm_eps: 1e-12,
-            model_type: model_type.map(str::to_string),
-            pad_token_id: model_type.map(|_| 1),
+            model_type: model_type.map(Into::into),
+            pad_token_id: model_type.map(|_| 1.into()),
         }
     }
 
@@ -661,10 +664,20 @@ mod tests {
             assert_eq!(cfg.position_padding_idx(), Some(1));
             assert_eq!(cfg.max_tokens(), 512);
         }
-        let cfg = config(r#", "model_type": "roberta", "pad_token_id": null"#);
-        assert_eq!(cfg.position_padding_idx(), Some(1));
+        // A padding id that is no index means the default of these models, as no id does.
+        for pad_token_id in ["null", "-1", "1.0", "\"1\""] {
+            let cfg = config(&format!(
+                r#", "model_type": "roberta", "pad_token_id": {pad_token_id}"#
+            ));
+            assert_eq!(cfg.position_padding_idx(), Some(1));
+        }
 
-        for extra in ["", r#", "model_type": "bert", "pad_token_id": 0"#] {
+        for extra in [
+            "",
+            r#", "model_type": "bert", "pad_token_id": 0"#,
+            r#", "model_type": "bert", "pad_token_id": -1"#,
+            r#", "model_type": 7, "pad_token_id": 1.0"#,
+        ] {
             let cfg = config(extra);
             assert_eq!(cfg.position_padding_idx(), None);
             assert_eq!(cfg.max_tokens(), 514);
