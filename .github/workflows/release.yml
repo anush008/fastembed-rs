@@ -25,7 +25,8 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
 
       - name: "📦 install dependencies"
-        run: bun install -D @semantic-release/git conventional-changelog-conventionalcommits@8 semantic-release-cargo
+        # semantic-release 26 needs Node.js 26.13 or later. Version 25 runs on the Node.js 24 above.
+        run: bun install -D semantic-release@25 @semantic-release/git conventional-changelog-conventionalcommits@8 semantic-release-cargo
 
       - name: Get Author Name and Email
         id: author_info
