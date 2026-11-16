@@ -202,7 +202,8 @@ impl SparseTextEmbedding {
 
             let embeddings = match self.model {
                 SparseModel::SPLADEPPV1 => {
-                    let logits = extract_output(&outputs, "last_hidden_state")?;
+                    let logits =
+                        extract_output(&outputs, "last_hidden_state", &encoded.attention_mask)?;
                     Self::post_process_splade(&logits, &encoded.attention_mask)
                 }
                 SparseModel::BGEM3 => {
@@ -213,7 +214,15 @@ impl SparseTextEmbedding {
                             .ok_or_else(|| Error::OutputKeyMissing {
                                 key: "<first output>".into(),
                             })?;
-                    let hidden_states = extract_output(&outputs, output_key)?;
+                    let hidden_states =
+                        extract_output(&outputs, output_key, &encoded.attention_mask)?;
+                    let hidden_size = super::bgem3_weights::get_weights().weight.len();
+                    if hidden_states.shape()[2] != hidden_size {
+                        return Err(Error::InvalidShape(format!(
+                            "BGE-M3 hidden states must be {hidden_size} wide, got shape {:?}",
+                            hidden_states.shape()
+                        )));
+                    }
                     Self::post_process_bgem3(
                         &hidden_states,
                         &encoded.input_ids,
@@ -221,7 +230,7 @@ impl SparseTextEmbedding {
                     )
                 }
                 SparseModel::OpenSearchNeuralSparseDocV3Gte => {
-                    let logits = extract_output(&outputs, "logits")?;
+                    let logits = extract_output(&outputs, "logits", &encoded.attention_mask)?;
                     Self::post_process_if_splade(
                         &logits,
                         &encoded.attention_mask,
@@ -426,6 +435,7 @@ impl SparseTextEmbedding {
 fn extract_output<'a>(
     outputs: &'a SessionOutputs<'_>,
     preferred_key: &str,
+    attention_mask: &Array2<i64>,
 ) -> Result<ArrayViewD<'a, f32>> {
     let key = if outputs.len() == 1 {
         outputs
@@ -444,9 +454,10 @@ fn extract_output<'a>(
         .try_extract_tensor::<f32>()
         .map_err(|e| Error::TensorExtraction(e.to_string()))?;
     let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-    if shape.len() != 3 {
+    let (batch_size, seq_len) = attention_mask.dim();
+    if shape.len() != 3 || shape[0] != batch_size || shape[1] != seq_len {
         return Err(Error::InvalidShape(format!(
-            "Output '{key}' must be rank-3 [batch, sequence, vocab], got shape {shape:?}"
+            "Output '{key}' must be [{batch_size}, {seq_len}, vocab], got shape {shape:?}"
         )));
     }
     let view = ArrayViewD::from_shape(shape.as_slice(), data)

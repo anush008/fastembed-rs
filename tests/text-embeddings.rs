@@ -345,6 +345,23 @@ fn test_user_defined_embedding_model() {
 }
 
 #[test]
+fn test_empty_input_returns_no_embeddings() {
+    let mut model = TextEmbedding::try_new(
+        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2Q).with_environment(environment()),
+    )
+    .unwrap();
+    assert_eq!(
+        TextEmbedding::get_quantization_mode(&EmbeddingModel::AllMiniLML6V2Q),
+        QuantizationMode::Dynamic
+    );
+
+    let no_texts: Vec<&str> = Vec::new();
+    assert!(model.embed(&no_texts, None).unwrap().is_empty());
+    assert!(model.embed(&no_texts, Some(8)).unwrap().is_empty());
+    assert!(model.embed(&no_texts, Some(0)).is_err());
+}
+
+#[test]
 fn test_rerank() {
     let test_one_model = |supported_model: &RerankerModelInfo| {
         println!("supported_model: {:?}", supported_model);

@@ -522,6 +522,8 @@ fn build_image_position_ids(
 fn load_image_from_path(path: &Path) -> Result<DynamicImage> {
     image::ImageReader::open(path)
         .map_err(map_err)?
+        .with_guessed_format()
+        .map_err(map_err)?
         .decode()
         .map_err(map_err)
 }
@@ -1656,9 +1658,8 @@ impl Qwen3Model {
 }
 
 /// Left padding keeps the last real token at the last position, where the pooling reads it.
-/// Qwen3-Embedding adds no EOS token.
 fn embedding_tokenizer(path: &Path, max_length: usize) -> Result<tokenizers::Tokenizer> {
-    use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, TruncationParams};
+    use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy};
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(path)
         .map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
@@ -1667,11 +1668,9 @@ fn embedding_tokenizer(path: &Path, max_length: usize) -> Result<tokenizers::Tok
         direction: PaddingDirection::Left,
         ..Default::default()
     }));
+    let truncation = crate::common::truncation_to(&tokenizer, max_length).map_err(map_err)?;
     tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }))
+        .with_truncation(Some(truncation))
         .map_err(map_err)?;
     Ok(tokenizer)
 }
@@ -2002,7 +2001,10 @@ impl Qwen3TextEmbedding {
         let mut input_ids_vec: Vec<u32> = Vec::with_capacity(batch_size * seq_len);
         let mut attention_mask_vec: Vec<f32> = Vec::with_capacity(batch_size * seq_len);
 
-        for enc in &encodings {
+        for (i, enc) in encodings.iter().enumerate() {
+            if enc.get_attention_mask().iter().all(|&m| m == 0) {
+                return Err(candle_core::Error::Msg(format!("text {i} has no tokens")));
+            }
             input_ids_vec.extend(enc.get_ids().iter().copied());
             attention_mask_vec.extend(enc.get_attention_mask().iter().map(|&m| m as f32));
         }
@@ -2419,7 +2421,7 @@ impl Qwen3VLEmbedding {
         dtype: DType,
         max_length: usize,
     ) -> Result<Self> {
-        use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, TruncationParams};
+        use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy};
 
         let repo = hf_repo(repo_id)?;
 
@@ -2441,15 +2443,15 @@ impl Qwen3VLEmbedding {
 
         let tok_path: PathBuf = repo.get("tokenizer.json").map_err(map_err)?;
         let mut tokenizer = tokenizers::Tokenizer::from_file(tok_path).map_err(map_err)?;
-        let _ = tokenizer.with_padding(Some(PaddingParams {
+        tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             direction: PaddingDirection::Right,
             ..Default::default()
         }));
-        let _ = tokenizer.with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }));
+        let truncation = crate::common::truncation_to(&tokenizer, max_length).map_err(map_err)?;
+        tokenizer
+            .with_truncation(Some(truncation))
+            .map_err(map_err)?;
 
         let max_image_tokens = {
             let base_prompt = build_vl_prompt(None, true, "Represent the user's input.");
@@ -3113,6 +3115,8 @@ mod tests {
         let texts = mixed_texts();
         assert!(model.embed(&["", texts[0].as_ref()]).is_err());
         assert!(model.embed_padded(&[""]).is_err());
+        assert!(model.embed_padded(&["", texts[0].as_ref()]).is_err());
+        assert!(model.embed_padded(&[texts[0].as_ref(), ""]).is_err());
     }
 
     #[test]

@@ -35,14 +35,24 @@ use std::path::PathBuf;
 #[cfg(feature = "onnx")]
 use std::sync::{Mutex, PoisonError};
 #[cfg(feature = "onnx")]
-use tokenizers::{
-    AddedToken, EncodeInput, Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
-};
+use tokenizers::{AddedToken, EncodeInput, Encoding, PaddingParams, PaddingStrategy};
+#[cfg(any(
+    feature = "onnx",
+    feature = "qwen3-text",
+    feature = "nomic-v2-moe",
+    feature = "bert-text"
+))]
+use tokenizers::{Tokenizer, TruncationParams};
 
 const DEFAULT_CACHE_DIR: &str = ".fastembed_cache";
 
 pub fn get_cache_dir() -> String {
-    std::env::var("FASTEMBED_CACHE_DIR").unwrap_or(DEFAULT_CACHE_DIR.into())
+    env_var("FASTEMBED_CACHE_DIR").unwrap_or(DEFAULT_CACHE_DIR.into())
+}
+
+/// An environment variable, with an empty value treated as unset.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +159,31 @@ pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<T
     load_tokenizer(tokenizer_files, max_length)
 }
 
+/// tokenizers subtracts the special-token count from `max_length` unchecked, so reject
+/// smaller values.
+#[cfg(any(
+    feature = "onnx",
+    feature = "qwen3-text",
+    feature = "nomic-v2-moe",
+    feature = "bert-text"
+))]
+pub(crate) fn truncation_to(tokenizer: &Tokenizer, max_length: usize) -> Result<TruncationParams> {
+    use tokenizers::PostProcessor;
+
+    let special_tokens = tokenizer
+        .get_post_processor()
+        .map_or(0, |p| p.added_tokens(false).max(p.added_tokens(true)));
+    if max_length < special_tokens {
+        return Err(Error::InvalidArgument(format!(
+            "max_length {max_length} is below the {special_tokens} special tokens the tokenizer adds"
+        )));
+    }
+    Ok(TruncationParams {
+        max_length,
+        ..Default::default()
+    })
+}
+
 /// Function can be called directly from the try_new_from_user_defined function (providing file bytes)
 ///
 /// Or indirectly from the try_new function via load_tokenizer_hf_hub (converting HF files to bytes)
@@ -197,6 +232,7 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
             )
         })? as f32;
     let max_length = max_length.min(model_max_length as usize);
+    let truncation = truncation_to(&tokenizer, max_length)?;
     let pad_token_value = &tokenizer_config["pad_token"];
     let pad_token: String = pad_token_value
         .as_str()
@@ -221,10 +257,7 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
             pad_id,
             ..Default::default()
         }))
-        .with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }))
+        .with_truncation(Some(truncation))
         .map_err(|e| Error::TokenizerConfig(e.to_string()))?
         .clone();
     if let serde_json::Value::Object(root_object) = special_tokens_map {
@@ -298,16 +331,13 @@ pub fn pull_from_hf(
     default_cache_dir: PathBuf,
     show_download_progress: bool,
 ) -> Result<ApiRepo> {
-    use std::env;
-
-    let cache_dir = env::var("HF_HOME")
+    let cache_dir = env_var("HF_HOME")
         .map(PathBuf::from)
         .unwrap_or(default_cache_dir);
 
-    let endpoint = env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+    let endpoint = env_var("HF_ENDPOINT").unwrap_or_else(|| "https://huggingface.co".to_string());
 
-    let token = env::var("HF_TOKEN")
-        .ok()
+    let token = env_var("HF_TOKEN")
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
         .or_else(default_hf_token);
@@ -478,10 +508,11 @@ pub(crate) fn init_session_builder(
     session_config: Vec<(String, String)>,
     auto_device: Option<AutoDevicePolicy>,
 ) -> Result<SessionBuilder> {
-    let threads = match intra_threads {
-        Some(n) => n,
-        None => std::thread::available_parallelism()?.get(),
-    };
+    let threads = intra_threads.or_else(|| {
+        std::thread::available_parallelism()
+            .ok()
+            .map(|cores| cores.get())
+    });
 
     #[cfg(feature = "directml")]
     let has_directml = execution_providers
@@ -501,9 +532,10 @@ pub(crate) fn init_session_builder(
         .with_execution_providers(execution_providers)
         .map_err(builder_error)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(builder_error)?
-        .with_intra_threads(threads)
         .map_err(builder_error)?;
+    if let Some(threads) = threads {
+        builder = builder.with_intra_threads(threads).map_err(builder_error)?;
+    }
 
     for (key, value) in session_config {
         builder = builder
@@ -600,6 +632,27 @@ mod tests {
         files.config_file = b"{}".to_vec();
         let tokenizer = load_tokenizer(files, 512).unwrap();
         assert_eq!(tokenizer.get_padding().unwrap().pad_id, 1);
+    }
+
+    #[test]
+    fn load_tokenizer_refuses_a_max_length_below_the_special_tokens() {
+        let mut files = tokenizer_files(r#"{"model_max_length": 512, "pad_token": "[PAD]"}"#);
+        // Adds two special tokens per text, three per pair.
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&files.tokenizer_file).unwrap();
+        tokenizer["post_processor"] = serde_json::json!({
+            "type": "BertProcessing",
+            "sep": ["[PAD]", 1],
+            "cls": ["[UNK]", 0]
+        });
+        files.tokenizer_file = serde_json::to_vec(&tokenizer).unwrap();
+
+        let err = load_tokenizer(files.clone(), 1).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "error was: {err}");
+
+        let tokenizer = load_tokenizer(files, 3).unwrap();
+        let encoding = tokenizer.encode("hello hello hello", true).unwrap();
+        assert_eq!(encoding.get_ids(), [0, 2, 1]);
     }
 
     #[test]

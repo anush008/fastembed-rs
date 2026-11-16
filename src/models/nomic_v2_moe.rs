@@ -682,7 +682,7 @@ impl NomicV2MoeTextEmbedding {
         dtype: DType,
         max_length: usize,
     ) -> Result<Self> {
-        use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
+        use tokenizers::{PaddingParams, PaddingStrategy};
 
         let repo =
             crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
@@ -708,17 +708,18 @@ impl NomicV2MoeTextEmbedding {
         let mut tokenizer = tokenizers::Tokenizer::from_file(tok_path)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
-        let _ = tokenizer.with_padding(Some(PaddingParams {
+        tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             direction: tokenizers::PaddingDirection::Right,
             pad_id: cfg.pad_token_id as u32,
             pad_token: "<pad>".to_string(),
             ..Default::default()
         }));
-        let _ = tokenizer.with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }));
+        let truncation = crate::common::truncation_to(&tokenizer, max_length)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        tokenizer
+            .with_truncation(Some(truncation))
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         Ok(Self {
             model,

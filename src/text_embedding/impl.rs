@@ -320,6 +320,14 @@ impl TextEmbedding {
         batch_size: Option<usize>,
     ) -> Result<EmbeddingOutput> {
         let texts = texts.as_ref();
+        if batch_size == Some(0) {
+            return Err(Error::InvalidArgument(
+                "batch_size must be greater than 0".into(),
+            ));
+        }
+        if texts.is_empty() {
+            return Ok(EmbeddingOutput::new([]));
+        }
         // Determine the batch size according to the quantization method used.
         // Default if not specified
         let batch_size = match self.quantization {
@@ -343,11 +351,6 @@ impl TextEmbedding {
             }
             _ => Ok(batch_size.unwrap_or(DEFAULT_BATCH_SIZE)),
         }?;
-        if batch_size == 0 {
-            return Err(Error::InvalidArgument(
-                "batch_size must be greater than 0".into(),
-            ));
-        }
 
         let batches = texts
             .chunks(batch_size)

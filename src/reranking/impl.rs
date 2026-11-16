@@ -157,6 +157,7 @@ impl TextRerank {
 
         let mut scores: Vec<f32> = Vec::with_capacity(documents.len());
         for batch in documents.chunks(batch_size) {
+            let scored = scores.len();
             let inputs = batch.iter().map(|d| (q, d.as_ref())).collect();
             let mut encoded = encode_batch(&self.tokenizer, inputs)?;
             let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
@@ -174,7 +175,25 @@ impl TextRerank {
                 .map_err(|e| {
                     Error::TensorExtraction(format!("Failed to extract logits tensor: {e}"))
                 })?;
-            scores.extend(outputs.slice(s![.., 0]).iter().copied());
+            match outputs.ndim() {
+                1 => scores.extend(outputs.iter().copied()),
+                2 if outputs.shape()[1] > 0 => {
+                    scores.extend(outputs.slice(s![.., 0]).iter().copied())
+                }
+                _ => {
+                    return Err(Error::InvalidShape(format!(
+                        "Expected logits of shape [batch] or [batch, 1], got {:?}",
+                        outputs.shape()
+                    )))
+                }
+            }
+            if scores.len() != scored + batch.len() {
+                return Err(Error::InvalidShape(format!(
+                    "Expected one score per document, got logits of shape {:?} for {} documents",
+                    outputs.shape(),
+                    batch.len()
+                )));
+            }
         }
 
         // Return top_n_result of type Vec<RerankResult> ordered by score in descending order, don't use binary heap

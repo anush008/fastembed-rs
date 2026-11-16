@@ -197,6 +197,11 @@ impl Bgem3Embedding {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::TensorExtraction(e.to_string()))?;
             let dense_shape: Vec<usize> = dense_shape.iter().map(|&d| d as usize).collect();
+            if dense_shape.len() != 2 || dense_shape[0] != current_batch_size {
+                return Err(Error::Other(format!(
+                    "BGE-M3 dense output must be [{current_batch_size}, dim], got shape {dense_shape:?}"
+                )));
+            }
             let dense_view = ndarray::ArrayViewD::from_shape(dense_shape.as_slice(), dense_data)
                 .map_err(|e| Error::InvalidShape(e.to_string()))?;
 
@@ -210,9 +215,13 @@ impl Bgem3Embedding {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::TensorExtraction(e.to_string()))?;
             let sparse_shape: Vec<usize> = sparse_shape.iter().map(|&d| d as usize).collect();
-            if sparse_shape.len() != 3 {
+            if sparse_shape.len() != 3
+                || sparse_shape[0] != current_batch_size
+                || sparse_shape[1] != encoding_length
+                || sparse_shape[2] == 0
+            {
                 return Err(Error::Other(format!(
-                    "BGE-M3 sparse output must be rank-3 [batch, seq_len, 1], got shape {sparse_shape:?}"
+                    "BGE-M3 sparse output must be [{current_batch_size}, {encoding_length}, 1], got shape {sparse_shape:?}"
                 )));
             }
             let sparse_view = ndarray::ArrayViewD::from_shape(sparse_shape.as_slice(), sparse_data)
@@ -255,9 +264,12 @@ impl Bgem3Embedding {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::TensorExtraction(e.to_string()))?;
             let colbert_shape: Vec<usize> = colbert_shape.iter().map(|&d| d as usize).collect();
-            if colbert_shape.len() != 3 || colbert_shape[1] >= encoding_length {
+            if colbert_shape.len() != 3
+                || colbert_shape[0] != current_batch_size
+                || colbert_shape[1] >= encoding_length
+            {
                 return Err(Error::Other(format!(
-                    "BGE-M3 colbert output must be rank-3 [batch, seq_len - 1, dim] with seq_len - 1 < {encoding_length}, got shape {colbert_shape:?}"
+                    "BGE-M3 colbert output must be [{current_batch_size}, seq_len - 1, dim] with seq_len - 1 < {encoding_length}, got shape {colbert_shape:?}"
                 )));
             }
             let colbert_view =

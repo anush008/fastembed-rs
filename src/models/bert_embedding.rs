@@ -13,7 +13,7 @@ use candle_nn::{
 };
 use serde::Deserialize;
 use std::path::PathBuf;
-use tokenizers::{Tokenizer, TruncationParams};
+use tokenizers::Tokenizer;
 
 fn map_err<E: std::fmt::Display>(err: E) -> candle_core::Error {
     candle_core::Error::Msg(err.to_string())
@@ -183,7 +183,8 @@ pub struct BertTextEmbedding {
 
 impl BertTextEmbedding {
     /// Load a BERT-family checkpoint (`config.json`, `tokenizer.json`, safetensors) from a
-    /// Hugging Face repo. `dtype` applies to the weights.
+    /// Hugging Face repo. `dtype` applies to the weights. `max_length` is capped at
+    /// `max_position_embeddings`.
     pub fn from_hf(
         repo_id: &str,
         device: &Device,
@@ -212,11 +213,10 @@ impl BertTextEmbedding {
         let mut tokenizer = Tokenizer::from_file(&tok_path).map_err(map_err)?;
         let pad_id = tokenizer.token_to_id("[PAD]").unwrap_or(0);
         tokenizer.with_padding(None);
+        let max_length = max_length.min(cfg.max_position_embeddings);
+        let truncation = crate::common::truncation_to(&tokenizer, max_length).map_err(map_err)?;
         tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length,
-                ..Default::default()
-            }))
+            .with_truncation(Some(truncation))
             .map_err(map_err)?;
         this.tokenizer = Some(tokenizer);
         this.max_length = max_length;

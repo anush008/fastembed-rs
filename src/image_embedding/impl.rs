@@ -209,6 +209,7 @@ impl ImageEmbedding {
                     .iter()
                     .map(|img| {
                         image::ImageReader::open(img)?
+                            .with_guessed_format()?
                             .decode()
                             .map_err(|err| Error::ImageDecode(err.to_string()))
                     })
@@ -238,7 +239,9 @@ impl ImageEmbedding {
     /// This separates CPU image preprocessing from mutable ONNX Runtime inference, allowing
     /// callers to prepare later batches while the accelerator processes the current batch.
     pub fn embed_preprocessed(&mut self, inputs: Vec<Array3<f32>>) -> Result<Vec<Embedding>> {
-        // Extract the batch size
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
         let inputs_view: Vec<ArrayView3<f32>> = inputs.iter().map(|img| img.view()).collect();
         let pixel_values_array = ndarray::stack(ndarray::Axis(0), &inputs_view)
             .map_err(|e| Error::InvalidShape(e.to_string()))?;

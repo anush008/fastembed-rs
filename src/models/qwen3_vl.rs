@@ -415,7 +415,8 @@ impl PatchMerger {
             normed.reshape((grouped, self.merged_hidden_size))?
         };
         let xs = self.fc1.forward(&reshaped)?;
-        let xs = xs.gelu()?;
+        // nn.GELU() in the reference, not the tanh approximation.
+        let xs = xs.gelu_erf()?;
         self.fc2.forward(&xs)
     }
 }
