@@ -213,11 +213,7 @@ impl BertTextEmbedding {
         let mut tokenizer = Tokenizer::from_file(&tok_path).map_err(map_err)?;
         let pad_id = tokenizer.token_to_id("[PAD]").unwrap_or(0);
         tokenizer.with_padding(None);
-        let max_length = max_length.min(cfg.max_position_embeddings);
-        let truncation = crate::common::truncation_to(&tokenizer, max_length).map_err(map_err)?;
-        tokenizer
-            .with_truncation(Some(truncation))
-            .map_err(map_err)?;
+        let max_length = set_truncation(&mut tokenizer, max_length, &cfg)?;
         this.tokenizer = Some(tokenizer);
         this.max_length = max_length;
         this.pad_id = pad_id;
@@ -363,5 +359,55 @@ impl BertTextEmbedding {
             )?;
         }
         Ok(xs)
+    }
+}
+
+/// Sets `tokenizer` to truncate at `max_length`, capped at the position count of the model,
+/// and returns the length in use.
+fn set_truncation(tokenizer: &mut Tokenizer, max_length: usize, cfg: &BertConfig) -> Result<usize> {
+    let max_length = max_length.min(cfg.max_position_embeddings);
+    let truncation = crate::common::truncation_to(tokenizer, max_length).map_err(map_err)?;
+    tokenizer
+        .with_truncation(Some(truncation))
+        .map_err(map_err)?;
+    Ok(max_length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_is_capped_at_the_position_count_and_keeps_room_for_special_tokens() {
+        let cfg = BertConfig {
+            vocab_size: 4,
+            hidden_size: 4,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            intermediate_size: 4,
+            max_position_embeddings: 8,
+            type_vocab_size: 2,
+            layer_norm_eps: 1e-12,
+        };
+        let mut tokenizer: Tokenizer = r#"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {"type": "BertProcessing", "sep": ["[SEP]", 2], "cls": ["[CLS]", 1]},
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "unk_token": "[UNK]",
+                "vocab": {"[UNK]": 0, "[CLS]": 1, "[SEP]": 2, "hello": 3}
+            }
+        }"#
+        .parse()
+        .unwrap();
+
+        assert_eq!(set_truncation(&mut tokenizer, 4096, &cfg).unwrap(), 8);
+        let encoding = tokenizer.encode("hello ".repeat(20), true).unwrap();
+        assert_eq!(encoding.get_ids(), [1, 3, 3, 3, 3, 3, 3, 2]);
+
+        assert_eq!(set_truncation(&mut tokenizer, 5, &cfg).unwrap(), 5);
+        assert!(set_truncation(&mut tokenizer, 1, &cfg).is_err());
     }
 }

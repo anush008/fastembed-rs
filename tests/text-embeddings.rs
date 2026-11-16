@@ -27,6 +27,9 @@ const EPS: f32 = 2e-2;
 /// int4 kernels give different sums on different CPUs.
 const EPS_Q4: f32 = 1e-1;
 
+/// Dynamic int8 models give sums up to ~0.04 apart on different ONNX Runtime versions and CPUs.
+const EPS_DYNAMIC: f32 = 6e-2;
+
 /// `FASTEMBED_TEST_SHARD=<index>/<count>` runs every `count`-th model, starting at `index`.
 fn in_shard(position: usize) -> bool {
     match std::env::var("FASTEMBED_TEST_SHARD") {
@@ -105,8 +108,9 @@ fn verify_embeddings(model: &EmbeddingModel, embeddings: &[Embedding]) -> Result
         _ => panic!("Model {model} not found. If you have just inserted this `EmbeddingModel` variant, please update the expected embeddings."),
     };
 
-    let eps = match model {
-        EmbeddingModel::EmbeddingGemma300MQ4 => EPS_Q4,
+    let eps = match (model, TextEmbedding::get_quantization_mode(model)) {
+        (EmbeddingModel::EmbeddingGemma300MQ4, _) => EPS_Q4,
+        (_, QuantizationMode::Dynamic) => EPS_DYNAMIC,
         _ => EPS,
     };
 
@@ -146,7 +150,7 @@ macro_rules! create_embeddings_test {
         #[test]
         fn $name() {
             let mut supported_models = TextEmbedding::list_supported_models();
-            // HashMap order differs per process, shards need a fixed one.
+            // Sorted by name, so a shard keeps its models when the table order changes.
             supported_models.sort_by_key(|m| m.model.to_string());
             supported_models
                 .iter()
@@ -345,7 +349,7 @@ fn test_user_defined_embedding_model() {
 }
 
 #[test]
-fn test_empty_input_returns_no_embeddings() {
+fn test_dynamic_quantization_runs_the_texts_of_a_call_as_one_batch() {
     let mut model = TextEmbedding::try_new(
         TextInitOptions::new(EmbeddingModel::AllMiniLML6V2Q).with_environment(environment()),
     )
@@ -359,6 +363,11 @@ fn test_empty_input_returns_no_embeddings() {
     assert!(model.embed(&no_texts, None).unwrap().is_empty());
     assert!(model.embed(&no_texts, Some(8)).unwrap().is_empty());
     assert!(model.embed(&no_texts, Some(0)).is_err());
+
+    let texts = vec!["hello", "hello world"];
+    assert!(model.embed(&texts, Some(1)).is_err());
+    assert_eq!(model.embed(&texts, Some(2)).unwrap().len(), 2);
+    assert_eq!(model.embed(&texts, None).unwrap().len(), 2);
 }
 
 #[test]
@@ -474,9 +483,20 @@ fn test_user_defined_reranking_model() {
         TextRerank::get_model_info(&RerankerModel::JINARerankerV1TurboEn);
 
     TextRerank::try_new(
-        RerankInitOptions::new(test_model_info.model).with_environment(environment()),
+        RerankInitOptions::new(test_model_info.model.clone()).with_environment(environment()),
     )
     .unwrap();
+
+    // The tokenizer adds two special tokens to a text and four to a query and document pair.
+    let too_short = TextRerank::try_new(
+        RerankInitOptions::new(test_model_info.model)
+            .with_max_length(3)
+            .with_environment(environment()),
+    );
+    assert!(matches!(
+        too_short,
+        Err(fastembed::Error::InvalidArgument(_))
+    ));
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");

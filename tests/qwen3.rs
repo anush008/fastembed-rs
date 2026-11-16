@@ -127,10 +127,22 @@ fn qwen3_06b_reference_scores() {
 }
 
 /// candle's CPU quantized matmul rounds the activations to 8-bit blocks, as llama.cpp does.
-/// On AVX-512 VNNI, candle 0.11.1 uses 256-value blocks instead of 32, so the bounds are looser.
+/// Its x86 kernel without VNNI rounds them in blocks of 32 values, and the cosine to the f32
+/// model is 0.9990 to 0.9994. The VNNI kernels of candle 0.11.1 use blocks of 256, and the
+/// cosine is 0.9965 to 0.9976. Other CPUs get the looser bounds too.
 #[test]
 fn qwen3_06b_gguf_matches_python() {
-    check_06b_gguf_against_python(&Device::Cpu, 2e-2, 2.5e-1, 0.995);
+    #[cfg(target_arch = "x86_64")]
+    let blocks_of_32 = !(std::arch::is_x86_feature_detected!("avx512vnni")
+        || std::arch::is_x86_feature_detected!("avxvnni"));
+    #[cfg(not(target_arch = "x86_64"))]
+    let blocks_of_32 = false;
+
+    if blocks_of_32 {
+        check_06b_gguf_against_python(&Device::Cpu, 1e-2, 6e-2, 0.998);
+    } else {
+        check_06b_gguf_against_python(&Device::Cpu, 2e-2, 2.5e-1, 0.995);
+    }
 }
 
 #[cfg(feature = "metal")]

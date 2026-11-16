@@ -2940,6 +2940,30 @@ mod tests {
         tokenizer
     }
 
+    #[test]
+    fn embedding_tokenizer_refuses_a_max_length_below_the_special_tokens() {
+        let json = r#"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": {"type": "BertProcessing", "sep": ["[UNK]", 0], "cls": ["[UNK]", 0]},
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "w0": 1}, "unk_token": "[UNK]"}
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "fastembed-embedding-tokenizer-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+        let too_short = super::embedding_tokenizer(&path, 1);
+        let fits = super::embedding_tokenizer(&path, 3);
+        std::fs::remove_file(&path).unwrap();
+
+        let err = too_short.err().unwrap().to_string();
+        assert!(err.contains("max_length"), "error was: {err}");
+        let encoding = fits.unwrap().encode("w0 w0 w0", true).unwrap();
+        assert_eq!(encoding.get_ids(), [0, 1, 0]);
+    }
+
     /// Texts of 5, 2, 9, 5, 1, 9 and 5 words: three lengths repeat, one stands alone.
     fn mixed_texts() -> Vec<String> {
         [5usize, 2, 9, 5, 1, 9, 5]

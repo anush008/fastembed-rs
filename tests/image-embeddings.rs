@@ -30,6 +30,9 @@ fn test_image_embedding_model() {
         let embeddings = model.embed(images.clone(), None).unwrap();
 
         assert_eq!(embeddings.len(), images.len());
+        for embedding in &embeddings {
+            assert_eq!(embedding.len(), supported_model.dim);
+        }
     };
     ImageEmbedding::list_supported_models()
         .iter()

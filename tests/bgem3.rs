@@ -11,8 +11,10 @@ use std::sync::{Mutex, OnceLock};
 
 static MODEL_LOCK: Mutex<()> = Mutex::new(());
 
-// Dynamic int8 output varies by up to ~0.03 across ONNX Runtime versions and CPUs.
-const EPS: f32 = 4e-2;
+// Dynamic int8 output varies across ONNX Runtime versions and CPUs: the sparse weights by up
+// to ~0.03, the dense and ColBERT values by less than 0.02 where measured.
+const EPS: f32 = 2e-2;
+const COLBERT_EPS: f32 = 4e-2;
 const SPARSE_EPS: f32 = 6e-2;
 const SPARSE_MIN_COSINE: f32 = 0.99;
 
@@ -164,16 +166,16 @@ fn test_bgem3_joint_embeddings_match_python() {
     ];
 
     for (i, val) in expected_colbert_0_tok1.iter().enumerate() {
-        assert!((output.colbert[0][0][i] - val).abs() < EPS);
+        assert!((output.colbert[0][0][i] - val).abs() < COLBERT_EPS);
     }
     for (i, val) in expected_colbert_0_tok2.iter().enumerate() {
-        assert!((output.colbert[0][1][i] - val).abs() < EPS);
+        assert!((output.colbert[0][1][i] - val).abs() < COLBERT_EPS);
     }
     for (i, val) in expected_colbert_1_tok1.iter().enumerate() {
-        assert!((output.colbert[1][0][i] - val).abs() < EPS);
+        assert!((output.colbert[1][0][i] - val).abs() < COLBERT_EPS);
     }
     for (i, val) in expected_colbert_1_tok2.iter().enumerate() {
-        assert!((output.colbert[1][1][i] - val).abs() < EPS);
+        assert!((output.colbert[1][1][i] - val).abs() < COLBERT_EPS);
     }
 }
 
