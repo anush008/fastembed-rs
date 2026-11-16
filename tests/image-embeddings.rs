@@ -1,5 +1,4 @@
 #![cfg(all(feature = "image-models", feature = "hf-hub"))]
-#![allow(clippy::excessive_precision)]
 
 use std::sync::OnceLock;
 
@@ -43,47 +42,25 @@ fn test_image_embedding_model() {
         .for_each(test_one_model);
 }
 
-/// Compares the ClipVitB32 embeddings of the two test images with the first 8 values that
-/// fastembed 0.9.1 (Python) returns. `image_0.png` is resized first, and PIL rounds the
-/// resized pixels differently from the image crate.
+/// Compares the ClipVitB32 embeddings of the two test images with the vectors that fastembed
+/// 0.9.1 (Python) returns. `image_1.png` has the size of the model input. `image_0.png` is
+/// resized first, and PIL rounds the resized pixels differently from the image crate: the
+/// distance is 0.020 with the bicubic filter of the model, and 0.068 with the bilinear one.
 fn assert_clip_matches_python_counterpart(embeddings: &[Vec<f32>]) {
-    let baseline: [([f32; 8], f32); 2] = [
-        (
-            [
-                2.842_279_0e-2,
-                -1.676_774_0e-2,
-                -5.692_382_8e-3,
-                -3.964_272_1e-2,
-                -8.129_567_8e-3,
-                -3.385_638_1e-2,
-                3.124_806_7e-2,
-                4.087_865_0e-2,
-            ],
-            5e-3,
-        ),
-        (
-            [
-                2.917_035_1e-2,
-                -2.920_276_1e-2,
-                -1.089_769_2e-2,
-                -3.426_397_2e-2,
-                -1.583_512_7e-2,
-                -4.130_660_0e-2,
-                1.180_834_4e-2,
-                8.709_147_6e-2,
-            ],
-            1e-4,
-        ),
-    ];
-    for (embedding, (expected, tolerance)) in embeddings.iter().zip(baseline) {
+    let baseline: Vec<Vec<f32>> =
+        serde_json::from_str(include_str!("assets/clip_vit_b32_images.json")).unwrap();
+    assert_eq!(embeddings.len(), baseline.len());
+    for ((embedding, expected), tolerance) in embeddings.iter().zip(&baseline).zip([3e-2, 1e-4]) {
+        assert_eq!(embedding.len(), expected.len());
         let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "norm {norm}");
-        for (actual, expected) in embedding.iter().zip(expected) {
-            assert!(
-                (actual - expected).abs() < tolerance,
-                "{actual} is not {expected}"
-            );
-        }
+        let distance = embedding
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(distance < tolerance, "distance {distance}");
     }
 }
 
