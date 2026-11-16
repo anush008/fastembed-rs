@@ -520,12 +520,8 @@ fn build_image_position_ids(
 
 #[cfg(feature = "qwen3-vl")]
 fn load_image_from_path(path: &Path) -> Result<DynamicImage> {
-    image::ImageReader::open(path)
-        .map_err(map_err)?
-        .with_guessed_format()
-        .map_err(map_err)?
-        .decode()
-        .map_err(map_err)
+    let reader = image::ImageReader::open(path).map_err(map_err)?;
+    crate::common::decode_image(path, reader).map_err(map_err)
 }
 
 pub struct Qwen3RMSNorm {

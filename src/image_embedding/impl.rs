@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::{io::Cursor, path::Path};
 
 use crate::{
-    common::{init_session_builder, normalize, Error, Result},
+    common::{decode_image, init_session_builder, normalize, Error, Result},
     models::image_embedding::models_list,
     Embedding, ImageEmbeddingModel, ModelInfo,
 };
@@ -208,9 +208,8 @@ impl ImageEmbedding {
                 let inputs = batch
                     .iter()
                     .map(|img| {
-                        image::ImageReader::open(img)?
-                            .with_guessed_format()?
-                            .decode()
+                        let reader = image::ImageReader::open(img)?;
+                        decode_image(img.as_ref(), reader)
                             .map_err(|err| Error::ImageDecode(err.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -242,6 +241,7 @@ impl ImageEmbedding {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        // Extract the batch size
         let inputs_view: Vec<ArrayView3<f32>> = inputs.iter().map(|img| img.view()).collect();
         let pixel_values_array = ndarray::stack(ndarray::Axis(0), &inputs_view)
             .map_err(|e| Error::InvalidShape(e.to_string()))?;
@@ -321,5 +321,22 @@ impl ImageEmbedding {
         };
 
         Ok(embeddings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_batch_embeds_to_nothing() {
+        let model = UserDefinedImageEmbeddingModel::new(
+            crate::common::tests::relu_model_bytes(),
+            br#"{"do_resize": false}"#.to_vec(),
+        );
+        let mut model =
+            ImageEmbedding::try_new_from_user_defined(model, Default::default()).unwrap();
+        assert!(model.embed_preprocessed(Vec::new()).unwrap().is_empty());
+        assert!(model.embed_images(Vec::new()).unwrap().is_empty());
     }
 }

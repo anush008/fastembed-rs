@@ -10,7 +10,7 @@ use crate::{
 };
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
-use ndarray::{Array2, ArrayViewD};
+use ndarray::{Array2, ArrayView1, ArrayViewD};
 use ort::session::{Session, SessionOutputs};
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "hf-hub")]
@@ -202,9 +202,8 @@ impl SparseTextEmbedding {
 
             let embeddings = match self.model {
                 SparseModel::SPLADEPPV1 => {
-                    let logits =
-                        extract_output(&outputs, "last_hidden_state", &encoded.attention_mask)?;
-                    Self::post_process_splade(&logits, &encoded.attention_mask)
+                    let logits = extract_output(&outputs, "last_hidden_state")?;
+                    Self::post_process_splade(&logits, &encoded.attention_mask)?
                 }
                 SparseModel::BGEM3 => {
                     let output_key =
@@ -214,28 +213,20 @@ impl SparseTextEmbedding {
                             .ok_or_else(|| Error::OutputKeyMissing {
                                 key: "<first output>".into(),
                             })?;
-                    let hidden_states =
-                        extract_output(&outputs, output_key, &encoded.attention_mask)?;
-                    let hidden_size = super::bgem3_weights::get_weights().weight.len();
-                    if hidden_states.shape()[2] != hidden_size {
-                        return Err(Error::InvalidShape(format!(
-                            "BGE-M3 hidden states must be {hidden_size} wide, got shape {:?}",
-                            hidden_states.shape()
-                        )));
-                    }
+                    let hidden_states = extract_output(&outputs, output_key)?;
                     Self::post_process_bgem3(
                         &hidden_states,
                         &encoded.input_ids,
                         &encoded.attention_mask,
-                    )
+                    )?
                 }
                 SparseModel::OpenSearchNeuralSparseDocV3Gte => {
-                    let logits = extract_output(&outputs, "logits", &encoded.attention_mask)?;
+                    let logits = extract_output(&outputs, "logits")?;
                     Self::post_process_if_splade(
                         &logits,
                         &encoded.attention_mask,
                         &self.special_token_ids,
-                    )
+                    )?
                 }
             };
             output.extend(embeddings);
@@ -299,7 +290,7 @@ impl SparseTextEmbedding {
     fn post_process_splade(
         model_output: &ArrayViewD<f32>,
         attention_mask: &Array2<i64>,
-    ) -> Vec<SparseEmbedding> {
+    ) -> Result<Vec<SparseEmbedding>> {
         let batch_size = attention_mask.shape()[0];
         let seq_len = attention_mask.shape()[1];
         let vocab_size = model_output.shape()[2];
@@ -311,7 +302,7 @@ impl SparseTextEmbedding {
                     if attention_mask[[batch_idx, seq_idx]] == 0 {
                         continue;
                     }
-                    let token_logits = model_output.slice(ndarray::s![batch_idx, seq_idx, ..]);
+                    let token_logits = token_row(model_output, batch_idx, seq_idx)?;
                     for (score, &logit) in pooled.iter_mut().zip(token_logits.iter()) {
                         *score = score.max(logit);
                     }
@@ -325,7 +316,7 @@ impl SparseTextEmbedding {
                         indices.push(idx);
                     }
                 }
-                SparseEmbedding { values, indices }
+                Ok(SparseEmbedding { values, indices })
             })
             .collect()
     }
@@ -334,9 +325,7 @@ impl SparseTextEmbedding {
         hidden_states: &ArrayViewD<f32>,
         input_ids: &Array2<i64>,
         attention_mask: &Array2<i64>,
-    ) -> Vec<SparseEmbedding> {
-        use ndarray::ArrayView1;
-
+    ) -> Result<Vec<SparseEmbedding>> {
         // Special tokens to skip (XLM-RoBERTa: CLS=0, PAD=1, EOS=2, UNK=3)
         const SPECIAL_TOKENS: [i64; 4] = [0, 1, 2, 3];
 
@@ -360,7 +349,14 @@ impl SparseTextEmbedding {
                         continue;
                     }
 
-                    let hidden = hidden_states.slice(ndarray::s![batch_idx, seq_idx, ..]);
+                    let hidden = token_row(hidden_states, batch_idx, seq_idx)?;
+                    if hidden.len() != weights.len() {
+                        return Err(Error::InvalidShape(format!(
+                            "BGE-M3 hidden states must be {} wide, got shape {:?}",
+                            weights.len(),
+                            hidden_states.shape()
+                        )));
+                    }
                     let weight = (hidden.dot(&weights) + bias).max(0.0);
 
                     if weight > 0.0 {
@@ -375,7 +371,7 @@ impl SparseTextEmbedding {
                 indices.sort_unstable();
                 let values: Vec<_> = indices.iter().map(|i| token_weights[i]).collect();
 
-                SparseEmbedding { values, indices }
+                Ok(SparseEmbedding { values, indices })
             })
             .collect()
     }
@@ -390,7 +386,7 @@ impl SparseTextEmbedding {
         logits: &ArrayViewD<f32>,
         attention_mask: &Array2<i64>,
         special_token_ids: &HashSet<usize>,
-    ) -> Vec<SparseEmbedding> {
+    ) -> Result<Vec<SparseEmbedding>> {
         let batch_size = attention_mask.shape()[0];
         let seq_len = attention_mask.shape()[1];
         let vocab_size = logits.shape()[2];
@@ -406,7 +402,7 @@ impl SparseTextEmbedding {
                         continue;
                     }
 
-                    let token_logits = logits.slice(ndarray::s![batch_idx, seq_idx, ..]);
+                    let token_logits = token_row(logits, batch_idx, seq_idx)?;
                     for (score, &logit) in pooled.iter_mut().zip(token_logits.iter()) {
                         *score = score.max(logit);
                     }
@@ -425,17 +421,31 @@ impl SparseTextEmbedding {
                     indices.push(token_id);
                 }
 
-                SparseEmbedding { values, indices }
+                Ok(SparseEmbedding { values, indices })
             })
             .collect()
     }
+}
+
+/// The row of `output` (`[batch, sequence, width]`) for one token.
+fn token_row<'a>(
+    output: &'a ArrayViewD<'_, f32>,
+    batch_idx: usize,
+    seq_idx: usize,
+) -> Result<ArrayView1<'a, f32>> {
+    let shape = output.shape();
+    if batch_idx >= shape[0] || seq_idx >= shape[1] {
+        return Err(Error::InvalidShape(format!(
+            "Output of shape {shape:?} has no row for token {seq_idx} of text {batch_idx}"
+        )));
+    }
+    Ok(output.slice(ndarray::s![batch_idx, seq_idx, ..]))
 }
 
 /// The sole output, or the one named `preferred_key`, as a rank-3 `[batch, sequence, vocab]` view.
 fn extract_output<'a>(
     outputs: &'a SessionOutputs<'_>,
     preferred_key: &str,
-    attention_mask: &Array2<i64>,
 ) -> Result<ArrayViewD<'a, f32>> {
     let key = if outputs.len() == 1 {
         outputs
@@ -454,10 +464,9 @@ fn extract_output<'a>(
         .try_extract_tensor::<f32>()
         .map_err(|e| Error::TensorExtraction(e.to_string()))?;
     let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-    let (batch_size, seq_len) = attention_mask.dim();
-    if shape.len() != 3 || shape[0] != batch_size || shape[1] != seq_len {
+    if shape.len() != 3 {
         return Err(Error::InvalidShape(format!(
-            "Output '{key}' must be [{batch_size}, {seq_len}, vocab], got shape {shape:?}"
+            "Output '{key}' must be rank-3 [batch, sequence, vocab], got shape {shape:?}"
         )));
     }
     let view = ArrayViewD::from_shape(shape.as_slice(), data)
@@ -484,12 +493,63 @@ mod tests {
         .unwrap();
         let mask = arr2(&[[1i64, 1, 0]]);
 
-        let out = SparseTextEmbedding::post_process_splade(&logits.view().into_dyn(), &mask);
+        let out =
+            SparseTextEmbedding::post_process_splade(&logits.view().into_dyn(), &mask).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].indices, vec![0, 1, 3]);
         let expected = [2.0f32.ln(), 3.0f32.ln(), 1.5f32.ln()];
         for (value, expected) in out[0].values.iter().zip(expected) {
             assert!((value - expected).abs() < 1e-6, "{value} != {expected}");
         }
+    }
+
+    #[test]
+    fn post_processing_errors_where_a_token_has_no_row() {
+        let mask = arr2(&[[1i64, 1, 0], [1, 1, 1]]);
+        let special = HashSet::new();
+        let post_process = |logits: &Array3<f32>| {
+            let logits = logits.view().into_dyn();
+            (
+                SparseTextEmbedding::post_process_splade(&logits, &mask),
+                SparseTextEmbedding::post_process_if_splade(&logits, &mask, &special),
+            )
+        };
+
+        let (splade, if_splade) = post_process(&Array3::ones((2, 3, 4)));
+        assert_eq!(splade.unwrap().len(), 2);
+        assert_eq!(if_splade.unwrap().len(), 2);
+        // Rows and positions past the input are left unread, as before.
+        let (splade, if_splade) = post_process(&Array3::ones((3, 5, 4)));
+        assert_eq!(splade.unwrap().len(), 2);
+        assert_eq!(if_splade.unwrap().len(), 2);
+
+        for short in [Array3::ones((1, 3, 4)), Array3::ones((2, 2, 4))] {
+            let (splade, if_splade) = post_process(&short);
+            assert!(matches!(splade, Err(Error::InvalidShape(_))));
+            assert!(matches!(if_splade, Err(Error::InvalidShape(_))));
+        }
+    }
+
+    #[test]
+    fn bgem3_post_processing_errors_on_missing_rows_and_wrong_width() {
+        // <s>=0 and </s>=2 are special.
+        let input_ids = arr2(&[[0i64, 9, 2]]);
+        let mask = arr2(&[[1i64, 1, 1]]);
+        let width = super::super::bgem3_weights::get_weights().weight.len();
+        let post_process = |hidden: Array3<f32>| {
+            SparseTextEmbedding::post_process_bgem3(&hidden.view().into_dyn(), &input_ids, &mask)
+        };
+
+        assert_eq!(post_process(Array3::zeros((1, 3, width))).unwrap().len(), 1);
+        // The last token is special, so its missing row is never read.
+        assert_eq!(post_process(Array3::zeros((1, 2, width))).unwrap().len(), 1);
+        assert!(matches!(
+            post_process(Array3::zeros((1, 1, width))),
+            Err(Error::InvalidShape(_))
+        ));
+        assert!(matches!(
+            post_process(Array3::zeros((1, 3, width + 1))),
+            Err(Error::InvalidShape(_))
+        ));
     }
 }

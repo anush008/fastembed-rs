@@ -726,3 +726,63 @@ impl Qwen3VLVisionModel {
         Ok((hidden_states, deepstack_features))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn patch_merger_uses_the_exact_gelu() {
+        let cfg: VisionConfig = serde_json::from_str(
+            r#"{"hidden_size": 2, "out_hidden_size": 8, "spatial_merge_size": 2}"#,
+        )
+        .unwrap();
+        let device = Device::Cpu;
+        let identity = |scale: f32| {
+            let data: Vec<f32> = (0..64)
+                .map(|i| if i % 9 == 0 { scale } else { 0.0 })
+                .collect();
+            Tensor::from_vec(data, (8, 8), &device).unwrap()
+        };
+        let zeros = || Tensor::zeros(8, DType::F32, &device).unwrap();
+        let tensors = HashMap::from([
+            (
+                "norm.weight".to_string(),
+                Tensor::ones(8, DType::F32, &device).unwrap(),
+            ),
+            ("norm.bias".to_string(), zeros()),
+            ("linear_fc1.weight".to_string(), identity(2.0)),
+            ("linear_fc1.bias".to_string(), zeros()),
+            ("linear_fc2.weight".to_string(), identity(1.0)),
+            ("linear_fc2.bias".to_string(), zeros()),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let merger = PatchMerger::new(&cfg, true, vb).unwrap();
+
+        let xs = Tensor::from_vec(
+            vec![-3f32, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0],
+            (4, 2),
+            &device,
+        )
+        .unwrap();
+        let got = merger.forward(&xs).unwrap().to_vec2::<f32>().unwrap();
+
+        // 0.5 * x * (1 + erf(x / sqrt(2))) of the normed input times two, from Python's math.erf.
+        // The tanh approximation is up to 3.4e-4 away on these values.
+        let expected = [
+            -0.0023499f32,
+            -0.0361006,
+            -0.1532828,
+            -0.1579483,
+            0.3718646,
+            0.906343,
+            2.0831509,
+            3.1765273,
+        ];
+        assert_eq!(got.len(), 1);
+        for (got, expected) in got[0].iter().zip(expected) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
+    }
+}

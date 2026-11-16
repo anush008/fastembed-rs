@@ -47,12 +47,7 @@ use tokenizers::{Tokenizer, TruncationParams};
 const DEFAULT_CACHE_DIR: &str = ".fastembed_cache";
 
 pub fn get_cache_dir() -> String {
-    env_var("FASTEMBED_CACHE_DIR").unwrap_or(DEFAULT_CACHE_DIR.into())
-}
-
-/// An environment variable, with an empty value treated as unset.
-fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+    std::env::var("FASTEMBED_CACHE_DIR").unwrap_or(DEFAULT_CACHE_DIR.into())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -253,7 +248,6 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
             )
         })? as f32;
     let max_length = max_length.min(model_max_length as usize);
-    let truncation = truncation_to(&tokenizer, max_length)?;
     let pad_token_value = &tokenizer_config["pad_token"];
     let pad_token: String = pad_token_value
         .as_str()
@@ -269,6 +263,7 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
         .map(|id| id as u32)
         .or_else(|| tokenizer.token_to_id(&pad_token))
         .unwrap_or(0);
+    let truncation = truncation_to(&tokenizer, max_length)?;
 
     let mut tokenizer = tokenizer
         .with_padding(Some(PaddingParams {
@@ -324,6 +319,26 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
     Ok(tokenizer.into())
 }
 
+/// `reader.decode()`, which goes by the file extension. When that fails, the file's content
+/// names the format instead. The first error is the one returned.
+#[cfg(any(feature = "image-models", feature = "qwen3-vl"))]
+pub(crate) fn decode_image(
+    path: &std::path::Path,
+    reader: image::ImageReader<std::io::BufReader<std::fs::File>>,
+) -> image::ImageResult<image::DynamicImage> {
+    let format = reader.format();
+    let by_extension = match reader.decode() {
+        Ok(image) => return Ok(image),
+        Err(err) => err,
+    };
+    image::ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .ok()
+        .filter(|reader| reader.format() != format)
+        .and_then(|reader| reader.decode().ok())
+        .ok_or(by_extension)
+}
+
 #[cfg(feature = "onnx")]
 pub fn normalize(v: &[f32]) -> Vec<f32> {
     let norm = (v.iter().map(|val| val * val).sum::<f32>()).sqrt();
@@ -352,13 +367,16 @@ pub fn pull_from_hf(
     default_cache_dir: PathBuf,
     show_download_progress: bool,
 ) -> Result<ApiRepo> {
-    let cache_dir = env_var("HF_HOME")
+    use std::env;
+
+    let cache_dir = env::var("HF_HOME")
         .map(PathBuf::from)
         .unwrap_or(default_cache_dir);
 
-    let endpoint = env_var("HF_ENDPOINT").unwrap_or_else(|| "https://huggingface.co".to_string());
+    let endpoint = env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
 
-    let token = env_var("HF_TOKEN")
+    let token = env::var("HF_TOKEN")
+        .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
         .or_else(default_hf_token);
@@ -579,8 +597,83 @@ pub(crate) fn init_session_builder(
     Ok(builder)
 }
 
+#[cfg(all(test, any(feature = "image-models", feature = "qwen3-vl")))]
+mod image_tests {
+    use super::decode_image;
+    use std::path::{Path, PathBuf};
+
+    /// A directory of test files, removed when the test ends.
+    struct Files(PathBuf);
+
+    impl Files {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("fastembed-{test}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(3, 2)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn decode(path: &Path) -> image::ImageResult<image::DynamicImage> {
+        decode_image(path, image::ImageReader::open(path).unwrap())
+    }
+
+    #[test]
+    fn decode_image_reads_a_file_with_a_wrong_or_missing_extension() {
+        let files = Files::new("decode-ok");
+        for name in ["right.png", "wrong.jpg", "none"] {
+            let image = decode(&files.write(name, &png())).unwrap();
+            assert_eq!((image.width(), image.height()), (3, 2), "{name}");
+        }
+    }
+
+    #[test]
+    fn decode_image_keeps_the_extension_error_when_the_content_fails_too() {
+        let files = Files::new("decode-err");
+        for (name, bytes) in [
+            ("garbage.png", &b"not an image"[..]),
+            ("garbage", b"not an image"),
+            ("empty.png", b""),
+        ] {
+            let path = files.write(name, bytes);
+            let by_extension = image::ImageReader::open(&path)
+                .unwrap()
+                .decode()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                decode(&path).unwrap_err().to_string(),
+                by_extension,
+                "{name}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, feature = "onnx"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
 
@@ -724,7 +817,7 @@ mod tests {
     }
 
     /// A one-node ONNX model, `y = Relu(x)` over a float tensor of shape [1, 4].
-    fn relu_model_bytes() -> Vec<u8> {
+    pub(crate) fn relu_model_bytes() -> Vec<u8> {
         let value_info = |name: &str| {
             let dim = |size: u8| protobuf_bytes(1, &[0x08, size]);
             let shape = protobuf_bytes(2, &[dim(1), dim(4)].concat());

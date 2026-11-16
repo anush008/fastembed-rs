@@ -8,6 +8,7 @@ use crate::{
 };
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
+use ndarray::{Array2, ArrayViewD};
 use ort::session::Session;
 use std::collections::HashMap;
 #[cfg(feature = "hf-hub")]
@@ -171,9 +172,7 @@ impl Bgem3Embedding {
             let inputs = batch.iter().map(|text| text.as_ref()).collect();
             let mut encoded = encode_batch(&self.tokenizer, inputs)?;
             let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
-            let (current_batch_size, encoding_length) = encoded.input_ids.dim();
-            let inputs_ids_array = &encoded.input_ids;
-            let attention_mask_array = &encoded.attention_mask;
+            let current_batch_size = encoded.input_ids.nrows();
 
             let outputs = self
                 .session
@@ -191,104 +190,18 @@ impl Bgem3Embedding {
             // outputs[1] -> sparse_vecs: [batch_size, seq_len, 1]
             // outputs[2] -> colbert_vecs: [batch_size, seq_len - 1, 1024]
 
-            // Dense vecs
-            let dense_output = &outputs[0];
-            let (dense_shape, dense_data) = dense_output
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::TensorExtraction(e.to_string()))?;
-            let dense_shape: Vec<usize> = dense_shape.iter().map(|&d| d as usize).collect();
-            if dense_shape.len() != 2 || dense_shape[0] != current_batch_size {
-                return Err(Error::Other(format!(
-                    "BGE-M3 dense output must be [{current_batch_size}, dim], got shape {dense_shape:?}"
-                )));
-            }
-            let dense_view = ndarray::ArrayViewD::from_shape(dense_shape.as_slice(), dense_data)
-                .map_err(|e| Error::InvalidShape(e.to_string()))?;
+            let dense = output_view(&outputs[0])?;
+            all_dense.extend(dense_vectors(&dense, current_batch_size)?);
 
-            for row in dense_view.rows() {
-                all_dense.push(row.to_vec());
-            }
+            let sparse = output_view(&outputs[1])?;
+            all_sparse.extend(sparse_embeddings(
+                &sparse,
+                &encoded.input_ids,
+                &encoded.attention_mask,
+            )?);
 
-            // Sparse vecs
-            let sparse_output = &outputs[1];
-            let (sparse_shape, sparse_data) = sparse_output
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::TensorExtraction(e.to_string()))?;
-            let sparse_shape: Vec<usize> = sparse_shape.iter().map(|&d| d as usize).collect();
-            if sparse_shape.len() != 3
-                || sparse_shape[0] != current_batch_size
-                || sparse_shape[1] != encoding_length
-                || sparse_shape[2] == 0
-            {
-                return Err(Error::Other(format!(
-                    "BGE-M3 sparse output must be [{current_batch_size}, {encoding_length}, 1], got shape {sparse_shape:?}"
-                )));
-            }
-            let sparse_view = ndarray::ArrayViewD::from_shape(sparse_shape.as_slice(), sparse_data)
-                .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-            // Special tokens to skip: XLM-RoBERTa: CLS=0, PAD=1, EOS=2, UNK=3
-            const SPECIAL_TOKENS: [i64; 4] = [0, 1, 2, 3];
-
-            for batch_idx in 0..current_batch_size {
-                let mut token_weights: HashMap<usize, f32> = HashMap::new();
-                for seq_idx in 0..encoding_length {
-                    if attention_mask_array[[batch_idx, seq_idx]] == 0 {
-                        continue;
-                    }
-
-                    let token_id = inputs_ids_array[[batch_idx, seq_idx]];
-                    if SPECIAL_TOKENS.contains(&token_id) {
-                        continue;
-                    }
-
-                    let weight = sparse_view[[batch_idx, seq_idx, 0]];
-                    if weight > 0.0 {
-                        token_weights
-                            .entry(token_id as usize)
-                            .and_modify(|w| *w = w.max(weight))
-                            .or_insert(weight);
-                    }
-                }
-
-                let mut indices: Vec<_> = token_weights.keys().copied().collect();
-                indices.sort_unstable();
-                let values: Vec<_> = indices.iter().map(|i| token_weights[i]).collect();
-
-                all_sparse.push(SparseEmbedding { values, indices });
-            }
-
-            // ColBERT vecs
-            let colbert_output = &outputs[2];
-            let (colbert_shape, colbert_data) = colbert_output
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::TensorExtraction(e.to_string()))?;
-            let colbert_shape: Vec<usize> = colbert_shape.iter().map(|&d| d as usize).collect();
-            if colbert_shape.len() != 3
-                || colbert_shape[0] != current_batch_size
-                || colbert_shape[1] >= encoding_length
-            {
-                return Err(Error::Other(format!(
-                    "BGE-M3 colbert output must be [{current_batch_size}, seq_len - 1, dim] with seq_len - 1 < {encoding_length}, got shape {colbert_shape:?}"
-                )));
-            }
-            let colbert_view =
-                ndarray::ArrayViewD::from_shape(colbert_shape.as_slice(), colbert_data)
-                    .map_err(|e| Error::InvalidShape(e.to_string()))?;
-
-            // Shape of colbert_view is [batch_size, seq_len - 1, 1024]
-            let colbert_seq_len = colbert_shape[1]; // seq_len - 1
-
-            for batch_idx in 0..current_batch_size {
-                let mut doc_colbert = Vec::new();
-                for seq_idx in 0..colbert_seq_len {
-                    if attention_mask_array[[batch_idx, seq_idx + 1]] == 1 {
-                        let token_vector = colbert_view.slice(ndarray::s![batch_idx, seq_idx, ..]);
-                        doc_colbert.push(token_vector.to_vec());
-                    }
-                }
-                all_colbert.push(doc_colbert);
-            }
+            let colbert = output_view(&outputs[2])?;
+            all_colbert.extend(colbert_vectors(&colbert, &encoded.attention_mask)?);
         }
 
         Ok(Bgem3EmbeddingOutput {
@@ -296,5 +209,207 @@ impl Bgem3Embedding {
             sparse: all_sparse,
             colbert: all_colbert,
         })
+    }
+}
+
+fn output_view<'a>(output: &'a ort::value::DynValue) -> Result<ArrayViewD<'a, f32>> {
+    let (shape, data) = output
+        .try_extract_tensor::<f32>()
+        .map_err(|e| Error::TensorExtraction(e.to_string()))?;
+    let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    ArrayViewD::from_shape(shape, data).map_err(|e| Error::InvalidShape(e.to_string()))
+}
+
+/// One dense vector per text.
+fn dense_vectors(dense: &ArrayViewD<f32>, texts: usize) -> Result<Vec<Vec<f32>>> {
+    let vectors: Vec<Vec<f32>> = dense.rows().into_iter().map(|row| row.to_vec()).collect();
+    if vectors.len() != texts {
+        return Err(Error::Other(format!(
+            "BGE-M3 dense output must have one row per text, got shape {:?} for {texts} texts",
+            dense.shape()
+        )));
+    }
+    Ok(vectors)
+}
+
+/// Per text, the largest positive weight of each token id, special tokens left out.
+fn sparse_embeddings(
+    sparse: &ArrayViewD<f32>,
+    input_ids: &Array2<i64>,
+    attention_mask: &Array2<i64>,
+) -> Result<Vec<SparseEmbedding>> {
+    // Special tokens to skip: XLM-RoBERTa: CLS=0, PAD=1, EOS=2, UNK=3
+    const SPECIAL_TOKENS: [i64; 4] = [0, 1, 2, 3];
+
+    let shape = sparse.shape();
+    if shape.len() != 3 {
+        return Err(Error::Other(format!(
+            "BGE-M3 sparse output must be rank-3 [batch, seq_len, 1], got shape {shape:?}"
+        )));
+    }
+    let (batch_size, encoding_length) = input_ids.dim();
+
+    (0..batch_size)
+        .map(|batch_idx| {
+            let mut token_weights: HashMap<usize, f32> = HashMap::new();
+            for seq_idx in 0..encoding_length {
+                if attention_mask[[batch_idx, seq_idx]] == 0 {
+                    continue;
+                }
+
+                let token_id = input_ids[[batch_idx, seq_idx]];
+                if SPECIAL_TOKENS.contains(&token_id) {
+                    continue;
+                }
+
+                let weight = *sparse.get([batch_idx, seq_idx, 0]).ok_or_else(|| {
+                    Error::Other(format!(
+                        "BGE-M3 sparse output of shape {shape:?} has no weight for token {seq_idx} of text {batch_idx}"
+                    ))
+                })?;
+                if weight > 0.0 {
+                    token_weights
+                        .entry(token_id as usize)
+                        .and_modify(|w| *w = w.max(weight))
+                        .or_insert(weight);
+                }
+            }
+
+            let mut indices: Vec<_> = token_weights.keys().copied().collect();
+            indices.sort_unstable();
+            let values: Vec<_> = indices.iter().map(|i| token_weights[i]).collect();
+
+            Ok(SparseEmbedding { values, indices })
+        })
+        .collect()
+}
+
+/// Per text, the ColBERT vectors of its unmasked tokens after the first.
+fn colbert_vectors(
+    colbert: &ArrayViewD<f32>,
+    attention_mask: &Array2<i64>,
+) -> Result<Vec<Vec<Vec<f32>>>> {
+    let shape = colbert.shape();
+    let (batch_size, encoding_length) = attention_mask.dim();
+    if shape.len() != 3 || shape[1] >= encoding_length {
+        return Err(Error::Other(format!(
+            "BGE-M3 colbert output must be rank-3 [batch, seq_len - 1, dim] with seq_len - 1 < {encoding_length}, got shape {shape:?}"
+        )));
+    }
+    // Shape of colbert is [batch_size, seq_len - 1, 1024]
+    let colbert_seq_len = shape[1];
+
+    (0..batch_size)
+        .map(|batch_idx| {
+            let mut doc_colbert = Vec::new();
+            for seq_idx in 0..colbert_seq_len {
+                if attention_mask[[batch_idx, seq_idx + 1]] == 1 {
+                    if batch_idx >= shape[0] {
+                        return Err(Error::Other(format!(
+                            "BGE-M3 colbert output of shape {shape:?} has no vectors for text {batch_idx}"
+                        )));
+                    }
+                    let token_vector = colbert.slice(ndarray::s![batch_idx, seq_idx, ..]);
+                    doc_colbert.push(token_vector.to_vec());
+                }
+            }
+            Ok(doc_colbert)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{arr2, Array1, Array2, Array3};
+
+    #[test]
+    fn dense_vectors_takes_one_row_per_text() {
+        let flat = Array2::from_shape_vec((2, 3), (0..6).map(|v| v as f32).collect()).unwrap();
+        let rows = dense_vectors(&flat.view().into_dyn(), 2).unwrap();
+        assert_eq!(rows, [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]);
+
+        // Shapes 7.7.0 read one row per text from.
+        let nested = Array3::<f32>::zeros((2, 1, 3)).into_dyn();
+        assert_eq!(dense_vectors(&nested.view(), 2).unwrap().len(), 2);
+        let single = Array1::<f32>::zeros(3).into_dyn();
+        assert_eq!(dense_vectors(&single.view(), 1).unwrap().len(), 1);
+
+        let per_token = Array3::<f32>::zeros((2, 4, 3)).into_dyn();
+        assert!(dense_vectors(&per_token.view(), 2).is_err());
+    }
+
+    #[test]
+    fn sparse_embeddings_keeps_the_largest_positive_weight_per_token() {
+        // <s>=0 and </s>=2 are special, 1 is padding.
+        let input_ids = arr2(&[[0i64, 9, 7, 9, 2], [0, 7, 2, 1, 1]]);
+        let attention_mask = arr2(&[[1i64, 1, 1, 1, 1], [1, 1, 1, 0, 0]]);
+        let sparse = Array3::from_shape_vec(
+            (2, 5, 1),
+            vec![5.0, 0.2, -0.1, 0.6, 5.0, 5.0, 0.3, 5.0, 9.0, 9.0],
+        )
+        .unwrap()
+        .into_dyn();
+
+        let out = sparse_embeddings(&sparse.view(), &input_ids, &attention_mask).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].indices, [9]);
+        assert_eq!(out[0].values, [0.6]);
+        assert_eq!(out[1].indices, [7]);
+        assert_eq!(out[1].values, [0.3]);
+    }
+
+    #[test]
+    fn sparse_embeddings_errors_where_a_token_has_no_weight() {
+        let input_ids = arr2(&[[0i64, 9, 2], [0, 7, 2]]);
+        let attention_mask = arr2(&[[1i64, 1, 1], [1, 1, 1]]);
+
+        let rank2 = Array2::<f32>::zeros((2, 3)).into_dyn();
+        assert!(sparse_embeddings(&rank2.view(), &input_ids, &attention_mask).is_err());
+        let one_text = Array3::<f32>::zeros((1, 3, 1)).into_dyn();
+        assert!(sparse_embeddings(&one_text.view(), &input_ids, &attention_mask).is_err());
+        let no_width = Array3::<f32>::zeros((2, 3, 0)).into_dyn();
+        assert!(sparse_embeddings(&no_width.view(), &input_ids, &attention_mask).is_err());
+
+        // The last token has no weight, and it is special, so nothing is read there.
+        let last_token_missing = Array3::<f32>::ones((2, 2, 1)).into_dyn();
+        let out =
+            sparse_embeddings(&last_token_missing.view(), &input_ids, &attention_mask).unwrap();
+        assert_eq!(out[0].indices, [9]);
+        // Rows and positions past the input are left unread, as before.
+        let larger = Array3::<f32>::ones((3, 6, 2)).into_dyn();
+        assert!(sparse_embeddings(&larger.view(), &input_ids, &attention_mask).is_ok());
+    }
+
+    #[test]
+    fn colbert_vectors_takes_the_unmasked_tokens_after_the_first() {
+        let attention_mask = arr2(&[[1i64, 1, 1], [1, 1, 0]]);
+        let colbert = Array3::from_shape_vec((2, 2, 2), (0..8).map(|v| v as f32).collect())
+            .unwrap()
+            .into_dyn();
+
+        let out = colbert_vectors(&colbert.view(), &attention_mask).unwrap();
+        assert_eq!(out[0], [[0.0, 1.0], [2.0, 3.0]]);
+        assert_eq!(out[1], [[4.0, 5.0]]);
+    }
+
+    #[test]
+    fn colbert_vectors_errors_on_shapes_it_cannot_read() {
+        let attention_mask = arr2(&[[1i64, 1, 1], [1, 1, 0]]);
+
+        let rank2 = Array2::<f32>::zeros((2, 2)).into_dyn();
+        assert!(colbert_vectors(&rank2.view(), &attention_mask).is_err());
+        let full_length = Array3::<f32>::zeros((2, 3, 2)).into_dyn();
+        assert!(colbert_vectors(&full_length.view(), &attention_mask).is_err());
+        let one_text = Array3::<f32>::zeros((1, 2, 2)).into_dyn();
+        assert!(colbert_vectors(&one_text.view(), &attention_mask).is_err());
+        // An extra row is left unread, as before.
+        let larger = Array3::<f32>::zeros((3, 2, 2)).into_dyn();
+        assert_eq!(
+            colbert_vectors(&larger.view(), &attention_mask)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
