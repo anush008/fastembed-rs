@@ -1748,7 +1748,7 @@ fn token_prefix(text: &str, limit: usize) -> &str {
 }
 
 /// High-level embedding wrapper around [`Qwen3Model`] that handles tokenization,
-/// batching, mean-pooling, and L2-normalization.
+/// batching, last-token pooling, and L2-normalization.
 pub struct Qwen3TextEmbedding {
     model: Qwen3Model,
     tokenizer: tokenizers::Tokenizer,
@@ -1757,8 +1757,23 @@ pub struct Qwen3TextEmbedding {
 }
 
 impl Qwen3TextEmbedding {
-    /// Build from an already loaded model and tokenizer.
-    pub fn new(model: Qwen3Model, tokenizer: tokenizers::Tokenizer) -> Self {
+    /// Build from an already loaded model and tokenizer. The tokenizer is set to pad on the
+    /// left, which keeps the last token of each text at the position the pooling reads.
+    pub fn new(model: Qwen3Model, mut tokenizer: tokenizers::Tokenizer) -> Self {
+        use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy};
+
+        let padding = match tokenizer.get_padding() {
+            Some(padding) => PaddingParams {
+                direction: PaddingDirection::Left,
+                ..padding.clone()
+            },
+            None => PaddingParams {
+                strategy: PaddingStrategy::BatchLongest,
+                direction: PaddingDirection::Left,
+                ..Default::default()
+            },
+        };
+        tokenizer.with_padding(Some(padding));
         Self {
             model,
             tokenizer,
@@ -1998,6 +2013,13 @@ impl Qwen3TextEmbedding {
         let mut attention_mask_vec: Vec<f32> = Vec::with_capacity(batch_size * seq_len);
 
         for (i, enc) in encodings.iter().enumerate() {
+            if enc.len() != seq_len {
+                return Err(candle_core::Error::Msg(format!(
+                    "text {i} has {} tokens and text 0 has {seq_len}: the tokenizer does not pad \
+                     to the longest text",
+                    enc.len()
+                )));
+            }
             if enc.get_attention_mask().iter().all(|&m| m == 0) {
                 return Err(candle_core::Error::Msg(format!("text {i} has no tokens")));
             }
@@ -3062,6 +3084,10 @@ mod tests {
             .filter(|t| super::token_prefix(t, limit).len() < t.len())
             .count();
         assert!(prefixed >= 8, "only {prefixed} texts were cut");
+        let kept = tokenizer
+            .encode(super::token_prefix(&texts[0], limit), true)
+            .unwrap();
+        assert!(!kept.get_overflowing().is_empty(), "no prefix was kept");
         let dashes = texts[10].as_str();
         let prefix = super::token_prefix(dashes, limit);
         assert!(prefix.len() < dashes.len());
@@ -3170,10 +3196,66 @@ mod tests {
         }
         // Different texts give different vectors, so a mixed-up order would show.
         assert_ne!(together[0], together[1]);
-        // One padded batch (today's `embed`) does not give a text its vector alone bit for bit.
+        // One padded batch (`embed_padded`) does not give a text its vector alone bit for bit.
         let padded = model.embed_padded(&texts).unwrap();
         let alone = model.embed(&texts[1..2]).unwrap();
         assert_ne!(padded[1], alone[0], "padding changed nothing");
+    }
+
+    #[test]
+    fn new_sets_the_tokenizer_to_pad_on_the_left() {
+        let texts = ["w1 w2 w3", "w4 w5", "w6 w7 w8 w9"];
+        let mut right_padded = word_tokenizer();
+        right_padded.with_padding(Some(tokenizers::PaddingParams::default()));
+        let mut unpadded = word_tokenizer();
+        unpadded.with_padding(None);
+
+        for tokenizer in [right_padded, unpadded] {
+            let model = super::Qwen3TextEmbedding::new(
+                random_model(
+                    small_config(),
+                    2,
+                    &candle_core::Device::Cpu,
+                    candle_core::DType::F32,
+                ),
+                tokenizer,
+            );
+            let together = model.embed(&texts).unwrap();
+            let padded = model.embed_padded(&texts).unwrap();
+            for (i, text) in texts.iter().enumerate() {
+                let alone = &model.embed(&[*text]).unwrap()[0];
+                for (name, batched) in [("embed", &together[i]), ("embed_padded", &padded[i])] {
+                    let diff = batched
+                        .iter()
+                        .zip(alone)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(diff < 1e-4, "{name}: text {i} differs from alone by {diff}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embed_padded_refuses_rows_of_different_lengths() {
+        let mut tokenizer = word_tokenizer();
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::Fixed(2),
+            ..Default::default()
+        }));
+        let model = super::Qwen3TextEmbedding::new(
+            random_model(
+                small_config(),
+                2,
+                &candle_core::Device::Cpu,
+                candle_core::DType::F32,
+            ),
+            tokenizer,
+        );
+        // Rows of 3, 2 and 4 tokens hold as many ids as three rows of 3.
+        let err = model.embed_padded(&["w1 w2 w3", "w4 w5", "w6 w7 w8 w9"]);
+        assert!(err.unwrap_err().to_string().contains("does not pad"));
+        assert_eq!(model.embed(&["w1 w2 w3", "w4 w5"]).unwrap().len(), 2);
     }
 
     #[test]
