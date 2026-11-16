@@ -282,7 +282,11 @@ let model = Qwen3TextEmbedding::from_hf(
 // Text-only usage with the Qwen3-VL embedding checkpoint is also supported:
 // let model = Qwen3TextEmbedding::from_hf("Qwen/Qwen3-VL-Embedding-2B", &device, DType::F32, 512)?;
 
-let embeddings = model.embed(&["query: ...", "passage: ..."])?;
+// A query carries its task instruction, and a document goes in as it is.
+let embeddings = model.embed(&[
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:What is the capital of China?",
+    "The capital of China is Beijing.",
+])?;
 println!("Embeddings length: {}", embeddings.len());
 ```
 
@@ -322,7 +326,11 @@ let model = Qwen3TextEmbedding::from_hf_gguf(
     512,
 )?;
 
-let embeddings = model.embed(&["query: ...", "passage: ..."])?;
+// A query carries its task instruction, and a document goes in as it is.
+let embeddings = model.embed(&[
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:What is the capital of China?",
+    "The capital of China is Beijing.",
+])?;
 println!("Embeddings length: {}", embeddings.len());
 ```
 
