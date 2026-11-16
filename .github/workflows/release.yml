@@ -11,6 +11,8 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+      id-token: write
+    environment: release 
     steps:
       - name: "☁️ checkout repository"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -19,13 +21,23 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26.13.1
 
       - name: "🔧 setup Bun"
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version: 1.4.4
 
       - name: "📦 install dependencies"
-        run: bun install -D @semantic-release/git conventional-changelog-conventionalcommits@8 semantic-release-cargo
+        run: >-
+          bun install -D --exact
+          semantic-release@26.0.1
+          @semantic-release/commit-analyzer@13.0.1
+          @semantic-release/release-notes-generator@14.1.1
+          @semantic-release/github@12.0.11
+          @semantic-release/git@11.0.1
+          conventional-changelog-conventionalcommits@8.0.0
+          semantic-release-cargo@2.4.2
 
       - name: Get Author Name and Email
         id: author_info
@@ -41,11 +53,15 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
   
+      - name: "🔑 crates.io trusted publishing"
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
       - name: "Semantic release🚀"
         id: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
           GIT_COMMITTER_NAME: "github-actions[bot]"
           GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
           GIT_AUTHOR_NAME: ${{ steps.author_info.outputs.AUTHOR_NAME }}
