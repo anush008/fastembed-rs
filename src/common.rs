@@ -168,20 +168,41 @@ pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<T
     feature = "bert-text"
 ))]
 pub(crate) fn truncation_to(tokenizer: &Tokenizer, max_length: usize) -> Result<TruncationParams> {
-    use tokenizers::PostProcessor;
-
-    let special_tokens = tokenizer
-        .get_post_processor()
-        .map_or(0, |p| p.added_tokens(false).max(p.added_tokens(true)));
-    if max_length < special_tokens {
-        return Err(Error::InvalidArgument(format!(
-            "max_length {max_length} is below the {special_tokens} special tokens the tokenizer adds"
-        )));
-    }
+    check_special_tokens(tokenizer, max_length, false)?;
     Ok(TruncationParams {
         max_length,
         ..Default::default()
     })
+}
+
+#[cfg(any(
+    feature = "onnx",
+    feature = "qwen3-text",
+    feature = "nomic-v2-moe",
+    feature = "bert-text"
+))]
+fn check_special_tokens(tokenizer: &Tokenizer, max_length: usize, pair: bool) -> Result<()> {
+    use tokenizers::PostProcessor;
+
+    let special_tokens = tokenizer
+        .get_post_processor()
+        .map_or(0, |p| p.added_tokens(pair));
+    if max_length < special_tokens {
+        let input = if pair { "pair" } else { "text" };
+        return Err(Error::InvalidArgument(format!(
+            "max_length {max_length} is below the {special_tokens} special tokens the tokenizer adds to a {input}"
+        )));
+    }
+    Ok(())
+}
+
+/// The pair-encoding counterpart of the check in `truncation_to`, for rerankers.
+#[cfg(feature = "onnx")]
+pub(crate) fn check_pair_truncation(tokenizer: &Tokenizer) -> Result<()> {
+    match tokenizer.get_truncation() {
+        Some(truncation) => check_special_tokens(tokenizer, truncation.max_length, true),
+        None => Ok(()),
+    }
 }
 
 /// Function can be called directly from the try_new_from_user_defined function (providing file bytes)
@@ -650,9 +671,18 @@ mod tests {
         let err = load_tokenizer(files.clone(), 1).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "error was: {err}");
 
-        let tokenizer = load_tokenizer(files, 3).unwrap();
+        let tokenizer = load_tokenizer(files.clone(), 2).unwrap();
         let encoding = tokenizer.encode("hello hello hello", true).unwrap();
-        assert_eq!(encoding.get_ids(), [0, 2, 1]);
+        assert_eq!(encoding.get_ids(), [0, 1]);
+        assert!(matches!(
+            check_pair_truncation(&tokenizer),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        let tokenizer = load_tokenizer(files, 3).unwrap();
+        assert!(check_pair_truncation(&tokenizer).is_ok());
+        let encoding = tokenizer.encode(("hello hello", "hello"), true).unwrap();
+        assert_eq!(encoding.get_ids(), [0, 1, 1]);
     }
 
     #[test]

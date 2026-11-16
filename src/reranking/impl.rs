@@ -1,11 +1,13 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    common::{encode_batch, init_session_builder, load_tokenizer, Error, Result},
+    common::{
+        check_pair_truncation, encode_batch, init_session_builder, load_tokenizer, Error, Result,
+    },
     models::reranking::reranker_model_list,
     RerankerModel, RerankerModelInfo,
 };
-use ndarray::s;
+use ndarray::{s, ArrayViewD};
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
@@ -86,6 +88,7 @@ impl TextRerank {
         .commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
+        check_pair_truncation(&tokenizer)?;
         Ok(Self::new(tokenizer, session))
     }
 
@@ -133,6 +136,7 @@ impl TextRerank {
         };
 
         let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
+        check_pair_truncation(&tokenizer)?;
         Ok(Self::new(tokenizer, session))
     }
 
@@ -157,7 +161,6 @@ impl TextRerank {
 
         let mut scores: Vec<f32> = Vec::with_capacity(documents.len());
         for batch in documents.chunks(batch_size) {
-            let scored = scores.len();
             let inputs = batch.iter().map(|d| (q, d.as_ref())).collect();
             let mut encoded = encode_batch(&self.tokenizer, inputs)?;
             let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
@@ -175,25 +178,7 @@ impl TextRerank {
                 .map_err(|e| {
                     Error::TensorExtraction(format!("Failed to extract logits tensor: {e}"))
                 })?;
-            match outputs.ndim() {
-                1 => scores.extend(outputs.iter().copied()),
-                2 if outputs.shape()[1] > 0 => {
-                    scores.extend(outputs.slice(s![.., 0]).iter().copied())
-                }
-                _ => {
-                    return Err(Error::InvalidShape(format!(
-                        "Expected logits of shape [batch] or [batch, 1], got {:?}",
-                        outputs.shape()
-                    )))
-                }
-            }
-            if scores.len() != scored + batch.len() {
-                return Err(Error::InvalidShape(format!(
-                    "Expected one score per document, got logits of shape {:?} for {} documents",
-                    outputs.shape(),
-                    batch.len()
-                )));
-            }
+            scores.extend(logits_to_scores(&outputs, batch.len())?);
         }
 
         // Return top_n_result of type Vec<RerankResult> ordered by score in descending order, don't use binary heap
@@ -208,5 +193,53 @@ impl TextRerank {
             .collect();
         top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());
         Ok(top_n_result)
+    }
+}
+
+/// One score per document from `[batch]` or `[batch, 1]` logits.
+fn logits_to_scores(logits: &ArrayViewD<f32>, documents: usize) -> Result<Vec<f32>> {
+    let scores: Vec<f32> = match logits.shape() {
+        [_] => logits.iter().copied().collect(),
+        [_, width] if *width > 0 => logits.slice(s![.., 0]).iter().copied().collect(),
+        shape => {
+            return Err(Error::InvalidShape(format!(
+                "Expected logits of shape [batch] or [batch, 1], got {shape:?}"
+            )))
+        }
+    };
+    if scores.len() != documents {
+        return Err(Error::InvalidShape(format!(
+            "Expected one score per document, got logits of shape {:?} for {documents} documents",
+            logits.shape()
+        )));
+    }
+    Ok(scores)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{arr1, arr2, Array3};
+
+    #[test]
+    fn logits_to_scores_takes_batch_and_batch_by_one() {
+        let flat = arr1(&[0.5f32, -1.0]).into_dyn();
+        assert_eq!(logits_to_scores(&flat.view(), 2).unwrap(), [0.5, -1.0]);
+        let column = arr2(&[[0.5f32], [-1.0]]).into_dyn();
+        assert_eq!(logits_to_scores(&column.view(), 2).unwrap(), [0.5, -1.0]);
+        let wide = arr2(&[[0.5f32, 9.0], [-1.0, 9.0]]).into_dyn();
+        assert_eq!(logits_to_scores(&wide.view(), 2).unwrap(), [0.5, -1.0]);
+    }
+
+    #[test]
+    fn logits_to_scores_rejects_other_shapes() {
+        let rank3 = Array3::<f32>::zeros((2, 1, 1)).into_dyn();
+        assert!(logits_to_scores(&rank3.view(), 2).is_err());
+        let scalar = ndarray::arr0(1f32).into_dyn();
+        assert!(logits_to_scores(&scalar.view(), 1).is_err());
+        let empty_width = ndarray::Array2::<f32>::zeros((2, 0)).into_dyn();
+        assert!(logits_to_scores(&empty_width.view(), 2).is_err());
+        let short = arr1(&[0.5f32]).into_dyn();
+        assert!(logits_to_scores(&short.view(), 2).is_err());
     }
 }
