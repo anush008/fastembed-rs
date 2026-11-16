@@ -6,7 +6,7 @@
 
 ## Features
 
-- Supports synchronous usage. No dependency on Tokio.
+- Supports synchronous usage. No Tokio runtime needed.
 - Uses [@pykeio/ort](https://github.com/pykeio/ort) for performant ONNX inference.
 - Uses [@huggingface/tokenizers](https://github.com/huggingface/tokenizers) for fast encodings.
 
@@ -31,7 +31,7 @@
 - [**sentence-transformers/all-MiniLM-L6-v2**](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
 - [**sentence-transformers/all-MiniLM-L12-v2**](https://huggingface.co/sentence-transformers/all-MiniLM-L12-v2)
 - [**sentence-transformers/all-mpnet-base-v2**](https://huggingface.co/sentence-transformers/all-mpnet-base-v2)
-- [**sentence-transformers/paraphrase-MiniLM-L12-v2**](https://huggingface.co/sentence-transformers/paraphrase-MiniLM-L12-v2)
+- [**sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2**](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
 - [**sentence-transformers/paraphrase-multilingual-mpnet-base-v2**](https://huggingface.co/sentence-transformers/paraphrase-multilingual-mpnet-base-v2)
 - [**nomic-ai/nomic-embed-text-v1**](https://huggingface.co/nomic-ai/nomic-embed-text-v1)
 - [**nomic-ai/nomic-embed-text-v1.5**](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) - pairs with `nomic-embed-vision-v1.5` for image-to-text search
@@ -161,7 +161,9 @@ let documents = vec![
     "fastembed-rs is licensed under Apache 2.0"
 ];
 
-// Generate embeddings with the default batch size, 256
+// Generate embeddings with the default batch size, 256.
+// This model emits one score per vocabulary entry per token.
+// So keep the batch size small for long documents.
 let embeddings: Vec<SparseEmbedding> = model.embed(documents, None)?;
 ```
 
@@ -178,7 +180,7 @@ let mut model = ImageEmbedding::try_new(
     ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32).with_show_download_progress(true),
 )?;
 
-let images = vec!["assets/image_0.png", "assets/image_1.png"];
+let images = vec!["tests/assets/image_0.png", "tests/assets/image_1.png"];
 
 // Generate embeddings with the default batch size, 256
 let embeddings = model.embed(images, None)?;
@@ -261,6 +263,8 @@ Qwen3 embedding models are available behind the `qwen3` feature flag (candle bac
 ```toml
 [dependencies]
 fastembed = { version = "7", features = ["qwen3"] }
+# The candle version that fastembed uses, for `Device` and `DType`.
+candle-core = "0.11"
 ```
 
 ```rust
@@ -329,6 +333,7 @@ The [nomic-embed-text-v2-moe](https://huggingface.co/nomic-ai/nomic-embed-text-v
 ```toml
 [dependencies]
 fastembed = { version = "7", features = ["nomic-v2-moe"] }
+candle-core = "0.11"
 ```
 
 ```rust
@@ -354,6 +359,7 @@ BERT-family encoders are available behind the `bert-text` feature flag (candle b
 ```toml
 [dependencies]
 fastembed = { version = "7", features = ["bert-text"] }
+candle-core = "0.11"
 ```
 
 ```rust
@@ -413,6 +419,8 @@ println!("Sparse non-zero tokens: {}", sparse_emb.indices.len());
 println!("ColBERT token count: {}", output.colbert[0].len());
 ```
 
+`Bgem3Model::BGEM3Q` is dynamically quantized, so the vectors of a text vary slightly with the other texts in its batch.
+
 ## Model cache
 
 Models download on first use and load from cache afterwards (no network needed at runtime once cached).
@@ -429,6 +437,8 @@ To run models on a GPU via DirectML on Windows, enable the `directml` feature:
 ```toml
 [dependencies]
 fastembed = { version = "7", features = ["directml"] }
+# The ort version that fastembed uses, for the execution provider.
+ort = "=2.0.0-rc.15"
 ```
 
 Then pass a DirectML execution provider when initializing a model:
@@ -462,7 +472,7 @@ let model = TextEmbedding::try_new(
 
 ## Error handling
 
-Fastembed returns a typed [`fastembed::Error`](https://docs.rs/fastembed/latest/fastembed/enum.Error.html). The type is re-exported from the crate root. The enum is `#[non_exhaustive]`. New variants can be added in minor releases without breaking `match` arms.
+The ONNX models return a typed [`fastembed::Error`](https://docs.rs/fastembed/latest/fastembed/enum.Error.html). The type is re-exported from the crate root. The enum is `#[non_exhaustive]`. New variants can be added in minor releases without breaking `match` arms. The candle models return `candle_core::Error`.
 
 ```rust
 use fastembed::{Error, Result, TextEmbedding};
