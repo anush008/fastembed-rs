@@ -58,30 +58,7 @@ fn default_resize(
             image.height()
         )));
     }
-    // An allocation that fails aborts the process, so both are tried first.
-    if !can_allocate(&buffers) {
-        return Err(Error::ImageTransform(format!(
-            "Not enough memory to resize a {}x{} image to {width}x{height}",
-            image.width(),
-            image.height()
-        )));
-    }
     Ok(image.resize_exact(width, height, filter))
-}
-
-/// Whether buffers of these sizes can be allocated at the same time.
-fn can_allocate(sizes: &[u64]) -> bool {
-    let mut held = Vec::with_capacity(sizes.len());
-    for &size in sizes {
-        let mut buffer = Vec::<u8>::new();
-        let reserved =
-            usize::try_from(size).is_ok_and(|size| buffer.try_reserve_exact(size).is_ok());
-        if !reserved {
-            return false;
-        }
-        held.push(buffer);
-    }
-    true
 }
 
 pub trait Transform: Send + Sync {
@@ -553,14 +530,6 @@ mod tests {
             .image()
             .unwrap();
         assert_eq!(out.dimensions(), (224, 6720));
-    }
-
-    #[test]
-    fn an_allocation_that_fails_is_seen_before_the_resize() {
-        // No allocator gives out this many bytes, so nothing is allocated here.
-        assert!(!can_allocate(&[16, u64::MAX]));
-        assert!(can_allocate(&[16, 1024]));
-        assert!(can_allocate(&[]));
     }
 
     #[test]

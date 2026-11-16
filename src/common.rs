@@ -472,6 +472,10 @@ fn wait_for_download<T>(
         let mut idle = 0;
         while partial_size.is_some() && idle < STALLED_AFTER_PAUSES {
             pause();
+            // A caller that came late may be downloading the file a second time.
+            if let Some(file) = cached() {
+                return Ok(file);
+            }
             idle = match partial_file_changed(&lock, &mut partial_size) {
                 true => 0,
                 false => idle + 1,
@@ -1052,9 +1056,27 @@ pub(crate) mod tests {
                 }
             },
         );
-        std::fs::remove_dir_all(&blobs).unwrap();
         assert_eq!(result.unwrap(), "model.onnx");
         assert_eq!((tries, pauses), (2, 64));
+
+        // A second download of the file keeps the lock and a partial file. The first one put
+        // the file in the cache, and the load takes it from there.
+        std::fs::write(&partial, [0; 3]).unwrap();
+        let (mut tries, pauses) = (0, std::cell::Cell::new(0));
+        let result = wait_for_download(
+            || {
+                tries += 1;
+                fetch()
+            },
+            || (pauses.get() == 3).then_some("model.onnx"),
+            || {
+                pauses.set(pauses.get() + 1);
+                std::fs::write(&partial, vec![0; 3 + pauses.get()]).unwrap();
+            },
+        );
+        std::fs::remove_dir_all(&blobs).unwrap();
+        assert_eq!(result.unwrap(), "model.onnx");
+        assert_eq!((tries, pauses.get()), (1, 3));
     }
 
     #[cfg(feature = "hf-hub")]

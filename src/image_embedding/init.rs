@@ -242,14 +242,16 @@ mod tests {
             // PIL's box filter has no counterpart in the image crate.
             (r#""resample": 4,"#, FilterType::CatmullRom),
         ] {
-            for processor in [
-                "CLIPImageProcessor",
-                "BitImageProcessor",
-                "ConvNextImageProcessor",
+            // ConvNext resizes to the exact size from a shortest edge of 384 on.
+            for (processor, shortest_edge) in [
+                ("CLIPImageProcessor", 4),
+                ("BitImageProcessor", 4),
+                ("ConvNextImageProcessor", 4),
+                ("ConvNextImageProcessor", 384),
             ] {
                 let config = format!(
                     r#"{{"image_processor_type": "{processor}", {resample}
-                        "do_resize": true, "size": {{"shortest_edge": 4}}}}"#
+                        "do_resize": true, "size": {{"shortest_edge": {shortest_edge}}}}}"#
                 );
                 let calls = Arc::new(AtomicUsize::new(0));
                 let observed = Arc::clone(&calls);
@@ -260,7 +262,11 @@ mod tests {
                         Ok(image)
                     });
                 preprocessor.preprocess(RgbImage::new(8, 8).into()).unwrap();
-                assert_eq!(calls.load(Ordering::Relaxed), 1, "{processor} {resample}");
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    1,
+                    "{processor} {shortest_edge} {resample}"
+                );
             }
         }
     }
