@@ -11,7 +11,6 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-      # crates.io trusted publishing exchanges the job's OIDC token for a temporary token.
       id-token: write
     steps:
       - name: "☁️ checkout repository"
@@ -29,8 +28,6 @@ jobs:
           bun-version: 1.4.4
 
       - name: "📦 install dependencies"
-        # Exact versions, so that a new release of a tool cannot break the release job.
-        # semantic-release 26 needs Node.js 26.13 or later.
         run: >-
           bun install -D --exact
           semantic-release@26.0.1
@@ -55,7 +52,6 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
   
-      # A crates.io token that is valid for 30 minutes. The step revokes it when the job ends.
       - name: "🔑 crates.io trusted publishing"
         id: crates_io_auth
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
