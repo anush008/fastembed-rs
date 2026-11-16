@@ -25,7 +25,8 @@
 //!
 //! Models download to `./.fastembed_cache` on first use, then load from there.
 //! Override the location with the `FASTEMBED_CACHE_DIR` env var or
-//! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both.
+//! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both, and models
+//! are cached directly in that directory.
 //! Set `HF_ENDPOINT` to pull from a mirror.
 //!
 // Without `onnx` the ONNX types above are not in the crate, so their links point at docs.rs.
@@ -82,17 +83,15 @@
 # fn embedding_demo() -> fastembed::Result<()> {
 # let mut model: TextEmbedding = TextEmbedding::try_new(Default::default())?;
  let documents = vec![
-    "passage: Hello, World!",
-    "query: Hello, World!",
-    "passage: This is an example passage.",
-    // You can leave out the prefix but it's recommended
+    "Hello, World!",
+    "This is an example passage.",
     "fastembed-rs is licensed under Apache 2.0"
     ];
 
  // Generate embeddings with the default batch size, 256
  let embeddings = model.embed(documents, None)?;
 
- println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 4
+ println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 3
  # Ok(())
  # }
  ```

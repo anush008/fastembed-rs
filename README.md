@@ -57,7 +57,7 @@
 - [**snowflake/snowflake-arctic-embed-m-long**](https://huggingface.co/snowflake/snowflake-arctic-embed-m-long)
 - [**snowflake/snowflake-arctic-embed-l**](https://huggingface.co/snowflake/snowflake-arctic-embed-l)
 
-Quantized versions are also available for several models above (append `Q` to the model enum variant, e.g., `EmbeddingModel::BGESmallENV15Q`). EmbeddingGemma additionally ships a 4-bit build as `EmbeddingModel::EmbeddingGemma300MQ4`.
+Quantized versions are also available for several models above (append `Q` to the model enum variant, e.g., `EmbeddingModel::AllMiniLML6V2Q`). The `Q` variants of the English BGE v1.5 models and of paraphrase-multilingual-MiniLM-L12-v2 are half-precision (fp16) models. EmbeddingGemma additionally ships a 4-bit build as `EmbeddingModel::EmbeddingGemma300MQ4`.
 
 </details>
 
@@ -127,17 +127,15 @@ let mut model = TextEmbedding::try_new(
 )?;
 
 let documents = vec![
-    "passage: Hello, World!",
-    "query: Hello, World!",
-    "passage: This is an example passage.",
-    // You can leave out the prefix but it's recommended
+    "Hello, World!",
+    "This is an example passage.",
     "fastembed-rs is licensed under Apache 2.0"
 ];
 
  // Generate embeddings with the default batch size, 256
  let embeddings = model.embed(documents, None)?;
 
- println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 4
+ println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 3
  println!("Embedding dimension: {}", embeddings[0].len()); // -> Embedding dimension: 384
 ```
 
@@ -155,9 +153,8 @@ let mut model = SparseTextEmbedding::try_new(
 )?;
 
 let documents = vec![
-    "passage: Hello, World!",
-    "query: Hello, World!",
-    "passage: This is an example passage.",
+    "Hello, World!",
+    "This is an example passage.",
     "fastembed-rs is licensed under Apache 2.0"
 ];
 
@@ -279,7 +276,8 @@ let model = Qwen3TextEmbedding::from_hf(
     512,
 )?;
 
-// Text-only usage with the Qwen3-VL embedding checkpoint is also supported:
+// Text-only usage with the Qwen3-VL embedding checkpoint is also supported. `embed` runs each
+// text as given, and `Qwen3VLEmbedding::embed_texts` adds the prompt of the model card.
 // let model = Qwen3TextEmbedding::from_hf("Qwen/Qwen3-VL-Embedding-2B", &device, DType::F32, 512)?;
 
 // A query carries its task instruction, and a document goes in as it is.
@@ -305,7 +303,7 @@ let model = Qwen3VLEmbedding::from_hf(
 )?;
 
 let image_embeddings = model.embed_images(&["tests/assets/image_0.png", "tests/assets/image_1.png"])?;
-let text_embeddings = model.embed_texts(&["query: blue cat", "query: red cat"])?;
+let text_embeddings = model.embed_texts(&["blue cat", "red cat"])?;
 
 println!("Image embeddings: {}", image_embeddings.len());
 println!("Text embeddings: {}", text_embeddings.len());
@@ -434,7 +432,7 @@ println!("ColBERT token count: {}", output.colbert[0].len());
 Models download on first use and load from cache afterwards (no network needed at runtime once cached).
 
 - `FASTEMBED_CACHE_DIR` — cache location (default: `.fastembed_cache`). Equivalent to `TextInitOptions::with_cache_dir`.
-- `HF_HOME` — if set, takes precedence over the above.
+- `HF_HOME` — if set, models are cached directly in this directory, and it takes precedence over the above.
 - `HF_ENDPOINT` — Hugging Face mirror base URL, for restricted networks.
 - `HF_TOKEN` — Hugging Face access token, for gated repositories and higher rate limits. Without it, the token saved by `huggingface-cli login` is used when present.
 
