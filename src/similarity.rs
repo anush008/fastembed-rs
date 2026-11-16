@@ -52,6 +52,8 @@ pub fn top_k<V: AsRef<[f32]>>(query: &[f32], corpus: &[V], k: usize) -> Vec<(usi
 /// Best score first. A `NaN` is no score, so it sorts last whatever its sign bit.
 pub(crate) fn by_score_descending(a: f32, b: f32) -> std::cmp::Ordering {
     match (a.is_nan(), b.is_nan()) {
+        // `total_cmp` puts -0.0 below 0.0, and the two are one score.
+        (false, false) if a == b => std::cmp::Ordering::Equal,
         (false, false) => b.total_cmp(&a),
         (a_nan, b_nan) => a_nan.cmp(&b_nan),
     }
@@ -104,6 +106,15 @@ mod tests {
         let hits = top_k(&[1.0, 0.0], &corpus, 6);
         let indices: Vec<usize> = hits.iter().map(|hit| hit.0).collect();
         assert_eq!(indices, [0, 3, 6, 9, 12, 15]);
+    }
+
+    #[test]
+    fn top_k_keeps_zero_scores_of_either_sign_in_corpus_order() {
+        let corpus = [[-0.0, -1.0], [0.0, 1.0], [-0.0, -1.0]];
+        let hits = top_k(&[1.0, 0.0], &corpus, 3);
+        assert!(hits[0].1.is_sign_negative() && hits[1].1.is_sign_positive());
+        let indices: Vec<usize> = hits.iter().map(|hit| hit.0).collect();
+        assert_eq!(indices, [0, 1, 2]);
     }
 
     #[test]
