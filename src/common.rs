@@ -7,7 +7,7 @@
         feature = "bert-text"
     )
 ))]
-use hf_hub::api::sync::{ApiBuilder, ApiRepo};
+use hf_hub::api::sync::{ApiBuilder, ApiError, ApiRepo};
 #[cfg(feature = "onnx")]
 use ndarray::Array2;
 #[cfg(feature = "onnx")]
@@ -142,7 +142,7 @@ pub struct TokenizerFiles {
 /// Loading tokenizer files from the Hugging Face Hub is separate from the main
 /// `load_tokenizer` function, which expects bytes from any source.
 #[cfg(all(feature = "onnx", feature = "hf-hub"))]
-pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<Tokenizer> {
+pub fn load_tokenizer_hf_hub(model_repo: HubRepo, max_length: usize) -> Result<Tokenizer> {
     let tokenizer_files: TokenizerFiles = TokenizerFiles {
         tokenizer_file: std::fs::read(model_repo.get("tokenizer.json")?)?,
         config_file: std::fs::read(&model_repo.get("config.json")?)?,
@@ -332,6 +332,7 @@ pub(crate) fn decode_image(
         .and_then(|reader| reader.with_guessed_format())
         .ok()
         .and_then(|reader| reader.decode().ok())
+        .filter(|image| image.width() > 0 && image.height() > 0)
         .ok_or(by_extension)
 }
 
@@ -362,7 +363,7 @@ pub fn pull_from_hf(
     model_name: String,
     default_cache_dir: PathBuf,
     show_download_progress: bool,
-) -> Result<ApiRepo> {
+) -> Result<HubRepo> {
     use std::env;
 
     let cache_dir = env::var("HF_HOME")
@@ -385,8 +386,94 @@ pub fn pull_from_hf(
         .build()
         .map_err(|e| Error::Other(format!("Failed to initialize HuggingFace API: {e}")))?;
 
-    let repo = api.model(model_name);
-    Ok(repo)
+    Ok(HubRepo(api.model(model_name)))
+}
+
+/// A model repository on the Hugging Face Hub.
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+pub struct HubRepo(ApiRepo);
+
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+impl HubRepo {
+    /// The path of `file` in the cache. The file is downloaded when it is not there.
+    ///
+    /// hf-hub returns an error for a file that another thread or process has been downloading
+    /// for five seconds. This waits while that download writes to disk, and then finds the
+    /// file in the cache.
+    pub fn get(&self, file: &str) -> std::result::Result<PathBuf, ApiError> {
+        wait_for_download(
+            || self.0.get(file),
+            || std::thread::sleep(std::time::Duration::from_secs(1)),
+        )
+    }
+}
+
+/// `fetch`, tried again when it fails on the lock of a download that writes to disk. `pause`
+/// is the wait between two looks at the partial file of that download.
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+fn wait_for_download<T>(
+    mut fetch: impl FnMut() -> std::result::Result<T, ApiError>,
+    mut pause: impl FnMut(),
+) -> std::result::Result<T, ApiError> {
+    let mut partial_size = None;
+    loop {
+        match fetch() {
+            Err(ApiError::LockAcquisition(lock))
+                if partial_file_changed(&lock, &mut partial_size) =>
+            {
+                // A finished download renames its partial file.
+                while partial_size.is_some() {
+                    pause();
+                    if !partial_file_changed(&lock, &mut partial_size) {
+                        break;
+                    }
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether the partial file of the download that holds `lock` changed since the last call.
+/// `size` keeps its length between calls, and starts as `None`.
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+fn partial_file_changed(lock: &std::path::Path, size: &mut Option<u64>) -> bool {
+    let current = std::fs::metadata(lock.with_extension("part"))
+        .map(|file| file.len())
+        .ok();
+    std::mem::replace(size, current) != current
 }
 
 /// An empty `HF_ENDPOINT` has no host to download from, so it means the default one. An empty
@@ -426,7 +513,7 @@ fn default_hf_token() -> Option<String> {
     }
     let has_home = (std::env::var_os("HOME").is_some()
         || std::env::var_os("USERPROFILE").is_some())
-        && std::env::home_dir().is_some_and(|home| !home.as_os_str().is_empty());
+        && std::env::home_dir().is_some();
     has_home.then(|| hf_hub::Cache::default().token()).flatten()
 }
 
@@ -452,7 +539,7 @@ fn hf_home_token(hf_home: &std::path::Path) -> Option<String> {
         feature = "bert-text"
     )
 ))]
-pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
+pub(crate) fn safetensors_weight_files(repo: &HubRepo) -> Result<Vec<PathBuf>> {
     const SINGLE_FILE: &str = "model.safetensors";
     const INDEX_FILE: &str = "model.safetensors.index.json";
 
@@ -480,6 +567,23 @@ pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
             })
         })
         .collect()
+}
+
+/// `err` as text, with the cause that its `Display` leaves out. The candle loaders carry
+/// errors as text.
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+pub(crate) fn error_with_cause(err: Error) -> String {
+    match std::error::Error::source(&err) {
+        Some(cause) => format!("{err}: {cause}"),
+        None => err.to_string(),
+    }
 }
 
 /// Shard file names of a safetensors index, each one a path inside the repo.
@@ -748,6 +852,8 @@ pub(crate) mod image_tests {
             ("empty.png", b""),
             ("png-magic.jpg", b"\x89PNG\r\n\x1a\nnot a png"),
             ("bmp-magic.png", b"BM but not a bitmap"),
+            // Decodes by content, to an image that is five pixels tall and none wide.
+            ("no-pixels.png", b"P6 0 5 255\n"),
         ] {
             let path = files.write(name, bytes);
             assert_eq!(
@@ -835,6 +941,93 @@ pub(crate) mod tests {
 
     #[cfg(feature = "hf-hub")]
     #[test]
+    fn a_download_in_progress_shows_in_its_partial_file() {
+        let blobs = std::env::temp_dir().join(format!("fastembed-blobs-{}", std::process::id()));
+        std::fs::create_dir_all(&blobs).unwrap();
+        let lock = blobs.join("0123abcd.lock");
+        let partial = blobs.join("0123abcd.part");
+
+        let mut size = None;
+        // No download has a partial file, so the lock error is final.
+        let none = partial_file_changed(&lock, &mut size);
+        std::fs::write(&partial, [0; 3]).unwrap();
+        let started = partial_file_changed(&lock, &mut size);
+        let stalled = partial_file_changed(&lock, &mut size);
+        std::fs::write(&partial, [0; 5]).unwrap();
+        let grew = partial_file_changed(&lock, &mut size);
+        // A finished download renames its partial file.
+        std::fs::remove_file(&partial).unwrap();
+        let finished = partial_file_changed(&lock, &mut size);
+        let gone = partial_file_changed(&lock, &mut size);
+        std::fs::remove_dir_all(&blobs).unwrap();
+
+        assert_eq!(
+            [none, started, stalled, grew, finished, gone],
+            [false, true, false, true, true, false]
+        );
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[test]
+    fn a_load_waits_for_a_download_that_writes_to_disk() {
+        let blobs = std::env::temp_dir().join(format!("fastembed-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&blobs).unwrap();
+        let lock = blobs.join("0123abcd.lock");
+        let partial = blobs.join("0123abcd.part");
+        // The other download holds the lock for as long as its partial file is there.
+        let fetch = || match partial.exists() {
+            true => Err(ApiError::LockAcquisition(lock.clone())),
+            false => Ok("model.onnx"),
+        };
+        let locked = || Err::<&str, _>(ApiError::LockAcquisition(lock.clone()));
+
+        // No partial file: nothing shows a download, and the lock error is final.
+        let (mut tries, mut pauses) = (0, 0);
+        let result = wait_for_download(
+            || {
+                tries += 1;
+                locked()
+            },
+            || pauses += 1,
+        );
+        assert!(matches!(result, Err(ApiError::LockAcquisition(_))));
+        assert_eq!((tries, pauses), (1, 0));
+
+        // A partial file that does not grow: one more try, then the lock error.
+        std::fs::write(&partial, [0; 3]).unwrap();
+        let (mut tries, mut pauses) = (0, 0);
+        let result = wait_for_download(
+            || {
+                tries += 1;
+                fetch()
+            },
+            || pauses += 1,
+        );
+        assert!(matches!(result, Err(ApiError::LockAcquisition(_))));
+        assert_eq!((tries, pauses), (2, 1));
+
+        // A partial file that grows three times and is then renamed: the next try succeeds.
+        let (mut tries, mut pauses) = (0, 0);
+        let result = wait_for_download(
+            || {
+                tries += 1;
+                fetch()
+            },
+            || {
+                pauses += 1;
+                match pauses {
+                    1..=3 => std::fs::write(&partial, vec![0; 3 + pauses]).unwrap(),
+                    _ => std::fs::remove_file(&partial).unwrap(),
+                }
+            },
+        );
+        std::fs::remove_dir_all(&blobs).unwrap();
+        assert_eq!(result.unwrap(), "model.onnx");
+        assert_eq!((tries, pauses), (2, 4));
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[test]
     fn hf_home_token_reads_the_token_file_in_hf_home() {
         let hf_home =
             std::env::temp_dir().join(format!("fastembed-hf-home-{}", std::process::id()));
@@ -889,6 +1082,27 @@ pub(crate) mod tests {
             assert!(err.to_string().contains(file), "error was: {err}");
         }
         assert!(shard_files(&serde_json::json!({}), "index").is_err());
+    }
+
+    #[cfg(all(
+        feature = "hf-hub",
+        any(
+            feature = "qwen3-text",
+            feature = "nomic-v2-moe",
+            feature = "bert-text"
+        )
+    ))]
+    #[test]
+    fn error_with_cause_adds_the_source_of_a_failed_download() {
+        let failed = Error::ModelRetrieval {
+            file: "model.safetensors".into(),
+            source: "status code 401".into(),
+        };
+        assert_eq!(
+            error_with_cause(failed),
+            "Failed to retrieve model file 'model.safetensors': status code 401"
+        );
+        assert_eq!(error_with_cause(Error::Other("plain".into())), "plain");
     }
 
     #[test]
@@ -1068,37 +1282,87 @@ pub(crate) mod tests {
         out
     }
 
+    const FLOAT: u8 = 1;
+    const INT64: u8 = 7;
+
+    /// A graph input or output: a tensor of `elem_type`, each dimension a size or `None` for
+    /// any size.
+    fn value_info(name: &str, elem_type: u8, dims: &[Option<u8>]) -> Vec<u8> {
+        let dims: Vec<u8> = dims
+            .iter()
+            .flat_map(|dim| match dim {
+                Some(size) => protobuf_bytes(1, &[0x08, *size]),
+                None => protobuf_bytes(1, &protobuf_bytes(2, b"any")),
+            })
+            .collect();
+        let tensor_type = protobuf_bytes(
+            1,
+            &[vec![0x08, elem_type], protobuf_bytes(2, &dims)].concat(),
+        );
+        [
+            protobuf_bytes(1, name.as_bytes()),
+            protobuf_bytes(2, &tensor_type),
+        ]
+        .concat()
+    }
+
+    /// An ONNX model of `graph`, with opset 17.
+    fn model_bytes(graph: &[u8]) -> Vec<u8> {
+        [
+            vec![0x08, 0x08],
+            protobuf_bytes(7, graph),
+            protobuf_bytes(8, &[0x10, 0x11]),
+        ]
+        .concat()
+    }
+
     /// A one-node ONNX model, `y = Relu(x)` over a float tensor of shape [1, 4].
     pub(crate) fn relu_model_bytes() -> Vec<u8> {
-        let value_info = |name: &str| {
-            let dim = |size: u8| protobuf_bytes(1, &[0x08, size]);
-            let shape = protobuf_bytes(2, &[dim(1), dim(4)].concat());
-            let tensor_type = protobuf_bytes(1, &[vec![0x08, 0x01], shape].concat());
-            [
-                protobuf_bytes(1, name.as_bytes()),
-                protobuf_bytes(2, &tensor_type),
-            ]
-            .concat()
-        };
         let node = [
             protobuf_bytes(1, b"x"),
             protobuf_bytes(2, b"y"),
             protobuf_bytes(4, b"Relu"),
         ]
         .concat();
-        let graph = [
-            protobuf_bytes(1, &node),
-            protobuf_bytes(2, b"relu"),
-            protobuf_bytes(11, &value_info("x")),
-            protobuf_bytes(12, &value_info("y")),
+        let shape = [Some(1), Some(4)];
+        model_bytes(
+            &[
+                protobuf_bytes(1, &node),
+                protobuf_bytes(2, b"relu"),
+                protobuf_bytes(11, &value_info("x", FLOAT, &shape)),
+                protobuf_bytes(12, &value_info("y", FLOAT, &shape)),
+            ]
+            .concat(),
+        )
+    }
+
+    /// A one-node ONNX text model, `y = Cast(input_ids)` to float: each text embeds to its
+    /// own token ids. With `tokens`, the model takes only rows of that many tokens.
+    pub(crate) fn token_ids_model_bytes(tokens: Option<u8>) -> Vec<u8> {
+        // The attribute `to = FLOAT`.
+        let to_float = [
+            protobuf_bytes(1, b"to"),
+            vec![0x18, FLOAT, 0xa0, 0x01, 0x02],
         ]
         .concat();
-        [
-            vec![0x08, 0x08],
-            protobuf_bytes(7, &graph),
-            protobuf_bytes(8, &[0x10, 0x11]),
+        let node = [
+            protobuf_bytes(1, b"input_ids"),
+            protobuf_bytes(2, b"y"),
+            protobuf_bytes(4, b"Cast"),
+            protobuf_bytes(5, &to_float),
         ]
-        .concat()
+        .concat();
+        let shape = [None, tokens];
+        model_bytes(
+            &[
+                protobuf_bytes(1, &node),
+                protobuf_bytes(2, b"token-ids"),
+                protobuf_bytes(11, &value_info("input_ids", INT64, &shape)),
+                protobuf_bytes(11, &value_info("attention_mask", INT64, &shape)),
+                protobuf_bytes(12, &value_info("y", FLOAT, &shape)),
+            ]
+            .concat(),
+        )
     }
 
     #[test]

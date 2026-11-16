@@ -1,4 +1,6 @@
 #[cfg(feature = "hf-hub")]
+use crate::common::HubRepo;
+#[cfg(feature = "hf-hub")]
 use crate::common::{init_session_builder, load_tokenizer_hf_hub};
 #[cfg(feature = "hf-hub")]
 use crate::models::sparse::IDF_FILE;
@@ -8,8 +10,6 @@ use crate::{
     text_embedding::InitOptionsUserDefined,
     ModelInfo, SparseEmbedding,
 };
-#[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiRepo;
 use ndarray::{Array2, ArrayView1, ArrayViewD};
 use ort::session::{Session, SessionOutputs};
 use std::collections::{HashMap, HashSet};
@@ -152,7 +152,7 @@ impl SparseTextEmbedding {
         model: SparseModel,
         cache_dir: PathBuf,
         show_download_progress: bool,
-    ) -> Result<ApiRepo> {
+    ) -> Result<HubRepo> {
         use crate::common::pull_from_hf;
 
         pull_from_hf(model.to_string(), cache_dir, show_download_progress)

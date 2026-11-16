@@ -35,7 +35,40 @@ fn default_resize(
     height: u32,
     filter: FilterType,
 ) -> Result<DynamicImage> {
+    // `resize_exact` allocates an RGBA f32 image of the source width and the new height, and
+    // then the result. An allocation that fails aborts the process, so both are tried first.
+    let bytes = |width: u32, height: u32, per_pixel: u64| {
+        u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(per_pixel)
+    };
+    let buffers = [
+        bytes(image.width(), height, 16),
+        bytes(width, height, u64::from(image.color().bytes_per_pixel())),
+    ];
+    if !can_allocate(&buffers) {
+        return Err(Error::ImageTransform(format!(
+            "Not enough memory to resize a {}x{} image to {width}x{height}",
+            image.width(),
+            image.height()
+        )));
+    }
     Ok(image.resize_exact(width, height, filter))
+}
+
+/// Whether buffers of these sizes can be allocated at the same time.
+fn can_allocate(sizes: &[u64]) -> bool {
+    let mut held = Vec::with_capacity(sizes.len());
+    for &size in sizes {
+        let mut buffer = Vec::<u8>::new();
+        let reserved =
+            usize::try_from(size).is_ok_and(|size| buffer.try_reserve_exact(size).is_ok());
+        if !reserved {
+            return false;
+        }
+        held.push(buffer);
+    }
+    true
 }
 
 pub trait Transform: Send + Sync {
@@ -72,10 +105,6 @@ pub struct Resize {
     pub resample: FilterType,
 }
 
-/// The `image` decoders allow 512 MiB for one decoded image, and the resized image keeps that
-/// limit. An image that is a few pixels wide and thousands of pixels tall resizes to gigabytes.
-const MAX_RESIZED_BYTES: u64 = 512 * 1024 * 1024;
-
 impl Resize {
     fn target_dimensions(&self, width: u32, height: u32) -> (u32, u32) {
         match self.size {
@@ -111,14 +140,6 @@ impl Transform for Resize {
         let (new_width, new_height) = self.target_dimensions(width, height);
         if (new_width, new_height) == (width, height) {
             return Ok(TransformData::Image(image));
-        }
-        let resized_bytes = u64::from(new_width)
-            .saturating_mul(u64::from(new_height))
-            .saturating_mul(3);
-        if resized_bytes > MAX_RESIZED_BYTES {
-            return Err(Error::ImageTransform(format!(
-                "A {width}x{height} image resizes to {new_width}x{new_height}, above the 512 MiB limit"
-            )));
         }
         let image = resize(image, new_width, new_height, self.resample)?;
         Ok(TransformData::Image(image))
@@ -307,7 +328,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
             if config["do_resize"].as_bool().unwrap_or(false) {
                 transformers.push(Box::new(Resize {
                     size: parse_resize_size(&config["size"])?,
-                    resample: FilterType::CatmullRom,
+                    resample: parse_resample(&config["resample"]),
                 }));
             }
 
@@ -328,7 +349,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 let resize_shortest_edge = shortest_edge as f64 / crop_pct;
                 transformers.push(Box::new(Resize {
                     size: ResizeSize::ShortestEdge(resize_shortest_edge as u32),
-                    resample: FilterType::CatmullRom,
+                    resample: parse_resample(&config["resample"]),
                 }));
                 transformers.push(Box::new(CenterCrop {
                     size: (shortest_edge, shortest_edge),
@@ -339,7 +360,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                         width: shortest_edge,
                         height: shortest_edge,
                     },
-                    resample: FilterType::CatmullRom,
+                    resample: parse_resample(&config["resample"]),
                 }));
             }
         }
@@ -386,6 +407,17 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
     }
 
     Ok(Compose::new(transformers))
+}
+
+/// The filter that `resample` names by its number in PIL. Bicubic stands in for an absent
+/// number, and for a PIL filter that the image crate does not have.
+fn parse_resample(resample: &serde_json::Value) -> FilterType {
+    match resample.as_u64() {
+        Some(0) => FilterType::Nearest,
+        Some(1) => FilterType::Lanczos3,
+        Some(2) => FilterType::Triangle,
+        _ => FilterType::CatmullRom,
+    }
 }
 
 fn parse_resize_size(size: &serde_json::Value) -> Result<ResizeSize> {
@@ -483,16 +515,12 @@ mod tests {
     }
 
     #[test]
-    fn shortest_edge_resize_refuses_a_result_above_the_size_limit() {
-        let resize = Resize {
-            size: ResizeSize::ShortestEdge(224),
-            resample: FilterType::Nearest,
-        };
-        // 224 x 806,400 pixels, three bytes each.
-        assert!(matches!(
-            resize.transform(image(1, 3600)),
-            Err(Error::ImageTransform(_))
-        ));
+    fn a_resize_that_cannot_be_allocated_is_an_error() {
+        // No allocator gives out this many bytes, so nothing is allocated here.
+        assert!(!can_allocate(&[16, u64::MAX]));
+        assert!(can_allocate(&[16, 1024]));
+        assert!(can_allocate(&[]));
+
         let largest = Resize {
             size: ResizeSize::Exact {
                 width: u32::MAX,
@@ -504,6 +532,11 @@ mod tests {
             largest.transform(image(1, 1)),
             Err(Error::ImageTransform(_))
         ));
+
+        let resize = Resize {
+            size: ResizeSize::ShortestEdge(224),
+            resample: FilterType::Nearest,
+        };
         let out = resize.transform(image(1, 30)).unwrap().image().unwrap();
         assert_eq!(out.dimensions(), (224, 6720));
     }

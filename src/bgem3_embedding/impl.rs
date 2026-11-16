@@ -1,4 +1,6 @@
 #[cfg(feature = "hf-hub")]
+use crate::common::HubRepo;
+#[cfg(feature = "hf-hub")]
 use crate::common::{init_session_builder, load_tokenizer_hf_hub};
 use crate::{
     common::{encode_batch, load_tokenizer, Error, Result},
@@ -6,8 +8,6 @@ use crate::{
     text_embedding::InitOptionsUserDefined,
     ModelInfo, SparseEmbedding, TokenizerFiles,
 };
-#[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiRepo;
 use ndarray::{Array2, ArrayViewD};
 use ort::session::Session;
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ impl Bgem3Embedding {
         model: Bgem3Model,
         cache_dir: PathBuf,
         show_download_progress: bool,
-    ) -> Result<ApiRepo> {
+    ) -> Result<HubRepo> {
         use crate::common::pull_from_hf;
 
         pull_from_hf(model.to_string(), cache_dir, show_download_progress)

@@ -1,5 +1,5 @@
 #[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiRepo;
+use crate::common::HubRepo;
 use image::DynamicImage;
 use ndarray::{Array3, ArrayView3};
 use ort::{session::Session, value::Value};
@@ -119,7 +119,7 @@ impl ImageEmbedding {
         model: ImageEmbeddingModel,
         cache_dir: PathBuf,
         show_download_progress: bool,
-    ) -> Result<ApiRepo> {
+    ) -> Result<HubRepo> {
         use crate::common::pull_from_hf;
 
         pull_from_hf(model.to_string(), cache_dir, show_download_progress)
@@ -162,17 +162,12 @@ impl ImageEmbedding {
         let output = images
             .chunks(batch_size)
             .map(|batch| {
-                // One decoded image at a time, so the batch holds only the model inputs.
-                let inputs = batch
-                    .iter()
-                    .map(|img| {
-                        let image = image::ImageReader::new(Cursor::new(img))
-                            .with_guessed_format()?
-                            .decode()
-                            .map_err(|err| Error::ImageDecode(err.to_string()))?;
-                        self.preprocessor.preprocess(image)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let inputs = self.preprocess_batch(batch, |img| {
+                    image::ImageReader::new(Cursor::new(img))
+                        .with_guessed_format()?
+                        .decode()
+                        .map_err(|err| Error::ImageDecode(err.to_string()))
+                })?;
 
                 self.embed_preprocessed(inputs)
             })
@@ -205,16 +200,11 @@ impl ImageEmbedding {
         let output = images
             .chunks(batch_size)
             .map(|batch| {
-                // One decoded image at a time, so the batch holds only the model inputs.
-                let inputs = batch
-                    .iter()
-                    .map(|img| {
-                        let reader = image::ImageReader::open(img)?;
-                        let image = decode_image(img.as_ref(), reader)
-                            .map_err(|err| Error::ImageDecode(err.to_string()))?;
-                        self.preprocessor.preprocess(image)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let inputs = self.preprocess_batch(batch, |img| {
+                    let reader = image::ImageReader::open(img)?;
+                    decode_image(img.as_ref(), reader)
+                        .map_err(|err| Error::ImageDecode(err.to_string()))
+                })?;
 
                 self.embed_preprocessed(inputs)
             })
@@ -224,6 +214,30 @@ impl ImageEmbedding {
             .collect();
 
         Ok(output)
+    }
+
+    /// Decodes and preprocesses the images of one batch, one image at a time, so that the
+    /// batch holds only the model inputs. When an image fails to preprocess, the images after
+    /// it are still decoded: an error in decoding one of them comes first, as it does when the
+    /// whole batch is decoded before it is preprocessed.
+    fn preprocess_batch<T>(
+        &self,
+        batch: &[T],
+        decode: impl Fn(&T) -> Result<DynamicImage>,
+    ) -> Result<Vec<Array3<f32>>> {
+        let mut inputs = Vec::with_capacity(batch.len());
+        for (index, image) in batch.iter().enumerate() {
+            match self.preprocessor.preprocess(decode(image)?) {
+                Ok(input) => inputs.push(input),
+                Err(error) => {
+                    for later in &batch[index + 1..] {
+                        decode(later)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(inputs)
     }
 
     /// Embed DynamicImages
@@ -364,6 +378,45 @@ mod tests {
         assert!(matches!(
             model.embed([&garbage], None),
             Err(Error::ImageDecode(_))
+        ));
+    }
+
+    #[test]
+    fn a_decode_error_comes_before_a_preprocessing_error_of_an_earlier_image() {
+        use crate::common::image_tests::{png, Files};
+
+        // One mean for three channels: every image fails to preprocess.
+        let config =
+            br#"{"do_resize": false, "do_normalize": true, "image_mean": [0.5], "image_std": [0.5]}"#;
+        let model = UserDefinedImageEmbeddingModel::new(
+            crate::common::tests::relu_model_bytes(),
+            config.to_vec(),
+        );
+        let mut model =
+            ImageEmbedding::try_new_from_user_defined(model, Default::default()).unwrap();
+        let files = Files::new("precedence");
+        let valid = files.write("valid.png", &png());
+        let garbage = files.write("garbage.png", b"not an image");
+
+        assert!(matches!(
+            model.embed([&valid], None),
+            Err(Error::InvalidShape(_))
+        ));
+        for images in [[&valid, &garbage], [&garbage, &valid]] {
+            assert!(matches!(
+                model.embed(images, None),
+                Err(Error::ImageDecode(_))
+            ));
+        }
+        let (valid_bytes, garbage_bytes) = (png(), b"not an image".to_vec());
+        assert!(matches!(
+            model.embed_bytes(&[&valid_bytes, &garbage_bytes], None),
+            Err(Error::ImageDecode(_))
+        ));
+        // In separate batches the first batch fails before the second is decoded.
+        assert!(matches!(
+            model.embed([&valid, &garbage], Some(1)),
+            Err(Error::InvalidShape(_))
         ));
     }
 }

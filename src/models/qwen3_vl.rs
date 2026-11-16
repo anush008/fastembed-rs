@@ -149,6 +149,17 @@ impl Module for Conv3dNoBias {
         let xs1 = xs.i((.., .., 0, .., ..))?;
         let xs2 = xs.i((.., .., 1, .., ..))?;
 
+        // candle's CPU convolution takes no bf16, so there the two convolutions run in f32.
+        if xs.dtype() == DType::BF16 && xs.device().is_cpu() {
+            let in_f32 = |conv: &candle_nn::Conv2d, xs: &Tensor| {
+                let weight = conv.weight().to_dtype(DType::F32)?;
+                candle_nn::Conv2d::new(weight, None, *conv.config())
+                    .forward(&xs.to_dtype(DType::F32)?)
+            };
+            let sum = (in_f32(&self.conv2d_1, &xs1)? + in_f32(&self.conv2d_2, &xs2)?)?;
+            return sum.to_dtype(DType::BF16)?.unsqueeze(2);
+        }
+
         (self.conv2d_1.forward(&xs1)? + self.conv2d_2.forward(&xs2)?)?.unsqueeze(2)
     }
 }
@@ -731,6 +742,40 @@ impl Qwen3VLVisionModel {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_patch_convolution_runs_in_bf16_on_the_cpu() {
+        let device = Device::Cpu;
+        let weight = Tensor::randn(0f32, 1.0, (4, 3, 2, 2, 2), &device).unwrap();
+        let xs = Tensor::randn(0f32, 1.0, (5, 3, 2, 2, 2), &device).unwrap();
+        let conv = |dtype: DType| {
+            let tensors = HashMap::from([("weight".to_string(), weight.to_dtype(dtype).unwrap())]);
+            let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+            let cfg = Conv3dConfig {
+                stride: 2,
+                ..Default::default()
+            };
+            Conv3dNoBias::new(3, 4, [2, 2, 2], cfg, vb).unwrap()
+        };
+
+        let want = conv(DType::F32).forward(&xs).unwrap();
+        let got = conv(DType::BF16)
+            .forward(&xs.to_dtype(DType::BF16).unwrap())
+            .unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        assert_eq!(got.dims(), want.dims());
+        let diff = (got.to_dtype(DType::F32).unwrap() - want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 0.1, "bf16 differs from f32 by {diff}");
+    }
 
     #[test]
     fn patch_merger_uses_the_exact_gelu() {

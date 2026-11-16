@@ -215,6 +215,57 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_resizer_gets_every_size() {
+        // The default resizer cannot allocate this size and refuses it.
+        let config = br#"{"do_resize": true, "size": {"width": 4294967295, "height": 4294967295}}"#;
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap());
+        assert!(preprocessor.preprocess(RgbImage::new(1, 1).into()).is_err());
+
+        let preprocessor = preprocessor.with_resize(|_, width, height, _| {
+            assert_eq!((width, height), (u32::MAX, u32::MAX));
+            Ok(RgbImage::new(2, 2).into())
+        });
+        let pixels = preprocessor.preprocess(RgbImage::new(1, 1).into()).unwrap();
+        assert_eq!(pixels.shape(), &[3, 2, 2]);
+    }
+
+    #[test]
+    fn the_resizer_gets_the_filter_that_the_config_names() {
+        use image::imageops::FilterType;
+
+        for (resample, expected) in [
+            ("", FilterType::CatmullRom),
+            (r#""resample": 0,"#, FilterType::Nearest),
+            (r#""resample": 1,"#, FilterType::Lanczos3),
+            (r#""resample": 2,"#, FilterType::Triangle),
+            (r#""resample": 3,"#, FilterType::CatmullRom),
+            // PIL's box filter has no counterpart in the image crate.
+            (r#""resample": 4,"#, FilterType::CatmullRom),
+        ] {
+            for processor in [
+                "CLIPImageProcessor",
+                "BitImageProcessor",
+                "ConvNextImageProcessor",
+            ] {
+                let config = format!(
+                    r#"{{"image_processor_type": "{processor}", {resample}
+                        "do_resize": true, "size": {{"shortest_edge": 4}}}}"#
+                );
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap())
+                    .with_resize(move |image, _, _, filter| {
+                        assert_eq!(filter, expected);
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        Ok(image)
+                    });
+                preprocessor.preprocess(RgbImage::new(8, 8).into()).unwrap();
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "{processor} {resample}");
+            }
+        }
+    }
+
+    #[test]
     fn cloneable_preprocessor_supports_a_custom_resizer() {
         let config = br#"{
             "image_processor_type": "CLIPImageProcessor",

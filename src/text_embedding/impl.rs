@@ -1,6 +1,8 @@
 //! The definition of the main struct for text embeddings - [`TextEmbedding`].
 
 #[cfg(feature = "hf-hub")]
+use crate::common::HubRepo;
+#[cfg(feature = "hf-hub")]
 use crate::common::{init_session_builder, load_tokenizer_hf_hub};
 use crate::{
     common::{encode_batch, load_tokenizer, Error, Result},
@@ -9,8 +11,6 @@ use crate::{
     Embedding, EmbeddingModel, EmbeddingOutput, ModelInfo, OutputKey, QuantizationMode,
     SingleBatchOutput,
 };
-#[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiRepo;
 use ort::session::Session;
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
@@ -142,7 +142,7 @@ impl TextEmbedding {
         model: EmbeddingModel,
         cache_dir: PathBuf,
         show_download_progress: bool,
-    ) -> Result<ApiRepo> {
+    ) -> Result<HubRepo> {
         use crate::common::pull_from_hf;
 
         let model_code = TextEmbedding::get_model_info(&model)?.model_code.clone();
@@ -413,9 +413,20 @@ impl TextEmbedding {
         // Each batch is pooled before the next one runs, so one batch of model output is held
         // at a time.
         let mut embeddings = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(batch_size) {
+        for (index, batch) in texts.chunks(batch_size).enumerate() {
             let output = self.run_batch(batch)?;
-            embeddings.extend(transformer(std::slice::from_ref(&output))?);
+            match transformer(std::slice::from_ref(&output)) {
+                Ok(vectors) => embeddings.extend(vectors),
+                Err(error) => {
+                    // An error in running a later batch comes first, as it does when every
+                    // batch runs before the first one is pooled.
+                    drop(output);
+                    for later in texts.chunks(batch_size).skip(index + 1) {
+                        self.run_batch(later)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(embeddings)
     }
@@ -459,6 +470,65 @@ mod tests {
                 Err(Error::InvalidArgument(_))
             ));
         }
+    }
+
+    /// A model that embeds each text to its token ids: `[0, 2, .., 1]`, one 2 for each word.
+    fn token_ids_model(tokens: Option<u8>, output_key: Option<OutputKey>) -> TextEmbedding {
+        use crate::common::tests::{bert_tokenizer_files, token_ids_model_bytes};
+
+        let mut model =
+            UserDefinedEmbeddingModel::new(token_ids_model_bytes(tokens), bert_tokenizer_files());
+        model.output_key = output_key;
+        TextEmbedding::try_new_from_user_defined(model, Default::default()).unwrap()
+    }
+
+    #[test]
+    fn embed_gives_the_vectors_of_transform_for_every_batch_size() {
+        let mut model = token_ids_model(None, None);
+        let texts = [
+            "hello",
+            "hello hello hello",
+            "hello hello",
+            "hello",
+            "hello hello",
+        ];
+        for batch_size in [None, Some(1), Some(2), Some(3), Some(usize::MAX)] {
+            let embedded = model.embed(texts, batch_size).unwrap();
+            let transformed = model
+                .transform(texts, batch_size)
+                .unwrap()
+                .export_with_transformer(output::transformer_with_precedence(
+                    output::OUTPUT_TYPE_PRECEDENCE,
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(embedded, transformed, "batch size {batch_size:?}");
+            assert_eq!(embedded.len(), texts.len());
+        }
+        // One text alone: its ids 0, 2 and 1, normalized.
+        let alone = &model.embed(["hello"], None).unwrap()[0];
+        let norm = 5f32.sqrt();
+        for (value, id) in alone.iter().zip([0.0, 2.0, 1.0]) {
+            assert!((value - id / norm).abs() < 1e-6, "{alone:?}");
+        }
+    }
+
+    #[test]
+    fn an_error_in_a_later_batch_comes_before_a_pooling_error() {
+        // Rows of three tokens run. No output has the name asked for, so pooling fails.
+        let mut model = token_ids_model(Some(3), Some(OutputKey::ByName("missing")));
+        let (fits, too_long) = ("hello", "hello hello hello");
+
+        assert!(matches!(model.embed([fits], Some(1)), Err(Error::Other(_))));
+        for texts in [[fits, too_long], [too_long, fits]] {
+            assert!(matches!(
+                model.embed(texts, Some(1)),
+                Err(Error::OrtSession(_))
+            ));
+        }
+
+        let mut model = token_ids_model(Some(3), None);
+        assert_eq!(model.embed([fits, fits], Some(1)).unwrap().len(), 2);
     }
 
     #[test]

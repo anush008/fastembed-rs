@@ -389,7 +389,7 @@ const TG: usize = 256;
 
 #[cfg(test)]
 mod tests {
-    use super::{add_layernorm, bias_gelu, BiasGelu};
+    use super::{add_layernorm, bias_gelu, AddLayerNorm, BiasGelu};
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{LayerNorm, Module};
 
@@ -431,6 +431,23 @@ mod tests {
         let want = unfused(&x, &r, &wb, cols, 1e-12);
         assert!(
             max_abs_diff(&got, &want) < 1e-3,
+            "diff {}",
+            max_abs_diff(&got, &want)
+        );
+    }
+
+    /// `add_layernorm` only takes the custom-op path on Metal, so the test above compares the
+    /// unfused fallback with itself. Drive the op's `cpu_fwd` directly to pin its arithmetic.
+    #[test]
+    fn add_layernorm_cpu_kernel_matches_the_unfused_sequence() {
+        let (rows, cols) = (3usize, 317usize);
+        let (x, r, wb) = shared(rows, cols);
+        let got = x
+            .apply_op3_no_bwd(&r, &wb, &AddLayerNorm { eps: 1e-12 })
+            .unwrap();
+        let want = unfused(&x, &r, &wb, cols, 1e-12);
+        assert!(
+            max_abs_diff(&got, &want) < 1e-4,
             "diff {}",
             max_abs_diff(&got, &want)
         );

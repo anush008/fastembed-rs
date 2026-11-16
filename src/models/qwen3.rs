@@ -18,7 +18,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiRepo;
+use crate::common::HubRepo;
 
 use crate::models::qwen3_qk_norm_rope::rms_norm_rope_thd;
 use crate::models::qwen3_sdpa_bthd::sdpa_bthd;
@@ -46,7 +46,7 @@ pub struct Config {
     pub rope_scaling: Option<serde_json::Value>,
     pub rope_theta: f64,
     pub sliding_window: Option<usize>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
     #[serde(default = "default_true")]
     pub use_cache: bool,
@@ -161,7 +161,7 @@ fn scalar_f32(device: &Device, v: f32) -> Result<Tensor> {
 }
 
 #[cfg(feature = "hf-hub")]
-fn hf_repo(repo_id: &str) -> Result<ApiRepo> {
+fn hf_repo(repo_id: &str) -> Result<HubRepo> {
     crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
         .map_err(map_err)
 }
@@ -346,7 +346,11 @@ fn preprocess_image(
     let (orig_w, orig_h) = rgb.dimensions();
     let factor = cfg.patch_size * cfg.merge_size;
 
-    let effective_max_pixels = cfg.max_pixels.min(max_image_tokens * factor * factor);
+    let effective_max_pixels = cfg.max_pixels.min(
+        max_image_tokens
+            .saturating_mul(factor)
+            .saturating_mul(factor),
+    );
     let (resized_h, resized_w) = smart_resize(
         orig_h as usize,
         orig_w as usize,
@@ -550,6 +554,25 @@ fn build_image_position_ids(
     }
 
     Tensor::from_vec(data, (3, batch_size, seq_len), device)
+}
+
+/// The image tokens that fit in `max_length` beside the tokens of the prompt around them,
+/// counted as the prompt is encoded for the model, with the token the tokenizer appends.
+#[cfg(feature = "qwen3-vl")]
+fn max_image_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    image_token_id: u32,
+    max_length: usize,
+) -> Result<usize> {
+    let base_prompt = build_vl_prompt(None, true, "Represent the user's input.");
+    let enc = tokenizer.encode(base_prompt, true).map_err(map_err)?;
+    let img_count = enc
+        .get_ids()
+        .iter()
+        .filter(|&&id| id == image_token_id)
+        .count();
+    let overhead = enc.get_ids().len() - img_count;
+    Ok(max_length.saturating_sub(overhead))
 }
 
 #[cfg(feature = "qwen3-vl")]
@@ -1800,23 +1823,16 @@ pub struct Qwen3TextEmbedding {
 }
 
 impl Qwen3TextEmbedding {
-    /// Build from an already loaded model and tokenizer. The tokenizer is set to pad on the
-    /// left, which keeps the last token of each text at the position the pooling reads.
+    /// Build from an already loaded model and tokenizer. A tokenizer that pads is set to pad
+    /// on the left, which keeps the last token of each text at the position the pooling reads.
     pub fn new(model: Qwen3Model, mut tokenizer: tokenizers::Tokenizer) -> Self {
-        use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy};
-
-        let padding = match tokenizer.get_padding() {
-            Some(padding) => PaddingParams {
-                direction: PaddingDirection::Left,
+        if let Some(padding) = tokenizer.get_padding() {
+            let padding = tokenizers::PaddingParams {
+                direction: tokenizers::PaddingDirection::Left,
                 ..padding.clone()
-            },
-            None => PaddingParams {
-                strategy: PaddingStrategy::BatchLongest,
-                direction: PaddingDirection::Left,
-                ..Default::default()
-            },
-        };
-        tokenizer.with_padding(Some(padding));
+            };
+            tokenizer.with_padding(Some(padding));
+        }
         Self {
             model,
             tokenizer,
@@ -1830,6 +1846,9 @@ impl Qwen3TextEmbedding {
     /// - Qwen3 text embedding checkpoints (e.g. `Qwen/Qwen3-Embedding-0.6B`)
     /// - Qwen3-VL embedding checkpoints in text-only mode
     ///   (e.g. `Qwen/Qwen3-VL-Embedding-2B`)
+    ///
+    /// `embed` runs each text as given. For a Qwen3-VL checkpoint,
+    /// `Qwen3VLEmbedding::embed_texts` adds the prompt of the model card.
     #[cfg(feature = "hf-hub")]
     pub fn from_hf(
         repo_id: &str,
@@ -1849,7 +1868,7 @@ impl Qwen3TextEmbedding {
 
         // Load weights (single or sharded)
         let weight_files: Vec<PathBuf> = crate::common::safetensors_weight_files(&repo)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            .map_err(|e| candle_core::Error::Msg(crate::common::error_with_cause(e)))?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
         let vb = match weight_prefix {
@@ -2044,7 +2063,16 @@ impl Qwen3TextEmbedding {
             return Ok(vec![]);
         }
 
-        let encodings = encode_texts(&self.tokenizer, texts)?;
+        let mut encodings = encode_texts(&self.tokenizer, texts)?;
+        if self.tokenizer.get_padding().is_none() {
+            // The rows of one batch need one length.
+            let left = tokenizers::PaddingParams {
+                strategy: tokenizers::PaddingStrategy::BatchLongest,
+                direction: tokenizers::PaddingDirection::Left,
+                ..Default::default()
+            };
+            tokenizers::utils::padding::pad_encodings(&mut encodings, &left).map_err(map_err)?;
+        }
 
         let batch_size = encodings.len();
         let seq_len = encodings[0].len();
@@ -2252,7 +2280,8 @@ impl Qwen3Reranker {
         let cfg_path: PathBuf = repo.get("config.json").map_err(map_err)?;
         let cfg_bytes = std::fs::read(&cfg_path).map_err(map_err)?;
         let (cfg, _) = parse_config_and_weight_prefix(&cfg_bytes)?;
-        let weight_files = crate::common::safetensors_weight_files(&repo).map_err(map_err)?;
+        let weight_files = crate::common::safetensors_weight_files(&repo)
+            .map_err(|e| candle_core::Error::Msg(crate::common::error_with_cause(e)))?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
 
         let tok_path: PathBuf = repo.get("tokenizer.json").map_err(map_err)?;
@@ -2498,7 +2527,7 @@ impl Qwen3VLEmbedding {
             serde_json::from_slice(&preprocessor_bytes).map_err(map_err)?;
 
         let weight_files: Vec<PathBuf> = crate::common::safetensors_weight_files(&repo)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            .map_err(|e| candle_core::Error::Msg(crate::common::error_with_cause(e)))?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
         let model = Qwen3Model::new(cfg.text_config, vb.pp("model").pp("language_model"))?;
@@ -2516,17 +2545,7 @@ impl Qwen3VLEmbedding {
             .with_truncation(Some(truncation))
             .map_err(map_err)?;
 
-        let max_image_tokens = {
-            let base_prompt = build_vl_prompt(None, true, "Represent the user's input.");
-            let enc = tokenizer.encode(base_prompt, false).map_err(map_err)?;
-            let img_count = enc
-                .get_ids()
-                .iter()
-                .filter(|&&id| id == cfg.image_token_id)
-                .count();
-            let overhead = enc.get_ids().len() - img_count;
-            max_length.saturating_sub(overhead)
-        };
+        let max_image_tokens = max_image_tokens(&tokenizer, cfg.image_token_id, max_length)?;
 
         Ok(Self {
             model,
@@ -3248,12 +3267,24 @@ mod tests {
     }
 
     #[test]
-    fn new_sets_the_tokenizer_to_pad_on_the_left() {
+    fn a_tokenizer_that_pads_on_the_right_or_not_at_all_gives_each_text_its_own_vector() {
         let texts = ["w1 w2 w3", "w4 w5", "w6 w7 w8 w9"];
         let mut right_padded = word_tokenizer();
         right_padded.with_padding(Some(tokenizers::PaddingParams::default()));
         let mut unpadded = word_tokenizer();
         unpadded.with_padding(None);
+
+        // `new` leaves a tokenizer without padding as it is: `embed` needs none.
+        let kept = super::Qwen3TextEmbedding::new(
+            random_model(
+                small_config(),
+                1,
+                &candle_core::Device::Cpu,
+                candle_core::DType::F32,
+            ),
+            unpadded.clone(),
+        );
+        assert!(kept.tokenizer.get_padding().is_none());
 
         for tokenizer in [right_padded, unpadded] {
             let model = super::Qwen3TextEmbedding::new(
@@ -4619,7 +4650,7 @@ mod tests {
         let (cfg, prefix) = parse_config_and_weight_prefix(config.as_bytes()).unwrap();
         assert_eq!(prefix, Some("model.language_model"));
         assert_eq!(cfg.rope_theta, 5e6);
-        assert!(!cfg.tie_word_embeddings);
+        assert!(cfg.tie_word_embeddings);
         let rotary = super::Qwen3RotaryEmbedding::new(&cfg, &candle_core::Device::Cpu).unwrap();
         assert!(rotary.mrope_interleaved);
         assert_eq!(rotary.mrope_section, [24, 20, 20]);
@@ -4640,6 +4671,70 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("EOF"), "error was: {err}");
+    }
+
+    #[cfg(feature = "qwen3-vl")]
+    #[test]
+    fn the_image_token_budget_leaves_room_for_the_appended_token() {
+        use std::str::FromStr;
+
+        // The image placeholder is token 5, and the tokenizer appends `<eos>` to every text.
+        let tokenizer = tokenizers::Tokenizer::from_str(
+            r#"{
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [{"id": 5, "content": "<|image_pad|>", "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+            "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": {"type": "TemplateProcessing",
+                "single": [{"Sequence": {"id": "A", "type_id": 0}},
+                           {"SpecialToken": {"id": "<eos>", "type_id": 0}}],
+                "pair": [{"Sequence": {"id": "A", "type_id": 0}},
+                         {"Sequence": {"id": "B", "type_id": 1}},
+                         {"SpecialToken": {"id": "<eos>", "type_id": 1}}],
+                "special_tokens": {"<eos>": {"id": "<eos>", "ids": [1], "tokens": ["<eos>"]}}},
+            "decoder": null,
+            "model": {"type": "WordLevel", "unk_token": "[UNK]",
+                "vocab": {"[UNK]": 0, "<eos>": 1, "<|image_pad|>": 5}}
+        }"#,
+        )
+        .unwrap();
+        let prompt = super::build_vl_prompt(None, true, "Represent the user's input.");
+        let ids = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
+        assert_eq!(ids.iter().filter(|&&id| id == 5).count(), 1);
+        assert_eq!(ids.last(), Some(&1));
+
+        // Every token of the encoded prompt but the image placeholder.
+        let around = ids.len() - 1;
+        assert_eq!(
+            super::max_image_tokens(&tokenizer, 5, 100).unwrap(),
+            100 - around
+        );
+        assert_eq!(super::max_image_tokens(&tokenizer, 5, around).unwrap(), 0);
+        assert_eq!(super::max_image_tokens(&tokenizer, 5, 0).unwrap(), 0);
+    }
+
+    #[cfg(feature = "qwen3-vl")]
+    #[test]
+    fn the_image_size_cap_holds_for_every_token_budget() {
+        // At most 16,384 pixels: 16 blocks of 32 x 32, one token each.
+        let cfg: super::Qwen3VLPreprocessorConfig = serde_json::from_str(
+            r#"{"min_pixels": 1024, "max_pixels": 16384, "patch_size": 16,
+                "temporal_patch_size": 2, "merge_size": 2, "rescale_factor": 0.00392156862745098,
+                "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]}"#,
+        )
+        .unwrap();
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(256, 256));
+        let tokens = |budget: usize| {
+            super::preprocess_image(&image, &cfg, budget)
+                .unwrap()
+                .num_llm_tokens
+        };
+
+        assert_eq!(tokens(4), 4);
+        assert_eq!(tokens(100), 16);
+        // The pixel count of these budgets is above `usize::MAX`.
+        assert_eq!(tokens(1 << 54), 16);
+        assert_eq!(tokens(usize::MAX), 16);
     }
 
     #[cfg(feature = "qwen3-vl")]
