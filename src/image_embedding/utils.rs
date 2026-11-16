@@ -72,6 +72,10 @@ pub struct Resize {
     pub resample: FilterType,
 }
 
+/// The `image` decoders allow 512 MiB for one decoded image, and the resized image keeps that
+/// limit. An image that is a few pixels wide and thousands of pixels tall resizes to gigabytes.
+const MAX_RESIZED_BYTES: u64 = 512 * 1024 * 1024;
+
 impl Resize {
     fn target_dimensions(&self, width: u32, height: u32) -> (u32, u32) {
         match self.size {
@@ -108,6 +112,11 @@ impl Transform for Resize {
         if (new_width, new_height) == (width, height) {
             return Ok(TransformData::Image(image));
         }
+        if u64::from(new_width) * u64::from(new_height) * 3 > MAX_RESIZED_BYTES {
+            return Err(Error::ImageTransform(format!(
+                "A {width}x{height} image resizes to {new_width}x{new_height}, above the 512 MiB limit"
+            )));
+        }
         let image = resize(image, new_width, new_height, self.resample)?;
         Ok(TransformData::Image(image))
     }
@@ -142,8 +151,9 @@ impl Transform for CenterCrop {
             }
             let mut pixels_array =
                 Array3::zeros((3usize, crop_height as usize, crop_width as usize));
-            let offset_x = (crop_width - origin_width) / 2;
-            let offset_y = (crop_height - origin_height) / 2;
+            // transformers puts `ceil(padding / 2)` before the image.
+            let offset_x = (crop_width - origin_width).div_ceil(2);
+            let offset_y = (crop_height - origin_height).div_ceil(2);
             // HWC -> CHW
             for (x, y, pixel) in image.to_rgb8().enumerate_pixels() {
                 pixels_array[[0, (y + offset_y) as usize, (x + offset_x) as usize]] =
@@ -290,7 +300,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
         .as_str()
         .unwrap_or("CLIPImageProcessor");
     match mode {
-        "CLIPImageProcessor" | "BitImageProcessor" => {
+        "CLIPImageProcessor" | "CLIPFeatureExtractor" | "BitImageProcessor" => {
             if config["do_resize"].as_bool().unwrap_or(false) {
                 transformers.push(Box::new(Resize {
                     size: parse_resize_size(&config["size"])?,
@@ -304,7 +314,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 }));
             }
         }
-        "ConvNextFeatureExtractor" => {
+        "ConvNextImageProcessor" | "ConvNextFeatureExtractor" => {
             let shortest_edge = config["size"]["shortest_edge"].as_u64().ok_or_else(|| {
                 Error::PreprocessorConfig(
                     "Size dictionary must contain 'shortest_edge' key.".into(),
@@ -454,6 +464,63 @@ mod tests {
         assert_eq!(out.dim(), (3, 100, 224));
         assert_eq!(out[[0, 50, 112]], 255.0);
         assert_eq!(out[[0, 0, 0]], 0.0);
+    }
+
+    #[test]
+    fn center_crop_puts_the_odd_pixel_of_padding_before_the_image() {
+        let crop = CenterCrop { size: (224, 100) };
+        let out = crop.transform(image(51, 41)).unwrap().array().unwrap();
+        // 173 columns and 59 rows of padding: 87 and 30 before the image, 86 and 29 after.
+        assert_eq!(out[[0, 30, 87]], 255.0);
+        assert_eq!(out[[0, 70, 137]], 255.0);
+        assert_eq!(out[[0, 29, 87]], 0.0);
+        assert_eq!(out[[0, 30, 86]], 0.0);
+        assert_eq!(out[[0, 71, 137]], 0.0);
+        assert_eq!(out[[0, 70, 138]], 0.0);
+    }
+
+    #[test]
+    fn shortest_edge_resize_refuses_a_result_above_the_size_limit() {
+        let resize = Resize {
+            size: ResizeSize::ShortestEdge(224),
+            resample: FilterType::Nearest,
+        };
+        // 224 x 806,400 pixels, three bytes each.
+        assert!(matches!(
+            resize.transform(image(1, 3600)),
+            Err(Error::ImageTransform(_))
+        ));
+        let out = resize.transform(image(1, 30)).unwrap().image().unwrap();
+        assert_eq!(out.dimensions(), (224, 6720));
+    }
+
+    #[test]
+    fn deprecated_and_current_processor_names_build_the_same_pipeline() {
+        let output = |processor: &str, extra: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "image_processor_type": processor,
+                "do_resize": true,
+                "size": {"shortest_edge": 224},
+                "do_rescale": false
+            });
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let compose = load_preprocessor(config).unwrap();
+            compose.transform(image(640, 480)).unwrap().array().unwrap()
+        };
+
+        let crop = serde_json::json!({"do_center_crop": true, "crop_size": 224});
+        assert_eq!(
+            output("CLIPFeatureExtractor", crop.clone()),
+            output("CLIPImageProcessor", crop)
+        );
+        let none = serde_json::json!({});
+        assert_eq!(
+            output("ConvNextImageProcessor", none.clone()),
+            output("ConvNextFeatureExtractor", none)
+        );
     }
 
     #[test]

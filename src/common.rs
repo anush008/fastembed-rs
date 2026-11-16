@@ -185,7 +185,7 @@ fn check_special_tokens(tokenizer: &Tokenizer, max_length: usize, pair: bool) ->
     if max_length < special_tokens {
         let input = if pair { "pair" } else { "text" };
         return Err(Error::InvalidArgument(format!(
-            "max_length {max_length} is below the {special_tokens} special tokens the tokenizer adds to a {input}"
+            "max_length is {max_length} and must be at least {special_tokens}, the number of special tokens the tokenizer adds to a {input}"
         )));
     }
     Ok(())
@@ -205,38 +205,28 @@ pub(crate) fn check_pair_truncation(tokenizer: &Tokenizer) -> Result<()> {
 /// Or indirectly from the try_new function via load_tokenizer_hf_hub (converting HF files to bytes)
 #[cfg(feature = "onnx")]
 pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Result<Tokenizer> {
-    let base_error_message =
-        "Error building TokenizerFiles for UserDefinedEmbeddingModel. Could not read {} file.";
+    let unreadable = |file: &str, cause: &dyn std::fmt::Display| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Error building TokenizerFiles for UserDefinedEmbeddingModel. \
+                 Could not read {file} file: {cause}"
+            ),
+        )
+    };
 
     // Deserialize each tokenizer file
-    let config: serde_json::Value =
-        serde_json::from_slice(&tokenizer_files.config_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "config.json"),
-            )
-        })?;
+    let config: serde_json::Value = serde_json::from_slice(&tokenizer_files.config_file)
+        .map_err(|e| unreadable("config.json", &e))?;
     let special_tokens_map: serde_json::Value =
-        serde_json::from_slice(&tokenizer_files.special_tokens_map_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "special_tokens_map.json"),
-            )
-        })?;
+        serde_json::from_slice(&tokenizer_files.special_tokens_map_file)
+            .map_err(|e| unreadable("special_tokens_map.json", &e))?;
     let tokenizer_config: serde_json::Value =
-        serde_json::from_slice(&tokenizer_files.tokenizer_config_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "tokenizer_config.json"),
-            )
-        })?;
+        serde_json::from_slice(&tokenizer_files.tokenizer_config_file)
+            .map_err(|e| unreadable("tokenizer_config.json", &e))?;
     let mut tokenizer: tokenizers::Tokenizer =
-        tokenizers::Tokenizer::from_bytes(tokenizer_files.tokenizer_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "tokenizer.json"),
-            )
-        })?;
+        tokenizers::Tokenizer::from_bytes(tokenizer_files.tokenizer_file)
+            .map_err(|e| unreadable("tokenizer.json", &e))?;
 
     // For BGEBaseSmall, model_max_length is set to 1000000000000000019884624838656.
     // This value fits in an f64.
@@ -280,6 +270,10 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
         for (_, value) in root_object.iter() {
             if value.is_string() {
                 if let Some(content) = value.as_str() {
+                    // tokenizer.json already has the token, with the flags to match it by.
+                    if tokenizer.get_added_vocabulary().is_special_token(content) {
+                        continue;
+                    }
                     tokenizer
                         .add_special_tokens([AddedToken {
                             content: content.into(),
@@ -326,15 +320,17 @@ pub(crate) fn decode_image(
     path: &std::path::Path,
     reader: image::ImageReader<std::io::BufReader<std::fs::File>>,
 ) -> image::ImageResult<image::DynamicImage> {
-    let format = reader.format();
     let by_extension = match reader.decode() {
         Ok(image) => return Ok(image),
         Err(err) => err,
     };
+    // A pipe cannot be read a second time, and opening it again blocks.
+    if !path.is_file() {
+        return Err(by_extension);
+    }
     image::ImageReader::open(path)
         .and_then(|reader| reader.with_guessed_format())
         .ok()
-        .filter(|reader| reader.format() != format)
         .and_then(|reader| reader.decode().ok())
         .ok_or(by_extension)
 }
@@ -381,8 +377,8 @@ pub fn pull_from_hf(
         .filter(|token| !token.is_empty())
         .or_else(default_hf_token);
 
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir)
+    // `ApiBuilder::new` panics without a home dir.
+    let api = ApiBuilder::from_cache(hf_hub::Cache::new(cache_dir))
         .with_endpoint(endpoint)
         .with_token(token)
         .with_progress(show_download_progress)
@@ -395,7 +391,7 @@ pub fn pull_from_hf(
 
 /// An empty `HF_ENDPOINT` has no host to download from, so it means the default one. An empty
 /// `HF_HOME` or `FASTEMBED_CACHE_DIR` keeps meaning the working directory, where caches made
-/// with it already are.
+/// with it already are. A trailing slash would give `//` in every file URL.
 #[cfg(all(
     feature = "hf-hub",
     any(
@@ -407,11 +403,13 @@ pub fn pull_from_hf(
 ))]
 fn hf_endpoint(value: Option<String>) -> String {
     value
+        .map(|endpoint| endpoint.trim_end_matches('/').to_string())
         .filter(|endpoint| !endpoint.is_empty())
         .unwrap_or_else(|| "https://huggingface.co".to_string())
 }
 
-/// Token written by `huggingface-cli login`. `Cache::default` panics without a home dir.
+/// Token written by `huggingface-cli login`: in `HF_HOME` when that is set and holds one, else
+/// in the home dir. `Cache::default` panics without a home dir.
 #[cfg(all(
     feature = "hf-hub",
     any(
@@ -422,8 +420,27 @@ fn hf_endpoint(value: Option<String>) -> String {
     )
 ))]
 fn default_hf_token() -> Option<String> {
-    let has_home = std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some();
+    let hf_home = std::env::var_os("HF_HOME").filter(|home| !home.is_empty());
+    if let Some(token) = hf_home.and_then(|home| hf_home_token(home.as_ref())) {
+        return Some(token);
+    }
+    let has_home = (std::env::var_os("HOME").is_some()
+        || std::env::var_os("USERPROFILE").is_some())
+        && std::env::home_dir().is_some_and(|home| !home.as_os_str().is_empty());
     has_home.then(|| hf_hub::Cache::default().token()).flatten()
+}
+
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "onnx",
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+fn hf_home_token(hf_home: &std::path::Path) -> Option<String> {
+    hf_hub::Cache::new(hf_home.join("hub")).token()
 }
 
 /// Safetensors files of a repo, resolving `model.safetensors.index.json` for sharded checkpoints.
@@ -439,27 +456,22 @@ pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
     const SINGLE_FILE: &str = "model.safetensors";
     const INDEX_FILE: &str = "model.safetensors.index.json";
 
-    if let Ok(path) = repo.get(SINGLE_FILE) {
-        return Ok(vec![path]);
-    }
-
-    let index_path = repo.get(INDEX_FILE).map_err(|e| Error::ModelRetrieval {
-        file: format!("{SINGLE_FILE} or {INDEX_FILE}"),
-        source: Box::new(e),
-    })?;
+    let single_file_error = match repo.get(SINGLE_FILE) {
+        Ok(path) => return Ok(vec![path]),
+        Err(err) => err,
+    };
+    // The repo has one of the two files, so the cause can be in either error.
+    let index_path = repo
+        .get(INDEX_FILE)
+        .map_err(|index_error| Error::ModelRetrieval {
+            file: format!("{SINGLE_FILE} or {INDEX_FILE}"),
+            source: format!("{SINGLE_FILE}: {single_file_error}; {INDEX_FILE}: {index_error}")
+                .into(),
+        })?;
     let index: serde_json::Value = serde_json::from_slice(&std::fs::read(index_path)?)
         .map_err(|e| Error::Other(format!("Failed to parse {INDEX_FILE}: {e}")))?;
 
-    let mut shards: Vec<String> = index["weight_map"]
-        .as_object()
-        .ok_or_else(|| Error::Other(format!("{INDEX_FILE} has no `weight_map` object")))?
-        .values()
-        .filter_map(|file| file.as_str().map(str::to_string))
-        .collect();
-    shards.sort_unstable();
-    shards.dedup();
-
-    shards
+    shard_files(&index, INDEX_FILE)?
         .iter()
         .map(|file| {
             repo.get(file).map_err(|e| Error::ModelRetrieval {
@@ -468,6 +480,43 @@ pub(crate) fn safetensors_weight_files(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
             })
         })
         .collect()
+}
+
+/// Shard file names of a safetensors index, each one a path inside the repo.
+#[cfg(all(
+    feature = "hf-hub",
+    any(
+        feature = "qwen3-text",
+        feature = "nomic-v2-moe",
+        feature = "bert-text"
+    )
+))]
+fn shard_files(index: &serde_json::Value, index_file: &str) -> Result<Vec<String>> {
+    use std::path::{Component, Path};
+
+    let mut shards: Vec<String> = index["weight_map"]
+        .as_object()
+        .ok_or_else(|| Error::Other(format!("{index_file} has no `weight_map` object")))?
+        .values()
+        .filter_map(|file| file.as_str().map(str::to_string))
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+
+    let leaves_repo = |file: &&String| {
+        Path::new(file).components().any(|part| {
+            matches!(
+                part,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
+    };
+    if let Some(file) = shards.iter().find(leaves_repo) {
+        return Err(Error::Other(format!(
+            "{index_file} names `{file}`, which is outside the repository"
+        )));
+    }
+    Ok(shards)
 }
 
 /// One tokenized batch as `[batch, sequence]` tensors.
@@ -546,7 +595,19 @@ fn default_environment() -> Result<Environment> {
     if let Some(environment) = default.as_ref() {
         return Ok(environment.clone());
     }
-    let environment = ort::init().build().map_err(|e| {
+    #[cfg(not(feature = "ort-load-dynamic"))]
+    let builder = ort::init();
+    // `ort::init` panics when the library does not load. This is the path it looks at.
+    #[cfg(feature = "ort-load-dynamic")]
+    let builder = {
+        use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+        let path = std::env::var("ORT_DYLIB_PATH")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| format!("{DLL_PREFIX}onnxruntime{DLL_SUFFIX}"));
+        ort::init_from(path).map_err(|e| Error::Other(format!("ONNX Runtime: {e}")))?
+    };
+    let environment = builder.build().map_err(|e| {
         if e.message().contains("only one environment") {
             Error::EnvironmentRequired
         } else {
@@ -557,6 +618,16 @@ fn default_environment() -> Result<Environment> {
     Ok(environment)
 }
 
+/// The requested thread count, else one thread per core. ONNX Runtime picks the count itself
+/// when the core count is unknown.
+#[cfg(feature = "onnx")]
+fn intra_threads_or(
+    requested: Option<usize>,
+    cores: std::io::Result<std::num::NonZeroUsize>,
+) -> Option<usize> {
+    requested.or_else(|| cores.ok().map(std::num::NonZeroUsize::get))
+}
+
 #[cfg(feature = "onnx")]
 pub(crate) fn init_session_builder(
     environment: Option<Environment>,
@@ -565,11 +636,7 @@ pub(crate) fn init_session_builder(
     session_config: Vec<(String, String)>,
     auto_device: Option<AutoDevicePolicy>,
 ) -> Result<SessionBuilder> {
-    let threads = intra_threads.or_else(|| {
-        std::thread::available_parallelism()
-            .ok()
-            .map(|cores| cores.get())
-    });
+    let threads = intra_threads_or(intra_threads, std::thread::available_parallelism());
 
     #[cfg(feature = "directml")]
     let has_directml = execution_providers
@@ -616,21 +683,21 @@ pub(crate) fn init_session_builder(
 }
 
 #[cfg(all(test, any(feature = "image-models", feature = "qwen3-vl")))]
-mod image_tests {
+pub(crate) mod image_tests {
     use super::decode_image;
     use std::path::{Path, PathBuf};
 
     /// A directory of test files, removed when the test ends.
-    struct Files(PathBuf);
+    pub(crate) struct Files(PathBuf);
 
     impl Files {
-        fn new(test: &str) -> Self {
+        pub(crate) fn new(test: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("fastembed-{test}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
 
-        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        pub(crate) fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
             let path = self.0.join(name);
             std::fs::write(&path, bytes).unwrap();
             path
@@ -643,7 +710,7 @@ mod image_tests {
         }
     }
 
-    fn png() -> Vec<u8> {
+    pub(crate) fn png() -> Vec<u8> {
         let mut bytes = Vec::new();
         image::DynamicImage::new_rgb8(3, 2)
             .write_to(
@@ -656,6 +723,11 @@ mod image_tests {
 
     fn decode(path: &Path) -> image::ImageResult<image::DynamicImage> {
         decode_image(path, image::ImageReader::open(path).unwrap())
+    }
+
+    fn extension_error(path: &Path) -> String {
+        let reader = image::ImageReader::open(path).unwrap();
+        reader.decode().unwrap_err().to_string()
     }
 
     #[test]
@@ -674,19 +746,42 @@ mod image_tests {
             ("garbage.png", &b"not an image"[..]),
             ("garbage", b"not an image"),
             ("empty.png", b""),
+            ("png-magic.jpg", b"\x89PNG\r\n\x1a\nnot a png"),
+            ("bmp-magic.png", b"BM but not a bitmap"),
         ] {
             let path = files.write(name, bytes);
-            let by_extension = image::ImageReader::open(&path)
-                .unwrap()
-                .decode()
-                .unwrap_err()
-                .to_string();
             assert_eq!(
                 decode(&path).unwrap_err().to_string(),
-                by_extension,
+                extension_error(&path),
                 "{name}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_image_reads_a_pipe_or_directory_once() {
+        let files = Files::new("decode-once");
+
+        let dir = files.0.join("dir.png");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(decode(&dir).unwrap_err().to_string(), extension_error(&dir));
+
+        let pipe = files.0.join("pipe.png");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let writer = {
+            let pipe = pipe.clone();
+            std::thread::spawn(move || std::fs::write(pipe, b"not an image").unwrap())
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(decode(&pipe).is_err()));
+        let failed = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        writer.join().unwrap();
+        assert_eq!(failed, Ok(true), "the decode did not return its error");
     }
 }
 
@@ -729,10 +824,81 @@ pub(crate) mod tests {
     fn hf_endpoint_defaults_when_unset_or_empty() {
         assert_eq!(hf_endpoint(None), "https://huggingface.co");
         assert_eq!(hf_endpoint(Some(String::new())), "https://huggingface.co");
-        assert_eq!(
-            hf_endpoint(Some("https://hf-mirror.example".into())),
-            "https://hf-mirror.example"
+        assert_eq!(hf_endpoint(Some("/".into())), "https://huggingface.co");
+        for endpoint in ["https://hf-mirror.example", "https://hf-mirror.example/"] {
+            assert_eq!(
+                hf_endpoint(Some(endpoint.into())),
+                "https://hf-mirror.example"
+            );
+        }
+    }
+
+    #[cfg(feature = "hf-hub")]
+    #[test]
+    fn hf_home_token_reads_the_token_file_in_hf_home() {
+        let hf_home =
+            std::env::temp_dir().join(format!("fastembed-hf-home-{}", std::process::id()));
+        std::fs::create_dir_all(&hf_home).unwrap();
+        let without_file = hf_home_token(&hf_home);
+        std::fs::write(hf_home.join("token"), " hf_token\n").unwrap();
+        let with_file = hf_home_token(&hf_home);
+        std::fs::remove_dir_all(&hf_home).unwrap();
+
+        assert_eq!(without_file, None);
+        assert_eq!(with_file.as_deref(), Some("hf_token"));
+    }
+
+    #[cfg(all(
+        feature = "hf-hub",
+        any(
+            feature = "qwen3-text",
+            feature = "nomic-v2-moe",
+            feature = "bert-text"
+        )
+    ))]
+    #[test]
+    fn shard_files_lists_each_shard_once_and_stays_inside_the_repo() {
+        let index = |files: &[&str]| {
+            let weight_map: serde_json::Map<String, serde_json::Value> = files
+                .iter()
+                .enumerate()
+                .map(|(i, file)| (format!("weight.{i}"), (*file).into()))
+                .collect();
+            serde_json::json!({ "weight_map": weight_map })
+        };
+
+        let shards = shard_files(
+            &index(&[
+                "model-2.safetensors",
+                "model-1.safetensors",
+                "model-2.safetensors",
+            ]),
+            "index",
         );
+        assert_eq!(
+            shards.unwrap(),
+            ["model-1.safetensors", "model-2.safetensors"]
+        );
+        assert_eq!(
+            shard_files(&index(&["shards/model-1.safetensors"]), "index").unwrap(),
+            ["shards/model-1.safetensors"]
+        );
+
+        for file in ["/etc/hostname", "../model.safetensors", "shards/../../x"] {
+            let err = shard_files(&index(&[file]), "index").unwrap_err();
+            assert!(err.to_string().contains(file), "error was: {err}");
+        }
+        assert!(shard_files(&serde_json::json!({}), "index").is_err());
+    }
+
+    #[test]
+    fn intra_threads_or_prefers_the_request_and_tolerates_an_unknown_core_count() {
+        let cores = || Ok(std::num::NonZeroUsize::new(8).unwrap());
+        let unknown = || Err(std::io::Error::other("unknown"));
+        assert_eq!(intra_threads_or(Some(2), cores()), Some(2));
+        assert_eq!(intra_threads_or(None, cores()), Some(8));
+        assert_eq!(intra_threads_or(Some(2), unknown()), Some(2));
+        assert_eq!(intra_threads_or(None, unknown()), None);
     }
 
     #[test]
@@ -778,9 +944,50 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn load_tokenizer_refuses_a_max_length_below_the_special_tokens() {
+    fn load_tokenizer_names_the_cause_of_an_unreadable_file() {
         let mut files = tokenizer_files(r#"{"model_max_length": 512, "pad_token": "[PAD]"}"#);
-        // Adds two special tokens per text, three per pair.
+        files.config_file = b"{".to_vec();
+        let err = load_tokenizer(files, 512).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "error was: {err}");
+        assert!(
+            err.to_string()
+                .contains("Could not read config.json file: EOF while parsing"),
+            "error message was: {err}"
+        );
+    }
+
+    #[test]
+    fn load_tokenizer_keeps_the_flags_of_a_special_token_in_tokenizer_json() {
+        let mut files = tokenizer_files(r#"{"model_max_length": 512, "pad_token": "[PAD]"}"#);
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&files.tokenizer_file).unwrap();
+        tokenizer["normalizer"] = serde_json::json!({"type": "Lowercase"});
+        tokenizer["model"]["vocab"]["[SEP]"] = 3.into();
+        tokenizer["added_tokens"] = serde_json::json!([{
+            "id": 3,
+            "content": "[SEP]",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }]);
+        files.tokenizer_file = serde_json::to_vec(&tokenizer).unwrap();
+        files.special_tokens_map_file =
+            br#"{"sep_token": "[SEP]", "mask_token": "[MASK]"}"#.to_vec();
+
+        let tokenizer = load_tokenizer(files, 512).unwrap();
+        let ids = |text: &str| tokenizer.encode(text, true).unwrap().get_ids().to_vec();
+        assert_eq!(ids("hello [SEP]"), [2, 3]);
+        // Only the exact string is the special token. The lower-case one is three unknown words.
+        assert_eq!(ids("hello [sep]"), [2, 0, 0, 0]);
+        // A token that tokenizer.json does not have is still added.
+        assert_eq!(ids("hello [MASK]"), [2, 4]);
+    }
+
+    /// Tokenizer files whose post-processor adds two special tokens to a text, three to a pair.
+    pub(crate) fn bert_tokenizer_files() -> TokenizerFiles {
+        let mut files = tokenizer_files(r#"{"model_max_length": 512, "pad_token": "[PAD]"}"#);
         let mut tokenizer: serde_json::Value =
             serde_json::from_slice(&files.tokenizer_file).unwrap();
         tokenizer["post_processor"] = serde_json::json!({
@@ -789,6 +996,12 @@ pub(crate) mod tests {
             "cls": ["[UNK]", 0]
         });
         files.tokenizer_file = serde_json::to_vec(&tokenizer).unwrap();
+        files
+    }
+
+    #[test]
+    fn load_tokenizer_refuses_a_max_length_below_the_special_tokens() {
+        let files = bert_tokenizer_files();
 
         let err = load_tokenizer(files.clone(), 1).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "error was: {err}");
@@ -830,6 +1043,16 @@ pub(crate) mod tests {
             None,
         );
         assert!(builder.is_ok());
+
+        // ONNX Runtime refuses an empty key, so an error shows that the entry reached it.
+        let refused = init_session_builder(
+            None,
+            vec![],
+            Some(1),
+            vec![(String::new(), "1".into())],
+            None,
+        );
+        assert!(matches!(refused, Err(Error::OrtBuilder(_))));
     }
 
     /// Encodes a protobuf field tag followed by a length-delimited payload.

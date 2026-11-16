@@ -5,6 +5,7 @@ use crate::{
         check_pair_truncation, encode_batch, init_session_builder, load_tokenizer, Error, Result,
     },
     models::reranking::reranker_model_list,
+    similarity::by_score_descending,
     RerankerModel, RerankerModelInfo,
 };
 use ndarray::{s, ArrayViewD};
@@ -191,19 +192,19 @@ impl TextRerank {
                 index,
             })
             .collect();
-        top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());
+        top_n_result.sort_by(|a, b| by_score_descending(a.score, b.score));
         Ok(top_n_result)
     }
 }
 
-/// One score per document from `[batch]` or `[batch, 1]` logits.
+/// One score per document: `[batch]` logits, or the first column of `[batch, n]` logits.
 fn logits_to_scores(logits: &ArrayViewD<f32>, documents: usize) -> Result<Vec<f32>> {
     let scores: Vec<f32> = match logits.shape() {
         [_] => logits.iter().copied().collect(),
         [_, width] if *width > 0 => logits.slice(s![.., 0]).iter().copied().collect(),
         shape => {
             return Err(Error::InvalidShape(format!(
-                "Expected logits of shape [batch] or [batch, 1], got {shape:?}"
+                "Expected logits of shape [batch] or [batch, n], got {shape:?}"
             )))
         }
     };
@@ -219,7 +220,20 @@ fn logits_to_scores(logits: &ArrayViewD<f32>, documents: usize) -> Result<Vec<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::tests::{bert_tokenizer_files, relu_model_bytes};
     use ndarray::{arr1, arr2, Array3};
+
+    #[test]
+    fn a_max_length_below_the_special_tokens_of_a_pair_is_refused() {
+        let build = |max_length| {
+            TextRerank::try_new_from_user_defined(
+                UserDefinedRerankingModel::new(relu_model_bytes(), bert_tokenizer_files()),
+                RerankInitOptionsUserDefined::default().with_max_length(max_length),
+            )
+        };
+        assert!(matches!(build(2), Err(Error::InvalidArgument(_))));
+        assert!(build(3).is_ok());
+    }
 
     #[test]
     fn logits_to_scores_takes_batch_and_batch_by_one() {

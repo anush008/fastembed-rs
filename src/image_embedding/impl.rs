@@ -162,18 +162,19 @@ impl ImageEmbedding {
         let output = images
             .chunks(batch_size)
             .map(|batch| {
-                // Encode the texts in the batch
+                // One decoded image at a time, so the batch holds only the model inputs.
                 let inputs = batch
                     .iter()
                     .map(|img| {
-                        image::ImageReader::new(Cursor::new(img))
+                        let image = image::ImageReader::new(Cursor::new(img))
                             .with_guessed_format()?
                             .decode()
-                            .map_err(|err| Error::ImageDecode(err.to_string()))
+                            .map_err(|err| Error::ImageDecode(err.to_string()))?;
+                        self.preprocessor.preprocess(image)
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                self.embed_images(inputs)
+                self.embed_preprocessed(inputs)
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -204,17 +205,18 @@ impl ImageEmbedding {
         let output = images
             .chunks(batch_size)
             .map(|batch| {
-                // Encode the texts in the batch
+                // One decoded image at a time, so the batch holds only the model inputs.
                 let inputs = batch
                     .iter()
                     .map(|img| {
                         let reader = image::ImageReader::open(img)?;
-                        decode_image(img.as_ref(), reader)
-                            .map_err(|err| Error::ImageDecode(err.to_string()))
+                        let image = decode_image(img.as_ref(), reader)
+                            .map_err(|err| Error::ImageDecode(err.to_string()))?;
+                        self.preprocessor.preprocess(image)
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                self.embed_images(inputs)
+                self.embed_preprocessed(inputs)
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -338,5 +340,30 @@ mod tests {
             ImageEmbedding::try_new_from_user_defined(model, Default::default()).unwrap();
         assert!(model.embed_preprocessed(Vec::new()).unwrap().is_empty());
         assert!(model.embed_images(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn embed_reads_an_image_whose_extension_names_another_format() {
+        use crate::common::image_tests::{png, Files};
+
+        let model = UserDefinedImageEmbeddingModel::new(
+            crate::common::tests::relu_model_bytes(),
+            br#"{"do_resize": false}"#.to_vec(),
+        );
+        let mut model =
+            ImageEmbedding::try_new_from_user_defined(model, Default::default()).unwrap();
+        let files = Files::new("embed");
+        let png_as_jpg = files.write("image.jpg", &png());
+        let garbage = files.write("garbage.jpg", b"not an image");
+
+        // The test model takes no image, so a decoded image fails later, in the session.
+        assert!(matches!(
+            model.embed([&png_as_jpg], None),
+            Err(Error::OrtSession(_))
+        ));
+        assert!(matches!(
+            model.embed([&garbage], None),
+            Err(Error::ImageDecode(_))
+        ));
     }
 }

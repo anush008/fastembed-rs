@@ -312,7 +312,8 @@ impl SparseTextEmbedding {
                 let mut indices = Vec::new();
                 for (idx, &score) in pooled.iter().enumerate() {
                     if score > 0.0 {
-                        values.push((1.0 + score).ln());
+                        // `(1.0 + score).ln()` is 0 for a score below the f32 epsilon.
+                        values.push(score.ln_1p());
                         indices.push(idx);
                     }
                 }
@@ -417,7 +418,7 @@ impl SparseTextEmbedding {
                     if score <= 0.0 || special_token_ids.contains(&token_id) {
                         continue;
                     }
-                    values.push((1.0 + (1.0 + score).ln()).ln());
+                    values.push(score.ln_1p().ln_1p());
                     indices.push(token_id);
                 }
 
@@ -500,6 +501,26 @@ mod tests {
         let expected = [2.0f32.ln(), 3.0f32.ln(), 1.5f32.ln()];
         for (value, expected) in out[0].values.iter().zip(expected) {
             assert!((value - expected).abs() < 1e-6, "{value} != {expected}");
+        }
+    }
+
+    #[test]
+    fn a_small_positive_logit_keeps_a_positive_value() {
+        // 1.0 + 5e-8 rounds to 1.0 in f32, whose logarithm is 0.
+        let logits = Array3::from_elem((1, 1, 1), 5e-8f32);
+        let logits = logits.view().into_dyn();
+        let mask = arr2(&[[1i64]]);
+
+        let splade = SparseTextEmbedding::post_process_splade(&logits, &mask).unwrap();
+        let if_splade =
+            SparseTextEmbedding::post_process_if_splade(&logits, &mask, &HashSet::new()).unwrap();
+        for out in [splade, if_splade] {
+            assert_eq!(out[0].indices, [0]);
+            assert!(
+                (out[0].values[0] - 5e-8).abs() < 1e-12,
+                "{:?}",
+                out[0].values
+            );
         }
     }
 

@@ -24,7 +24,8 @@ pub struct ImageInitOptionsUserDefined {
     pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
-    /// every available CPU core via `std::thread::available_parallelism`.
+    /// every available CPU core via `std::thread::available_parallelism`, or
+    /// ONNX Runtime's own default when the core count cannot be read.
     /// Set this to cap CPU usage (e.g. on laptops) at the cost of throughput.
     pub intra_threads: Option<usize>,
     /// ONNX Runtime session configuration entries, applied with
@@ -152,6 +153,12 @@ impl ImagePreprocessor {
 
     /// Resize, crop, rescale, and normalize an image according to this model's configuration.
     pub fn preprocess(&self, image: DynamicImage) -> crate::Result<Array3<f32>> {
+        let (width, height) = (image.width(), image.height());
+        if width == 0 || height == 0 {
+            return Err(crate::Error::ImageTransform(format!(
+                "A {width}x{height} image has no pixels"
+            )));
+        }
         match &self.resize {
             Some(resize) => self
                 .inner
@@ -193,6 +200,18 @@ mod tests {
             .with_auto_device(AutoDevicePolicy::PreferCPU);
         let user_defined = ImageInitOptionsUserDefined::from(opts);
         assert_eq!(user_defined.auto_device, Some(AutoDevicePolicy::PreferCPU));
+    }
+
+    #[test]
+    fn an_image_without_pixels_is_refused() {
+        let config = br#"{"do_resize": true, "size": {"shortest_edge": 224}}"#;
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap());
+        for (width, height) in [(0, 5), (5, 0), (0, 0)] {
+            assert!(matches!(
+                preprocessor.preprocess(RgbImage::new(width, height).into()),
+                Err(crate::Error::ImageTransform(_))
+            ));
+        }
     }
 
     #[test]
