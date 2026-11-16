@@ -32,8 +32,9 @@ jobs:
           ./build.sh --update --build --config Release --parallel --compile_no_warning_as_error --skip_submodule_sync
           cd ..
 
-      - name: Always Save Cache
-        if: always() && steps.cache-build-restore.outputs.cache-hit != 'true'
+      # A build that failed or was cancelled must not be saved: the key cannot be written twice.
+      - name: Save ONNX Build
+        if: steps.cache-build-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           key: '${{ steps.cache-build-restore.outputs.cache-primary-key }}'
@@ -60,6 +61,7 @@ jobs:
           - { name: image, filter: "--test image-embeddings" }
           - { name: qwen3, filter: "--features qwen3 --lib --test qwen3", cache: test-qwen3 }
           - { name: nomic-v2-moe, filter: "--features nomic-v2-moe --test nomic_v2_moe", cache: test-nomic-v2-moe }
+          - { name: bert-text, filter: "--features bert-text --lib --test bert_embedding", cache: test-bert-text }
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -130,8 +132,14 @@ jobs:
             name: nomic-v2-moe
             features: "nomic-v2-moe,hf-hub-native-tls"
           - os: ubuntu-latest
+            name: bert-text
+            features: "bert-text,hf-hub-native-tls"
+          - os: ubuntu-latest
             name: rustls-image
             features: "hf-hub-rustls-tls,image-models"
+          - os: ubuntu-latest
+            name: ort-load-dynamic
+            features: "ort-load-dynamic,hf-hub-native-tls,image-models"
           - os: windows-latest
             name: directml
             features: "directml,hf-hub-native-tls,image-models"
@@ -149,7 +157,7 @@ jobs:
 
   # The in-file tests of the Metal code: the fused Qwen3 kernels and the model-level
   # Metal checks. They build random weights, so nothing is downloaded but ONNX Runtime,
-  # which the crate links whatever its features.
+  # which `ort-download-binaries-native-tls` adds so that the ONNX unit tests run here too.
   test-metal:
     runs-on: macos-15
     permissions:

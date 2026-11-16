@@ -1,11 +1,14 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    common::{encode_batch, init_session_builder, load_tokenizer, Error, Result},
+    common::{
+        check_pair_truncation, encode_batch, init_session_builder, load_tokenizer, Error, Result,
+    },
     models::reranking::reranker_model_list,
+    similarity::by_score_descending,
     RerankerModel, RerankerModelInfo,
 };
-use ndarray::s;
+use ndarray::{s, ArrayViewD};
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
@@ -86,6 +89,7 @@ impl TextRerank {
         .commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
+        check_pair_truncation(&tokenizer)?;
         Ok(Self::new(tokenizer, session))
     }
 
@@ -133,6 +137,7 @@ impl TextRerank {
         };
 
         let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
+        check_pair_truncation(&tokenizer)?;
         Ok(Self::new(tokenizer, session))
     }
 
@@ -174,7 +179,7 @@ impl TextRerank {
                 .map_err(|e| {
                     Error::TensorExtraction(format!("Failed to extract logits tensor: {e}"))
                 })?;
-            scores.extend(outputs.slice(s![.., 0]).iter().copied());
+            scores.extend(logits_to_scores(&outputs, batch.len())?);
         }
 
         // Return top_n_result of type Vec<RerankResult> ordered by score in descending order, don't use binary heap
@@ -187,7 +192,68 @@ impl TextRerank {
                 index,
             })
             .collect();
-        top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());
+        top_n_result.sort_by(|a, b| by_score_descending(a.score, b.score));
         Ok(top_n_result)
+    }
+}
+
+/// One score per document: `[batch]` logits, or the first column of `[batch, n]` logits.
+fn logits_to_scores(logits: &ArrayViewD<f32>, documents: usize) -> Result<Vec<f32>> {
+    let scores: Vec<f32> = match logits.shape() {
+        [_] => logits.iter().copied().collect(),
+        [_, width] if *width > 0 => logits.slice(s![.., 0]).iter().copied().collect(),
+        shape => {
+            return Err(Error::InvalidShape(format!(
+                "Expected logits of shape [batch] or [batch, n], got {shape:?}"
+            )))
+        }
+    };
+    if scores.len() != documents {
+        return Err(Error::InvalidShape(format!(
+            "Expected one score per document, got logits of shape {:?} for {documents} documents",
+            logits.shape()
+        )));
+    }
+    Ok(scores)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::tests::{bert_tokenizer_files, relu_model_bytes};
+    use ndarray::{arr1, arr2, Array3};
+
+    #[test]
+    fn a_max_length_below_the_special_tokens_of_a_pair_is_refused() {
+        let build = |max_length| {
+            TextRerank::try_new_from_user_defined(
+                UserDefinedRerankingModel::new(relu_model_bytes(), bert_tokenizer_files()),
+                RerankInitOptionsUserDefined::default().with_max_length(max_length),
+            )
+        };
+        assert!(matches!(build(2), Err(Error::InvalidArgument(_))));
+        assert!(build(3).is_ok());
+    }
+
+    #[test]
+    fn logits_to_scores_takes_batch_and_batch_by_one() {
+        let flat = arr1(&[0.5f32, -1.0]).into_dyn();
+        assert_eq!(logits_to_scores(&flat.view(), 2).unwrap(), [0.5, -1.0]);
+        let column = arr2(&[[0.5f32], [-1.0]]).into_dyn();
+        assert_eq!(logits_to_scores(&column.view(), 2).unwrap(), [0.5, -1.0]);
+        let wide = arr2(&[[0.5f32, 9.0], [-1.0, 9.0]]).into_dyn();
+        assert_eq!(logits_to_scores(&wide.view(), 2).unwrap(), [0.5, -1.0]);
+    }
+
+    #[test]
+    fn logits_to_scores_rejects_other_shapes() {
+        let rank3 = Array3::<f32>::zeros((2, 1, 1)).into_dyn();
+        assert!(logits_to_scores(&rank3.view(), 2).is_err());
+        let scalar = ndarray::arr0(1f32).into_dyn();
+        assert!(logits_to_scores(&scalar.view(), 1).is_err());
+        let empty_width = ndarray::Array2::<f32>::zeros((2, 0)).into_dyn();
+        assert!(logits_to_scores(&empty_width.view(), 2).is_err());
+        let short = arr1(&[0.5f32]).into_dyn();
+        assert!(logits_to_scores(&short.view(), 2).is_err());
     }
 }

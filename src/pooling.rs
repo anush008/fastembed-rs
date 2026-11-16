@@ -19,10 +19,13 @@ impl Default for Pooling {
 pub fn cls(tensor: &ArrayView<f32, Dim<IxDynImpl>>) -> Result<Array2<f32>> {
     match tensor.dim().ndim() {
         2 => Ok(tensor.slice(s![.., ..]).to_owned()),
+        3 if tensor.shape()[1] == 0 => Err(Error::InvalidShape(
+            "The output has no token to take the CLS embedding from".into(),
+        )),
         3 => Ok(tensor.slice(s![.., 0, ..]).to_owned()),
         _ => Err(Error::InvalidShape(format!(
             "Invalid output shape: {shape:?}. Expected 2D or 3D tensor.",
-            shape = tensor.dim()
+            shape = tensor.shape()
         ))),
     }
 }
@@ -46,7 +49,7 @@ pub fn mean(
     } else if token_embeddings.dim().ndim() != 3 {
         return Err(Error::InvalidShape(format!(
             "Invalid output shape: {shape:?}. Expected 2D or 3D tensor.",
-            shape = token_embeddings.dim()
+            shape = token_embeddings.shape()
         )));
     }
 
@@ -75,4 +78,37 @@ pub fn mean(
     let mask_sum = attention_mask.sum_axis(ndarray::Axis(1));
     let mask_sum = mask_sum.mapv(|x| if x == 0f32 { 1.0 } else { x });
     Ok(&sum / &mask_sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::ArrayD;
+
+    #[test]
+    fn cls_takes_the_first_token_and_refuses_an_output_without_tokens() {
+        let output = ArrayD::from_shape_vec(vec![1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(cls(&output.view()).unwrap(), ndarray::arr2(&[[1.0, 2.0]]));
+
+        let no_tokens = ArrayD::<f32>::zeros(vec![1, 0, 2]);
+        assert!(matches!(
+            cls(&no_tokens.view()),
+            Err(Error::InvalidShape(_))
+        ));
+    }
+
+    #[test]
+    fn a_shape_error_names_the_shape() {
+        let output = ArrayD::<f32>::zeros(vec![2]);
+        let mask = Array2::<i64>::zeros((2, 1));
+        for err in [
+            cls(&output.view()).unwrap_err(),
+            mean(&output.view(), &mask).unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("Invalid output shape: [2]."),
+                "error message was: {err}"
+            );
+        }
+    }
 }

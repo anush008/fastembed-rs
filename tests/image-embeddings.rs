@@ -30,10 +30,38 @@ fn test_image_embedding_model() {
         let embeddings = model.embed(images.clone(), None).unwrap();
 
         assert_eq!(embeddings.len(), images.len());
+        for embedding in &embeddings {
+            assert_eq!(embedding.len(), supported_model.dim);
+        }
+        if supported_model.model == ImageEmbeddingModel::ClipVitB32 {
+            assert_clip_matches_python_counterpart(&embeddings);
+        }
     };
     ImageEmbedding::list_supported_models()
         .iter()
         .for_each(test_one_model);
+}
+
+/// Compares the ClipVitB32 embeddings of the two test images with the vectors that fastembed
+/// 0.9.1 (Python) returns. `image_1.png` has the size of the model input. `image_0.png` is
+/// resized first, and PIL rounds the resized pixels differently from the image crate: the
+/// distance is 0.020 with the bicubic filter of the model, and 0.068 with the bilinear one.
+fn assert_clip_matches_python_counterpart(embeddings: &[Vec<f32>]) {
+    let baseline: Vec<Vec<f32>> =
+        serde_json::from_str(include_str!("assets/clip_vit_b32_images.json")).unwrap();
+    assert_eq!(embeddings.len(), baseline.len());
+    for ((embedding, expected), tolerance) in embeddings.iter().zip(&baseline).zip([3e-2, 1e-4]) {
+        assert_eq!(embedding.len(), expected.len());
+        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm {norm}");
+        let distance = embedding
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(distance < tolerance, "distance {distance}");
+    }
 }
 
 #[test]

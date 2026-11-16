@@ -10,7 +10,8 @@
 //! - [`TextRerank`] - cross-encoder reranking of candidates
 //!
 //! These run on ONNX Runtime and need the `onnx` feature, which is on by default
-//! and which every `ort-*` feature turns on.
+//! and which every `ort-*` feature turns on. [`ImageEmbedding`] also needs the
+//! `image-models` feature, which is on by default too.
 //!
 //! Qwen3 and Nomic v2 MoE embeddings are available behind the `qwen3` and
 //! `nomic-v2-moe` feature flags (candle backend). A build with
@@ -24,7 +25,8 @@
 //!
 //! Models download to `./.fastembed_cache` on first use, then load from there.
 //! Override the location with the `FASTEMBED_CACHE_DIR` env var or
-//! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both.
+//! [`TextInitOptions`]`::with_cache_dir`. `HF_HOME` takes precedence over both, and models
+//! are cached directly in that directory.
 //! Set `HF_ENDPOINT` to pull from a mirror.
 //!
 // Without `onnx` the ONNX types above are not in the crate, so their links point at docs.rs.
@@ -34,9 +36,14 @@
 [`TextEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=TextEmbedding
 [`SparseTextEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=SparseTextEmbedding
 [`Bgem3Embedding`]: https://docs.rs/fastembed/latest/fastembed/?search=Bgem3Embedding
-[`ImageEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=ImageEmbedding
 [`TextRerank`]: https://docs.rs/fastembed/latest/fastembed/?search=TextRerank
 [`TextInitOptions`]: https://docs.rs/fastembed/latest/fastembed/?search=TextInitOptions
+"#
+)]
+#![cfg_attr(
+    not(feature = "image-models"),
+    doc = r#"
+[`ImageEmbedding`]: https://docs.rs/fastembed/latest/fastembed/?search=ImageEmbedding
 "#
 )]
 #![cfg_attr(
@@ -76,17 +83,15 @@
 # fn embedding_demo() -> fastembed::Result<()> {
 # let mut model: TextEmbedding = TextEmbedding::try_new(Default::default())?;
  let documents = vec![
-    "passage: Hello, World!",
-    "query: Hello, World!",
-    "passage: This is an example passage.",
-    // You can leave out the prefix but it's recommended
+    "Hello, World!",
+    "This is an example passage.",
     "fastembed-rs is licensed under Apache 2.0"
     ];
 
  // Generate embeddings with the default batch size, 256
  let embeddings = model.embed(documents, None)?;
 
- println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 4
+ println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 3
  # Ok(())
  # }
  ```
@@ -140,7 +145,8 @@ pub use crate::models::ModelTrait;
 pub use crate::models::text_embedding::EmbeddingModel;
 #[cfg(feature = "onnx")]
 pub use crate::text_embedding::{
-    InitOptionsUserDefined, TextEmbedding, TextInitOptions, UserDefinedEmbeddingModel,
+    ExternalInitializerFile, InitOptionsUserDefined, TextEmbedding, TextInitOptions,
+    UserDefinedEmbeddingModel,
 };
 #[cfg(feature = "onnx")]
 #[deprecated(note = "use `TextInitOptions` instead")]

@@ -1,4 +1,5 @@
 #![cfg(all(feature = "bert-text", feature = "hf-hub"))]
+#![allow(clippy::excessive_precision)]
 
 use candle_core::{DType, Device};
 use fastembed::BertTextEmbedding;
@@ -42,12 +43,69 @@ fn mxbai_cpu_normalizes_embeddings() {
         assert!((n - 1.0).abs() < 1e-3, "cpu vector norm {n}");
     }
     // Length-sorted batching still returns the vectors in the input order.
-    let again = cpu.embed(&TEXTS).expect("cpu embed again");
-    for (first, second) in out.iter().zip(&again) {
-        assert!(
-            cos(first, second) > 0.999_999,
-            "cpu embedding changed between runs"
-        );
+    for (text, batched) in TEXTS.iter().zip(&out) {
+        let alone = &cpu.embed(&[text]).expect("cpu embed one text")[0];
+        let c = cos(batched, alone);
+        assert!(c > 0.999_9, "{text:?} in a batch against alone: cosine {c}");
+    }
+}
+
+/// RoBERTa counts positions from the padding id, and BERT from 0.
+#[test]
+fn distilroberta_matches_transformers() {
+    let model = BertTextEmbedding::from_hf(
+        "sentence-transformers/all-distilroberta-v1",
+        &Device::Cpu,
+        DType::F32,
+        4096,
+    )
+    .expect("cpu load");
+    // The position table has 514 rows, and the first two belong to no token.
+    assert_eq!(model.max_length(), 512);
+
+    // The first 8 values of the normalized `last_hidden_state[:, 0]` that transformers 5.23
+    // returns for `TEXTS`, padded to one batch.
+    let baseline: [[f32; 8]; 3] = [
+        [
+            2.858_899_0e-2,
+            -3.270_944_2e-2,
+            -1.929_039_0e-2,
+            2.974_913_1e-2,
+            2.228_091_3e-2,
+            6.800_662_7e-2,
+            6.506_870_5e-3,
+            2.517_060_4e-2,
+        ],
+        [
+            -1.284_241_5e-2,
+            -2.229_934_4e-2,
+            -3.423_807_4e-2,
+            -4.778_776_7e-2,
+            -1.637_971_8e-2,
+            -4.964_015_0e-3,
+            -3.411_704_7e-2,
+            4.602_278_0e-2,
+        ],
+        [
+            3.986_878_3e-2,
+            -9.248_185_2e-2,
+            -2.973_057_0e-2,
+            -3.489_137_8e-2,
+            -1.661_183_1e-3,
+            6.729_853_9e-2,
+            -6.651_513_3e-2,
+            -3.024_310_6e-2,
+        ],
+    ];
+    let out = model.embed(&TEXTS).expect("cpu embed");
+    for (vector, expected) in out.iter().zip(&baseline) {
+        assert_eq!(vector.len(), 768);
+        for (actual, expected) in vector.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "{actual} is not {expected}"
+            );
+        }
     }
 }
 

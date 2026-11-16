@@ -36,7 +36,8 @@ pub struct InitOptionsUserDefined {
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     pub max_length: usize,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
-    /// every available CPU core via `std::thread::available_parallelism`.
+    /// every available CPU core via `std::thread::available_parallelism`, or
+    /// ONNX Runtime's own default when the core count cannot be read.
     /// Set this to cap CPU usage (e.g. on laptops) at the cost of throughput.
     pub intra_threads: Option<usize>,
     /// Refuse session creation when any graph node would fall back to the CPU

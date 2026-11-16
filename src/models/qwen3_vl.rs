@@ -149,6 +149,17 @@ impl Module for Conv3dNoBias {
         let xs1 = xs.i((.., .., 0, .., ..))?;
         let xs2 = xs.i((.., .., 1, .., ..))?;
 
+        // candle's CPU convolution takes no bf16, so there the two convolutions run in f32.
+        if xs.dtype() == DType::BF16 && xs.device().is_cpu() {
+            let in_f32 = |conv: &candle_nn::Conv2d, xs: &Tensor| {
+                let weight = conv.weight().to_dtype(DType::F32)?;
+                candle_nn::Conv2d::new(weight, None, *conv.config())
+                    .forward(&xs.to_dtype(DType::F32)?)
+            };
+            let sum = (in_f32(&self.conv2d_1, &xs1)? + in_f32(&self.conv2d_2, &xs2)?)?;
+            return sum.to_dtype(DType::BF16)?.unsqueeze(2);
+        }
+
         (self.conv2d_1.forward(&xs1)? + self.conv2d_2.forward(&xs2)?)?.unsqueeze(2)
     }
 }
@@ -415,7 +426,8 @@ impl PatchMerger {
             normed.reshape((grouped, self.merged_hidden_size))?
         };
         let xs = self.fc1.forward(&reshaped)?;
-        let xs = xs.gelu()?;
+        // nn.GELU() in the reference, not the tanh approximation.
+        let xs = xs.gelu_erf()?;
         self.fc2.forward(&xs)
     }
 }
@@ -723,5 +735,101 @@ impl Qwen3VLVisionModel {
 
         let hidden_states = self.merger.forward(&hidden_states)?;
         Ok((hidden_states, deepstack_features))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn the_patch_convolution_runs_in_bf16_on_the_cpu() {
+        let device = Device::Cpu;
+        // Small whole numbers: bf16 holds them, their products and the sums without rounding.
+        let whole = |len: usize, values: i64, shape: (usize, usize, usize, usize, usize)| {
+            let data: Vec<f32> = (0..len as i64)
+                .map(|i| ((i * 7) % values - values / 2) as f32)
+                .collect();
+            Tensor::from_vec(data, shape, &device).unwrap()
+        };
+        let weight = whole(4 * 3 * 8, 3, (4, 3, 2, 2, 2));
+        let xs = whole(5 * 3 * 8, 5, (5, 3, 2, 2, 2));
+        let conv = |dtype: DType| {
+            let tensors = HashMap::from([("weight".to_string(), weight.to_dtype(dtype).unwrap())]);
+            let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+            let cfg = Conv3dConfig {
+                stride: 2,
+                ..Default::default()
+            };
+            Conv3dNoBias::new(3, 4, [2, 2, 2], cfg, vb).unwrap()
+        };
+
+        let want = conv(DType::F32).forward(&xs).unwrap();
+        let got = conv(DType::BF16)
+            .forward(&xs.to_dtype(DType::BF16).unwrap())
+            .unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        assert_eq!(got.dims(), want.dims());
+        let values = |tensor: &Tensor| {
+            let tensor = tensor.to_dtype(DType::F32).unwrap();
+            tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        assert!(values(&want).iter().any(|value| *value != 0.0));
+        assert_eq!(values(&got), values(&want));
+    }
+
+    #[test]
+    fn patch_merger_uses_the_exact_gelu() {
+        let cfg: VisionConfig = serde_json::from_str(
+            r#"{"hidden_size": 2, "out_hidden_size": 8, "spatial_merge_size": 2}"#,
+        )
+        .unwrap();
+        let device = Device::Cpu;
+        let identity = |scale: f32| {
+            let data: Vec<f32> = (0..64)
+                .map(|i| if i % 9 == 0 { scale } else { 0.0 })
+                .collect();
+            Tensor::from_vec(data, (8, 8), &device).unwrap()
+        };
+        let zeros = || Tensor::zeros(8, DType::F32, &device).unwrap();
+        let tensors = HashMap::from([
+            (
+                "norm.weight".to_string(),
+                Tensor::ones(8, DType::F32, &device).unwrap(),
+            ),
+            ("norm.bias".to_string(), zeros()),
+            ("linear_fc1.weight".to_string(), identity(2.0)),
+            ("linear_fc1.bias".to_string(), zeros()),
+            ("linear_fc2.weight".to_string(), identity(1.0)),
+            ("linear_fc2.bias".to_string(), zeros()),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let merger = PatchMerger::new(&cfg, true, vb).unwrap();
+
+        let xs = Tensor::from_vec(
+            vec![-3f32, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0],
+            (4, 2),
+            &device,
+        )
+        .unwrap();
+        let got = merger.forward(&xs).unwrap().to_vec2::<f32>().unwrap();
+
+        // 0.5 * x * (1 + erf(x / sqrt(2))) of the normed input times two, from Python's math.erf.
+        // The tanh approximation is up to 3.4e-4 away on these values.
+        let expected = [
+            -0.0023499f32,
+            -0.0361006,
+            -0.1532828,
+            -0.1579483,
+            0.3718646,
+            0.906343,
+            2.0831509,
+            3.1765273,
+        ];
+        assert_eq!(got.len(), 1);
+        for (got, expected) in got[0].iter().zip(expected) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
     }
 }

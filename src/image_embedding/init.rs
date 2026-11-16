@@ -24,7 +24,8 @@ pub struct ImageInitOptionsUserDefined {
     pub environment: Option<Environment>,
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
-    /// every available CPU core via `std::thread::available_parallelism`.
+    /// every available CPU core via `std::thread::available_parallelism`, or
+    /// ONNX Runtime's own default when the core count cannot be read.
     /// Set this to cap CPU usage (e.g. on laptops) at the cost of throughput.
     pub intra_threads: Option<usize>,
     /// ONNX Runtime session configuration entries, applied with
@@ -152,6 +153,12 @@ impl ImagePreprocessor {
 
     /// Resize, crop, rescale, and normalize an image according to this model's configuration.
     pub fn preprocess(&self, image: DynamicImage) -> crate::Result<Array3<f32>> {
+        let (width, height) = (image.width(), image.height());
+        if width == 0 || height == 0 {
+            return Err(crate::Error::ImageTransform(format!(
+                "A {width}x{height} image has no pixels"
+            )));
+        }
         match &self.resize {
             Some(resize) => self
                 .inner
@@ -193,6 +200,75 @@ mod tests {
             .with_auto_device(AutoDevicePolicy::PreferCPU);
         let user_defined = ImageInitOptionsUserDefined::from(opts);
         assert_eq!(user_defined.auto_device, Some(AutoDevicePolicy::PreferCPU));
+    }
+
+    #[test]
+    fn an_image_without_pixels_is_refused() {
+        let config = br#"{"do_resize": true, "size": {"shortest_edge": 224}}"#;
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap());
+        for (width, height) in [(0, 5), (5, 0), (0, 0)] {
+            assert!(matches!(
+                preprocessor.preprocess(RgbImage::new(width, height).into()),
+                Err(crate::Error::ImageTransform(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_custom_resizer_gets_every_size() {
+        // The default resizer cannot allocate this size and refuses it.
+        let config = br#"{"do_resize": true, "size": {"width": 4294967295, "height": 4294967295}}"#;
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap());
+        assert!(preprocessor.preprocess(RgbImage::new(1, 1).into()).is_err());
+
+        let preprocessor = preprocessor.with_resize(|_, width, height, _| {
+            assert_eq!((width, height), (u32::MAX, u32::MAX));
+            Ok(RgbImage::new(2, 2).into())
+        });
+        let pixels = preprocessor.preprocess(RgbImage::new(1, 1).into()).unwrap();
+        assert_eq!(pixels.shape(), &[3, 2, 2]);
+    }
+
+    #[test]
+    fn the_resizer_gets_the_filter_that_the_config_names() {
+        use image::imageops::FilterType;
+
+        for (resample, expected) in [
+            ("", FilterType::CatmullRom),
+            (r#""resample": 0,"#, FilterType::Nearest),
+            (r#""resample": 1,"#, FilterType::Lanczos3),
+            (r#""resample": 2,"#, FilterType::Triangle),
+            (r#""resample": 3,"#, FilterType::CatmullRom),
+            // PIL's box filter has no counterpart in the image crate.
+            (r#""resample": 4,"#, FilterType::CatmullRom),
+        ] {
+            // ConvNext resizes to the exact size from a shortest edge of 384 on.
+            for (processor, shortest_edge) in [
+                ("CLIPImageProcessor", 4),
+                ("BitImageProcessor", 4),
+                ("ConvNextImageProcessor", 4),
+                ("ConvNextImageProcessor", 384),
+            ] {
+                let config = format!(
+                    r#"{{"image_processor_type": "{processor}", {resample}
+                        "do_resize": true, "size": {{"shortest_edge": {shortest_edge}}}}}"#
+                );
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap())
+                    .with_resize(move |image, _, _, filter| {
+                        assert_eq!(filter, expected);
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        Ok(image)
+                    });
+                preprocessor.preprocess(RgbImage::new(8, 8).into()).unwrap();
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    1,
+                    "{processor} {shortest_edge} {resample}"
+                );
+            }
+        }
     }
 
     #[test]

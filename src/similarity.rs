@@ -23,6 +23,8 @@ fn dot_f64(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Cosine similarity in `[-1.0, 1.0]`. `0.0` if either vector is all-zeros.
+///
+/// The dot product stops at the shorter slice, so compare vectors of one length.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let na = dot_f64(a, a).sqrt();
     let nb = dot_f64(b, b).sqrt();
@@ -33,6 +35,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// The `k` closest vectors in `corpus` to `query` as `(index, score)`, best first.
+/// Equal scores keep their `corpus` order, and a `NaN` score ranks last.
 ///
 /// `corpus` is any slice whose items deref to `&[f32]` (`&[Vec<f32>]`, `&[&[f32]]`, ...).
 pub fn top_k<V: AsRef<[f32]>>(query: &[f32], corpus: &[V], k: usize) -> Vec<(usize, f32)> {
@@ -41,9 +44,19 @@ pub fn top_k<V: AsRef<[f32]>>(query: &[f32], corpus: &[V], k: usize) -> Vec<(usi
         .enumerate()
         .map(|(i, v)| (i, cosine_similarity(query, v.as_ref())))
         .collect();
-    scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    scored.sort_by(|a, b| by_score_descending(a.1, b.1));
     scored.truncate(k);
     scored
+}
+
+/// Best score first. A `NaN` is no score, so it sorts last whatever its sign bit.
+pub(crate) fn by_score_descending(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        // `total_cmp` puts -0.0 below 0.0, and the two are one score.
+        (false, false) if a == b => std::cmp::Ordering::Equal,
+        (false, false) => b.total_cmp(&a),
+        (a_nan, b_nan) => a_nan.cmp(&b_nan),
+    }
 }
 
 #[cfg(test)]
@@ -67,6 +80,41 @@ mod tests {
         let corpus = [[-1e30, 0.0], [0.0, 1e-24], [1e30, 0.0]];
         let hits = top_k(&[1e-24, 0.0], &corpus, 3);
         assert_eq!(hits, vec![(2, 1.0), (1, 0.0), (0, -1.0)]);
+    }
+
+    #[test]
+    fn top_k_ranks_a_nan_score_last() {
+        let corpus = [[f32::NAN, 0.0], [0.0, 1.0], [1.0, 0.0]];
+        let hits = top_k(&[1.0, 0.0], &corpus, 3);
+        assert_eq!(hits[..2], [(2, 1.0), (1, 0.0)]);
+        assert!(hits[2].0 == 0 && hits[2].1.is_nan());
+    }
+
+    #[test]
+    fn by_score_descending_sorts_a_nan_of_either_sign_last() {
+        let mut scores = [f32::NAN, -1.0, -f32::NAN, f32::NEG_INFINITY, 2.0];
+        scores.sort_by(|a, b| by_score_descending(*a, *b));
+        assert_eq!(scores[..3], [2.0, -1.0, f32::NEG_INFINITY]);
+        assert!(scores[3].is_nan() && scores[4].is_nan());
+    }
+
+    #[test]
+    fn top_k_keeps_equal_scores_in_corpus_order() {
+        let corpus: Vec<[f32; 2]> = (0..41)
+            .map(|i| if i % 3 == 0 { [1.0, 0.0] } else { [0.0, 1.0] })
+            .collect();
+        let hits = top_k(&[1.0, 0.0], &corpus, 6);
+        let indices: Vec<usize> = hits.iter().map(|hit| hit.0).collect();
+        assert_eq!(indices, [0, 3, 6, 9, 12, 15]);
+    }
+
+    #[test]
+    fn top_k_keeps_zero_scores_of_either_sign_in_corpus_order() {
+        let corpus = [[-0.0, -1.0], [0.0, 1.0], [-0.0, -1.0]];
+        let hits = top_k(&[1.0, 0.0], &corpus, 3);
+        assert!(hits[0].1.is_sign_negative() && hits[1].1.is_sign_positive());
+        let indices: Vec<usize> = hits.iter().map(|hit| hit.0).collect();
+        assert_eq!(indices, [0, 1, 2]);
     }
 
     #[test]

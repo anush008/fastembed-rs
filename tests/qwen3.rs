@@ -127,21 +127,39 @@ fn qwen3_06b_reference_scores() {
 }
 
 /// candle's CPU quantized matmul rounds the activations to 8-bit blocks, as llama.cpp does.
+/// Its x86 kernel without VNNI rounds them in blocks of 32 values, and the cosine to the f32
+/// model is 0.9990 to 0.9994. The VNNI kernels of candle 0.11.1 use blocks of 256, and the
+/// cosine is 0.9965 to 0.9976. Other CPUs get the looser bounds too.
 #[test]
 fn qwen3_06b_gguf_matches_python() {
-    check_06b_gguf_against_python(&Device::Cpu, 1e-2, 6e-2);
+    #[cfg(target_arch = "x86_64")]
+    let blocks_of_32 = !(std::arch::is_x86_feature_detected!("avx512vnni")
+        || std::arch::is_x86_feature_detected!("avxvnni"));
+    #[cfg(not(target_arch = "x86_64"))]
+    let blocks_of_32 = false;
+
+    if blocks_of_32 {
+        check_06b_gguf_against_python(&Device::Cpu, 1e-2, 6e-2, 0.998);
+    } else {
+        check_06b_gguf_against_python(&Device::Cpu, 2e-2, 2.5e-1, 0.995);
+    }
 }
 
 #[cfg(feature = "metal")]
 #[test]
 fn qwen3_06b_gguf_matches_python_on_metal() {
-    check_06b_gguf_against_python(&Device::new_metal(0).expect("metal"), 5e-4, 5e-3);
+    check_06b_gguf_against_python(&Device::new_metal(0).expect("metal"), 5e-4, 5e-3, 0.998);
 }
 
 /// The Q8_0 GGUF of Qwen3-Embedding-0.6B, each text embedded alone. The Python values come from
 /// transformers loading the same file in f32, with last-token pooling and L2 normalization. Each
 /// full vector is also compared with the f32 safetensors model.
-fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolerance: f32) {
+fn check_06b_gguf_against_python(
+    device: &Device,
+    dim_tolerance: f32,
+    sum_tolerance: f32,
+    min_cosine: f32,
+) {
     let model = one_download_at_a_time(|| {
         Qwen3TextEmbedding::from_hf_gguf(
             "Qwen/Qwen3-Embedding-0.6B-GGUF",
@@ -215,8 +233,7 @@ fn check_06b_gguf_against_python(device: &Device, dim_tolerance: f32, sum_tolera
         let emb = model.embed(std::slice::from_ref(text)).expect("embed");
         let want = reference.embed(std::slice::from_ref(text)).expect("embed");
         let cosine = cosine_sim(&emb[0], &want[0]);
-        // Q8_0 weights and 8-bit activations give 0.9988 to 0.9994 on the CPU.
-        assert!(cosine > 0.998, "cosine to safetensors: {cosine}");
+        assert!(cosine > min_cosine, "cosine to safetensors: {cosine}");
         embeddings.extend(emb);
     }
     for (idx, emb) in embeddings.iter().enumerate() {

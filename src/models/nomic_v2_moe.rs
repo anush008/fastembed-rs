@@ -641,8 +641,11 @@ fn build_bidirectional_mask(attention_mask: &Tensor) -> Result<Tensor> {
 // Mean pooling + L2 normalization
 // ---------------------------------------------------------------------------
 
+/// The mean over the unmasked tokens, in f32: a sum over hundreds of half-precision values
+/// loses the small ones, and the vector would come out longer than one.
 fn mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-    let mask_f32 = attention_mask.to_dtype(hidden.dtype())?.unsqueeze(2)?;
+    let hidden = hidden.to_dtype(DType::F32)?;
+    let mask_f32 = attention_mask.to_dtype(DType::F32)?.unsqueeze(2)?;
     let masked = hidden.broadcast_mul(&mask_f32)?;
     let summed = masked.sum(1)?;
     let count = mask_f32.sum(1)?.clamp(1e-9, f64::MAX)?;
@@ -654,6 +657,17 @@ fn l2_normalize(xs: &Tensor) -> Result<Tensor> {
     let eps = Tensor::new(&[1e-12f32], xs.device())?.broadcast_as(sum_sq.shape())?;
     let norm = sum_sq.to_dtype(DType::F32)?.add(&eps)?.sqrt()?;
     xs.to_dtype(DType::F32)?.broadcast_div(&norm)
+}
+
+/// Right padding to the longest text of a batch, with the pad token of the model.
+fn batch_padding(cfg: &NomicConfig) -> tokenizers::PaddingParams {
+    tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        direction: tokenizers::PaddingDirection::Right,
+        pad_id: cfg.pad_token_id as u32,
+        pad_token: "<pad>".to_string(),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -682,8 +696,6 @@ impl NomicV2MoeTextEmbedding {
         dtype: DType,
         max_length: usize,
     ) -> Result<Self> {
-        use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
-
         let repo =
             crate::common::pull_from_hf(repo_id.to_string(), crate::get_cache_dir().into(), true)
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
@@ -697,7 +709,7 @@ impl NomicV2MoeTextEmbedding {
         .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         let weight_files: Vec<PathBuf> = crate::common::safetensors_weight_files(&repo)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            .map_err(|e| candle_core::Error::Msg(crate::common::error_with_cause(e)))?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, device)? };
         let model = NomicBertModel::new(cfg.clone(), vb)?;
@@ -708,17 +720,12 @@ impl NomicV2MoeTextEmbedding {
         let mut tokenizer = tokenizers::Tokenizer::from_file(tok_path)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
-        let _ = tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            direction: tokenizers::PaddingDirection::Right,
-            pad_id: cfg.pad_token_id as u32,
-            pad_token: "<pad>".to_string(),
-            ..Default::default()
-        }));
-        let _ = tokenizer.with_truncation(Some(TruncationParams {
-            max_length,
-            ..Default::default()
-        }));
+        tokenizer.with_padding(Some(batch_padding(&cfg)));
+        let truncation = crate::common::truncation_to(&tokenizer, max_length)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        tokenizer
+            .with_truncation(Some(truncation))
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
         Ok(Self {
             model,
@@ -740,10 +747,15 @@ impl NomicV2MoeTextEmbedding {
             return Ok(vec![]);
         }
 
-        let encodings = self
+        let mut encodings = self
             .tokenizer
             .encode_batch(texts.iter().map(|s| s.as_ref()).collect::<Vec<_>>(), true)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        if self.tokenizer.get_padding().is_none() {
+            // The rows of one batch need one length.
+            tokenizers::utils::padding::pad_encodings(&mut encodings, &batch_padding(&self.cfg))
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        }
 
         let batch_size = encodings.len();
         let seq_len = encodings[0].len();
@@ -751,7 +763,14 @@ impl NomicV2MoeTextEmbedding {
         let mut input_ids_vec: Vec<u32> = Vec::with_capacity(batch_size * seq_len);
         let mut attention_mask_vec: Vec<f32> = Vec::with_capacity(batch_size * seq_len);
 
-        for enc in &encodings {
+        for (i, enc) in encodings.iter().enumerate() {
+            if enc.len() != seq_len {
+                return Err(candle_core::Error::Msg(format!(
+                    "text {i} has {} tokens and text 0 has {seq_len}: the tokenizer does not pad \
+                     to the longest text",
+                    enc.len()
+                )));
+            }
             input_ids_vec.extend(enc.get_ids().iter().copied());
             attention_mask_vec.extend(enc.get_attention_mask().iter().map(|&m| m as f32));
         }
@@ -770,5 +789,87 @@ impl NomicV2MoeTextEmbedding {
         let normalized = l2_normalize(&pooled)?;
 
         normalized.to_vec2::<f32>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn pooled_vectors_have_unit_length_in_every_weight_dtype() {
+        let device = Device::Cpu;
+        let hidden = Tensor::randn(0f32, 1.0, (2, 64, 768), &device).unwrap();
+        // The second row has 40 tokens and 24 padded positions.
+        let mut mask = vec![1f32; 2 * 64];
+        mask[64 + 40..].fill(0.0);
+        let mask = Tensor::from_vec(mask, (2, 64), &device).unwrap();
+
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let pooled = mean_pool(&hidden.to_dtype(dtype).unwrap(), &mask).unwrap();
+            let vectors = l2_normalize(&pooled).unwrap().to_vec2::<f32>().unwrap();
+            for vector in vectors {
+                let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!((norm - 1.0).abs() < 1e-4, "{dtype:?}: norm {norm}");
+            }
+        }
+    }
+
+    /// A one-layer model with random weights, and a word-level tokenizer over `w0`..`w9` that
+    /// pads as `padding` says.
+    fn embedder(padding: Option<tokenizers::PaddingParams>) -> NomicV2MoeTextEmbedding {
+        let cfg: NomicConfig = serde_json::from_str(
+            r#"{"n_embd": 16, "n_head": 2, "n_inner": 32, "n_layer": 1, "n_positions": 64,
+                "vocab_size": 12}"#,
+        )
+        .unwrap();
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let model = NomicBertModel::new(cfg.clone(), vb).unwrap();
+
+        let vocab: Vec<String> = ["\"[UNK]\": 0".to_string(), "\"<pad>\": 1".to_string()]
+            .into_iter()
+            .chain((0..10).map(|i| format!("\"w{i}\": {}", i + 2)))
+            .collect();
+        let json = format!(
+            r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {{"type": "WhitespaceSplit"}},
+                "post_processor": null, "decoder": null,
+                "model": {{"type": "WordLevel", "vocab": {{{}}}, "unk_token": "[UNK]"}}}}"#,
+            vocab.join(", ")
+        );
+        let mut tokenizer = tokenizers::Tokenizer::from_str(&json).unwrap();
+        tokenizer.with_padding(padding);
+        NomicV2MoeTextEmbedding::new(model, tokenizer, cfg)
+    }
+
+    #[test]
+    fn a_tokenizer_without_padding_gives_each_text_its_own_vector() {
+        let model = embedder(None);
+        // Rows of 3, 2 and 4 tokens hold as many ids as three rows of 3.
+        let texts = ["w1 w2 w3", "w4 w5", "w6 w7 w8 w9"];
+        let together = model.embed(&texts).unwrap();
+        for (i, text) in texts.iter().enumerate() {
+            let alone = &model.embed(&[*text]).unwrap()[0];
+            let diff = together[i]
+                .iter()
+                .zip(alone)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(diff < 1e-5, "text {i} differs from alone by {diff}");
+        }
+        assert_ne!(together[0], together[1]);
+    }
+
+    #[test]
+    fn rows_of_different_lengths_are_refused() {
+        let model = embedder(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::Fixed(2),
+            ..Default::default()
+        }));
+        let err = model.embed(&["w1 w2 w3", "w4 w5", "w6 w7 w8 w9"]);
+        assert!(err.unwrap_err().to_string().contains("does not pad"));
+        assert_eq!(model.embed(&["w1", "w2 w3"]).unwrap().len(), 2);
     }
 }

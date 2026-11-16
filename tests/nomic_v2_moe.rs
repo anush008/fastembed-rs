@@ -15,6 +15,11 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn nomic_v2_moe_embed() {
     let device = Device::Cpu;
+    // The tokenizer adds two special tokens to a text.
+    let too_short = NomicV2MoeTextEmbedding::from_hf(REPO, &device, DType::F32, 1);
+    let err = too_short.err().expect("max_length 1").to_string();
+    assert!(err.contains("max_length"), "error was: {err}");
+
     let model = NomicV2MoeTextEmbedding::from_hf(REPO, &device, DType::F32, MAX_LENGTH)
         .expect("load model");
 

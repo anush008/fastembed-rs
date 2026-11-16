@@ -1,6 +1,8 @@
 //! The definition of the main struct for text embeddings - [`TextEmbedding`].
 
 #[cfg(feature = "hf-hub")]
+use crate::common::HubRepo;
+#[cfg(feature = "hf-hub")]
 use crate::common::{init_session_builder, load_tokenizer_hf_hub};
 use crate::{
     common::{encode_batch, load_tokenizer, Error, Result},
@@ -9,8 +11,6 @@ use crate::{
     Embedding, EmbeddingModel, EmbeddingOutput, ModelInfo, OutputKey, QuantizationMode,
     SingleBatchOutput,
 };
-#[cfg(feature = "hf-hub")]
-use hf_hub::api::sync::ApiRepo;
 use ort::session::Session;
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
@@ -65,7 +65,6 @@ impl TextEmbedding {
             })?;
         }
 
-        // Prioritize loading the pooling config if available; otherwise, look for it in the hardcoded defaults.
         let post_processing = TextEmbedding::get_default_pooling_method(&model_name);
 
         let session = init_session_builder(
@@ -143,7 +142,7 @@ impl TextEmbedding {
         model: EmbeddingModel,
         cache_dir: PathBuf,
         show_download_progress: bool,
-    ) -> Result<ApiRepo> {
+    ) -> Result<HubRepo> {
         use crate::common::pull_from_hf;
 
         let model_code = TextEmbedding::get_model_info(&model)?.model_code.clone();
@@ -214,13 +213,14 @@ impl TextEmbedding {
 
     /// Get the quantization mode of the model.
     ///
-    /// Any models with a `Q` suffix in their name are quantized models.
-    ///
-    /// Currently only 6 supported models have dynamic quantization:
+    /// A dynamically quantized model fits its value range to each batch, so
+    /// [`TextEmbedding::embed`] runs all the texts of a call as one batch. The `Q` variants of
+    /// these models are dynamically quantized:
     /// - Alibaba-NLP/gte-base-en-v1.5
     /// - Alibaba-NLP/gte-large-en-v1.5
     /// - mixedbread-ai/mxbai-embed-large-v1
     /// - nomic-ai/nomic-embed-text-v1.5
+    /// - snowflake/snowflake-arctic-embed (xs, s, m, m-long, l)
     /// - Xenova/all-MiniLM-L12-v2
     /// - Xenova/all-MiniLM-L6-v2
     ///
@@ -242,7 +242,8 @@ impl TextEmbedding {
             EmbeddingModel::SnowflakeArcticEmbedMQ => QuantizationMode::Dynamic,
             EmbeddingModel::SnowflakeArcticEmbedMLongQ => QuantizationMode::Dynamic,
             EmbeddingModel::SnowflakeArcticEmbedLQ => QuantizationMode::Dynamic,
-            EmbeddingModel::EmbeddingGemma300MQ => QuantizationMode::Dynamic,
+            // Int8 weights with float activations: batching-safe, so not Dynamic
+            EmbeddingModel::EmbeddingGemma300MQ => QuantizationMode::Static,
             // 4-bit static quantization: batching-safe, so not Dynamic
             EmbeddingModel::EmbeddingGemma300MQ4 => QuantizationMode::None,
             EmbeddingModel::AllMiniLML6V2
@@ -296,10 +297,6 @@ impl TextEmbedding {
     /// instance, which can be used to extract the embeddings with default or custom
     /// methods as well as output key precedence.
     ///
-    /// Metadata that could be useful for creating the array transformer is
-    /// returned alongside the [`EmbeddingOutput`] instance, such as pooling methods
-    /// etc.
-    ///
     /// # Note
     ///
     /// This is a lower level method than [`TextEmbedding::embed`], and is useful
@@ -320,12 +317,29 @@ impl TextEmbedding {
         batch_size: Option<usize>,
     ) -> Result<EmbeddingOutput> {
         let texts = texts.as_ref();
+        let Some(batch_size) = self.batch_size_for(texts.len(), batch_size)? else {
+            return Ok(EmbeddingOutput::new([]));
+        };
+
+        let batches = texts
+            .chunks(batch_size)
+            .map(|batch| self.run_batch(batch))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(EmbeddingOutput::new(batches))
+    }
+
+    /// The number of texts in one session run. `None` when there is no text to run.
+    fn batch_size_for(&self, texts: usize, batch_size: Option<usize>) -> Result<Option<usize>> {
+        if texts == 0 && batch_size != Some(0) {
+            return Ok(None);
+        }
         // Determine the batch size according to the quantization method used.
         // Default if not specified
         let batch_size = match self.quantization {
             QuantizationMode::Dynamic => {
                 if let Some(batch_size) = batch_size {
-                    if batch_size < texts.len() {
+                    if batch_size < texts {
                         Err(Error::InvalidArgument(
                             "Dynamic quantization cannot be used with batching. \
                             This is due to the dynamic quantization process adjusting \
@@ -335,10 +349,10 @@ impl TextEmbedding {
                                 .into(),
                         ))
                     } else {
-                        Ok(texts.len())
+                        Ok(texts)
                     }
                 } else {
-                    Ok(texts.len())
+                    Ok(texts)
                 }
             }
             _ => Ok(batch_size.unwrap_or(DEFAULT_BATCH_SIZE)),
@@ -348,29 +362,25 @@ impl TextEmbedding {
                 "batch_size must be greater than 0".into(),
             ));
         }
+        Ok(Some(batch_size))
+    }
 
-        let batches = texts
-            .chunks(batch_size)
-            .map(|batch| {
-                let inputs = batch.iter().map(|text| text.as_ref()).collect();
-                let mut encoded = encode_batch(&self.tokenizer, inputs)?;
-                let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
+    fn run_batch<S: AsRef<str> + Send + Sync>(&mut self, batch: &[S]) -> Result<SingleBatchOutput> {
+        let inputs = batch.iter().map(|text| text.as_ref()).collect();
+        let mut encoded = encode_batch(&self.tokenizer, inputs)?;
+        let session_inputs = encoded.session_inputs(self.need_token_type_ids)?;
 
-                let outputs_map = self
-                    .session
-                    .run(session_inputs)
-                    .map_err(|e| Error::OrtSession(e.to_string()))?
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect();
-                Ok(SingleBatchOutput {
-                    outputs: outputs_map,
-                    attention_mask_array: encoded.attention_mask,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(EmbeddingOutput::new(batches))
+        let outputs_map = self
+            .session
+            .run(session_inputs)
+            .map_err(|e| Error::OrtSession(e.to_string()))?
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        Ok(SingleBatchOutput {
+            outputs: outputs_map,
+            attention_mask_array: encoded.attention_mask,
+        })
     }
 
     /// Method to generate sentence embeddings for a collection of texts.
@@ -389,18 +399,36 @@ impl TextEmbedding {
         texts: impl AsRef<[S]>,
         batch_size: Option<usize>,
     ) -> Result<Vec<Embedding>> {
-        let batches = self.transform(texts.as_ref(), batch_size)?;
-        if let Some(output_key) = &self.output_key {
-            batches.export_with_transformer(output::transformer_with_precedence(
-                output_key,
-                self.pooling.clone(),
-            ))
-        } else {
-            batches.export_with_transformer(output::transformer_with_precedence(
-                output::OUTPUT_TYPE_PRECEDENCE,
-                self.pooling.clone(),
-            ))
+        let texts = texts.as_ref();
+        let Some(batch_size) = self.batch_size_for(texts.len(), batch_size)? else {
+            return Ok(Vec::new());
+        };
+        let precedence = match &self.output_key {
+            Some(output_key) => vec![output_key.clone()],
+            None => output::OUTPUT_TYPE_PRECEDENCE.to_vec(),
+        };
+        let transformer =
+            output::transformer_with_precedence(precedence.as_slice(), self.pooling.clone());
+
+        // Each batch is pooled before the next one runs, so one batch of model output is held
+        // at a time.
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for (index, batch) in texts.chunks(batch_size).enumerate() {
+            let output = self.run_batch(batch)?;
+            match transformer(std::slice::from_ref(&output)) {
+                Ok(vectors) => embeddings.extend(vectors),
+                Err(error) => {
+                    // An error in running a later batch comes first, as it does when every
+                    // batch runs before the first one is pooled.
+                    drop(output);
+                    for later in texts.chunks(batch_size).skip(index + 1) {
+                        self.run_batch(later)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
+        Ok(embeddings)
     }
 }
 
@@ -411,8 +439,111 @@ mod tests {
     #[test]
     fn quantized_variants_have_explicit_pooling() {
         for variant in crate::models::text_embedding::all_variants() {
-            let _ = TextEmbedding::get_default_pooling_method(&variant);
+            assert!(
+                TextEmbedding::get_default_pooling_method(&variant).is_some(),
+                "{variant:?}"
+            );
             let _ = TextEmbedding::get_quantization_mode(&variant);
+        }
+    }
+
+    fn model(quantization: QuantizationMode) -> TextEmbedding {
+        use crate::common::tests::{bert_tokenizer_files, relu_model_bytes};
+
+        let model = UserDefinedEmbeddingModel::new(relu_model_bytes(), bert_tokenizer_files())
+            .with_quantization(quantization);
+        TextEmbedding::try_new_from_user_defined(model, Default::default()).unwrap()
+    }
+
+    #[test]
+    fn no_texts_embed_to_nothing_whatever_the_quantization() {
+        for quantization in [QuantizationMode::None, QuantizationMode::Dynamic] {
+            let mut model = model(quantization);
+            let no_texts: [&str; 0] = [];
+            for batch_size in [None, Some(1)] {
+                assert!(model.embed(no_texts, batch_size).unwrap().is_empty());
+                let output = model.transform(no_texts, batch_size).unwrap();
+                assert!(output.into_raw().is_empty());
+            }
+            assert!(matches!(
+                model.embed(no_texts, Some(0)),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+    }
+
+    /// A model that embeds each text to its token ids: `[0, 2, .., 1]`, one 2 for each word.
+    fn token_ids_model(tokens: Option<u8>, output_key: Option<OutputKey>) -> TextEmbedding {
+        use crate::common::tests::{bert_tokenizer_files, token_ids_model_bytes};
+
+        let mut model =
+            UserDefinedEmbeddingModel::new(token_ids_model_bytes(tokens), bert_tokenizer_files());
+        model.output_key = output_key;
+        TextEmbedding::try_new_from_user_defined(model, Default::default()).unwrap()
+    }
+
+    #[test]
+    fn embed_gives_the_vectors_of_transform_for_every_batch_size() {
+        let mut model = token_ids_model(None, None);
+        let texts = [
+            "hello",
+            "hello hello hello",
+            "hello hello",
+            "hello",
+            "hello hello",
+        ];
+        for batch_size in [None, Some(1), Some(2), Some(3), Some(usize::MAX)] {
+            let embedded = model.embed(texts, batch_size).unwrap();
+            let transformed = model
+                .transform(texts, batch_size)
+                .unwrap()
+                .export_with_transformer(output::transformer_with_precedence(
+                    output::OUTPUT_TYPE_PRECEDENCE,
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(embedded, transformed, "batch size {batch_size:?}");
+            assert_eq!(embedded.len(), texts.len());
+        }
+        // One text alone: its ids 0, 2 and 1, normalized.
+        let alone = &model.embed(["hello"], None).unwrap()[0];
+        let norm = 5f32.sqrt();
+        for (value, id) in alone.iter().zip([0.0, 2.0, 1.0]) {
+            assert!((value - id / norm).abs() < 1e-6, "{alone:?}");
+        }
+    }
+
+    #[test]
+    fn an_error_in_a_later_batch_comes_before_a_pooling_error() {
+        // Rows of three tokens run. No output has the name asked for, so pooling fails.
+        let mut model = token_ids_model(Some(3), Some(OutputKey::ByName("missing")));
+        let (fits, too_long) = ("hello", "hello hello hello");
+
+        assert!(matches!(model.embed([fits], Some(1)), Err(Error::Other(_))));
+        for texts in [[fits, too_long], [too_long, fits]] {
+            assert!(matches!(
+                model.embed(texts, Some(1)),
+                Err(Error::OrtSession(_))
+            ));
+        }
+
+        let mut model = token_ids_model(Some(3), None);
+        assert_eq!(model.embed([fits, fits], Some(1)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_dynamically_quantized_model_refuses_to_split_its_texts() {
+        let mut model = model(QuantizationMode::Dynamic);
+        assert!(matches!(
+            model.embed(["hello", "hello hello"], Some(1)),
+            Err(Error::InvalidArgument(_))
+        ));
+        // Two texts in one batch reach the test model, which takes no token ids.
+        for batch_size in [None, Some(2), Some(3)] {
+            assert!(matches!(
+                model.embed(["hello", "hello hello"], batch_size),
+                Err(Error::OrtSession(_))
+            ));
         }
     }
 }

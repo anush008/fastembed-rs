@@ -29,12 +29,35 @@ impl TransformData {
 pub(crate) type ResizeFn =
     dyn Fn(DynamicImage, u32, u32, FilterType) -> Result<DynamicImage> + Send + Sync;
 
+/// The `image` decoders allow 512 MiB for one decoded image, and each buffer of a resize keeps
+/// that limit. An image that is a few pixels wide and thousands of pixels tall resizes to
+/// gigabytes.
+const MAX_RESIZE_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
+
 fn default_resize(
     image: DynamicImage,
     width: u32,
     height: u32,
     filter: FilterType,
 ) -> Result<DynamicImage> {
+    // `resize_exact` allocates an RGBA f32 image of the source width and the new height, and
+    // then the result.
+    let bytes = |width: u32, height: u32, per_pixel: u64| {
+        u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(per_pixel)
+    };
+    let buffers = [
+        bytes(image.width(), height, 16),
+        bytes(width, height, u64::from(image.color().bytes_per_pixel())),
+    ];
+    if buffers.iter().any(|&size| size > MAX_RESIZE_BUFFER_BYTES) {
+        return Err(Error::ImageTransform(format!(
+            "The resize of a {}x{} image to {width}x{height} needs a buffer above 512 MiB",
+            image.width(),
+            image.height()
+        )));
+    }
     Ok(image.resize_exact(width, height, filter))
 }
 
@@ -142,8 +165,9 @@ impl Transform for CenterCrop {
             }
             let mut pixels_array =
                 Array3::zeros((3usize, crop_height as usize, crop_width as usize));
-            let offset_x = (crop_width - origin_width) / 2;
-            let offset_y = (crop_height - origin_height) / 2;
+            // transformers puts `ceil(padding / 2)` before the image.
+            let offset_x = (crop_width - origin_width).div_ceil(2);
+            let offset_y = (crop_height - origin_height).div_ceil(2);
             // HWC -> CHW
             for (x, y, pixel) in image.to_rgb8().enumerate_pixels() {
                 pixels_array[[0, (y + offset_y) as usize, (x + offset_x) as usize]] =
@@ -290,11 +314,11 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
         .as_str()
         .unwrap_or("CLIPImageProcessor");
     match mode {
-        "CLIPImageProcessor" | "BitImageProcessor" => {
+        "CLIPImageProcessor" | "CLIPFeatureExtractor" | "BitImageProcessor" => {
             if config["do_resize"].as_bool().unwrap_or(false) {
                 transformers.push(Box::new(Resize {
                     size: parse_resize_size(&config["size"])?,
-                    resample: FilterType::CatmullRom,
+                    resample: parse_resample(&config["resample"]),
                 }));
             }
 
@@ -304,7 +328,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 }));
             }
         }
-        "ConvNextFeatureExtractor" => {
+        "ConvNextImageProcessor" | "ConvNextFeatureExtractor" => {
             let shortest_edge = config["size"]["shortest_edge"].as_u64().ok_or_else(|| {
                 Error::PreprocessorConfig(
                     "Size dictionary must contain 'shortest_edge' key.".into(),
@@ -315,7 +339,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 let resize_shortest_edge = shortest_edge as f64 / crop_pct;
                 transformers.push(Box::new(Resize {
                     size: ResizeSize::ShortestEdge(resize_shortest_edge as u32),
-                    resample: FilterType::CatmullRom,
+                    resample: parse_resample(&config["resample"]),
                 }));
                 transformers.push(Box::new(CenterCrop {
                     size: (shortest_edge, shortest_edge),
@@ -326,7 +350,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                         width: shortest_edge,
                         height: shortest_edge,
                     },
-                    resample: FilterType::CatmullRom,
+                    resample: parse_resample(&config["resample"]),
                 }));
             }
         }
@@ -373,6 +397,17 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
     }
 
     Ok(Compose::new(transformers))
+}
+
+/// The filter that `resample` names by its number in PIL. Bicubic stands in for an absent
+/// number, and for a PIL filter that the image crate does not have.
+fn parse_resample(resample: &serde_json::Value) -> FilterType {
+    match resample.as_u64() {
+        Some(0) => FilterType::Nearest,
+        Some(1) => FilterType::Lanczos3,
+        Some(2) => FilterType::Triangle,
+        _ => FilterType::CatmullRom,
+    }
 }
 
 fn parse_resize_size(size: &serde_json::Value) -> Result<ResizeSize> {
@@ -454,6 +489,76 @@ mod tests {
         assert_eq!(out.dim(), (3, 100, 224));
         assert_eq!(out[[0, 50, 112]], 255.0);
         assert_eq!(out[[0, 0, 0]], 0.0);
+    }
+
+    #[test]
+    fn center_crop_puts_the_odd_pixel_of_padding_before_the_image() {
+        let crop = CenterCrop { size: (224, 100) };
+        let out = crop.transform(image(51, 41)).unwrap().array().unwrap();
+        // 173 columns and 59 rows of padding: 87 and 30 before the image, 86 and 29 after.
+        assert_eq!(out[[0, 30, 87]], 255.0);
+        assert_eq!(out[[0, 70, 137]], 255.0);
+        assert_eq!(out[[0, 29, 87]], 0.0);
+        assert_eq!(out[[0, 30, 86]], 0.0);
+        assert_eq!(out[[0, 71, 137]], 0.0);
+        assert_eq!(out[[0, 70, 138]], 0.0);
+    }
+
+    #[test]
+    fn a_resize_with_a_buffer_above_the_limit_is_an_error() {
+        let above_the_limit = |resize: Resize, image: TransformData| {
+            let err = resize.transform(image).err().unwrap().to_string();
+            assert!(err.contains("above 512 MiB"), "error was: {err}");
+        };
+        let shortest_edge = || Resize {
+            size: ResizeSize::ShortestEdge(224),
+            resample: FilterType::Nearest,
+        };
+        // The result has 224 x 22,400,000 pixels of three bytes.
+        above_the_limit(shortest_edge(), image(1, 100_000));
+        // The first pass keeps the source width: 40,000 x 1,000 pixels of 16 bytes.
+        let exact = |width: u32, height: u32| Resize {
+            size: ResizeSize::Exact { width, height },
+            resample: FilterType::Nearest,
+        };
+        above_the_limit(exact(1, 1000), image(40_000, 1));
+        above_the_limit(exact(u32::MAX, u32::MAX), image(1, 1));
+
+        let out = shortest_edge()
+            .transform(image(1, 30))
+            .unwrap()
+            .image()
+            .unwrap();
+        assert_eq!(out.dimensions(), (224, 6720));
+    }
+
+    #[test]
+    fn deprecated_and_current_processor_names_build_the_same_pipeline() {
+        let output = |processor: &str, extra: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "image_processor_type": processor,
+                "do_resize": true,
+                "size": {"shortest_edge": 224},
+                "do_rescale": false
+            });
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let compose = load_preprocessor(config).unwrap();
+            compose.transform(image(640, 480)).unwrap().array().unwrap()
+        };
+
+        let crop = serde_json::json!({"do_center_crop": true, "crop_size": 224});
+        assert_eq!(
+            output("CLIPFeatureExtractor", crop.clone()),
+            output("CLIPImageProcessor", crop)
+        );
+        let none = serde_json::json!({});
+        assert_eq!(
+            output("ConvNextImageProcessor", none.clone()),
+            output("ConvNextFeatureExtractor", none)
+        );
     }
 
     #[test]

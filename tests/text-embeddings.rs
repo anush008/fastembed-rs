@@ -2,7 +2,10 @@
 #![allow(clippy::excessive_precision)]
 
 use std::path::Path;
-use std::{fs, sync::OnceLock};
+use std::{
+    fs,
+    sync::{Mutex, OnceLock},
+};
 
 use hf_hub::Repo;
 use ort::environment::Environment;
@@ -21,11 +24,23 @@ fn environment() -> Environment {
         .clone()
 }
 
+/// The directory that the library downloads models to.
+fn model_cache_dir() -> String {
+    std::env::var("HF_HOME").unwrap_or_else(|_| get_cache_dir())
+}
+
+/// `test_rerank` deletes each model after use. A test that reads the files of one of those
+/// models from the cache holds this lock for that time.
+static RERANKER_FILES: Mutex<()> = Mutex::new(());
+
 /// A small epsilon value for floating point comparisons.
 const EPS: f32 = 2e-2;
 
 /// int4 kernels give different sums on different CPUs.
 const EPS_Q4: f32 = 1e-1;
+
+/// Dynamic int8 models give sums up to ~0.04 apart on different ONNX Runtime versions and CPUs.
+const EPS_DYNAMIC: f32 = 6e-2;
 
 /// `FASTEMBED_TEST_SHARD=<index>/<count>` runs every `count`-th model, starting at `index`.
 fn in_shard(position: usize) -> bool {
@@ -105,8 +120,9 @@ fn verify_embeddings(model: &EmbeddingModel, embeddings: &[Embedding]) -> Result
         _ => panic!("Model {model} not found. If you have just inserted this `EmbeddingModel` variant, please update the expected embeddings."),
     };
 
-    let eps = match model {
-        EmbeddingModel::EmbeddingGemma300MQ4 => EPS_Q4,
+    let eps = match (model, TextEmbedding::get_quantization_mode(model)) {
+        (EmbeddingModel::EmbeddingGemma300MQ4, _) => EPS_Q4,
+        (_, QuantizationMode::Dynamic) => EPS_DYNAMIC,
         _ => EPS,
     };
 
@@ -146,7 +162,7 @@ macro_rules! create_embeddings_test {
         #[test]
         fn $name() {
             let mut supported_models = TextEmbedding::list_supported_models();
-            // HashMap order differs per process, shards need a fixed one.
+            // Sorted by name, so a shard keeps its models when the table order changes.
             supported_models.sort_by_key(|m| m.model.to_string());
             supported_models
                 .iter()
@@ -269,7 +285,7 @@ fn test_user_defined_embedding_model() {
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
-    let model_dir = Path::new(&get_cache_dir()).join(format!("models--{}", model_name));
+    let model_dir = Path::new(&model_cache_dir()).join(format!("models--{}", model_name));
 
     // Find the "snapshots" sub-directory
     let snapshots_dir = model_dir.join("snapshots");
@@ -345,6 +361,28 @@ fn test_user_defined_embedding_model() {
 }
 
 #[test]
+fn test_dynamic_quantization_runs_the_texts_of_a_call_as_one_batch() {
+    let mut model = TextEmbedding::try_new(
+        TextInitOptions::new(EmbeddingModel::AllMiniLML6V2Q).with_environment(environment()),
+    )
+    .unwrap();
+    assert_eq!(
+        TextEmbedding::get_quantization_mode(&EmbeddingModel::AllMiniLML6V2Q),
+        QuantizationMode::Dynamic
+    );
+
+    let no_texts: Vec<&str> = Vec::new();
+    assert!(model.embed(&no_texts, None).unwrap().is_empty());
+    assert!(model.embed(&no_texts, Some(8)).unwrap().is_empty());
+    assert!(model.embed(&no_texts, Some(0)).is_err());
+
+    let texts = vec!["hello", "hello world"];
+    assert!(model.embed(&texts, Some(1)).is_err());
+    assert_eq!(model.embed(&texts, Some(2)).unwrap().len(), 2);
+    assert_eq!(model.embed(&texts, None).unwrap().len(), 2);
+}
+
+#[test]
 fn test_rerank() {
     let test_one_model = |supported_model: &RerankerModelInfo| {
         println!("supported_model: {:?}", supported_model);
@@ -390,7 +428,12 @@ fn test_rerank() {
         );
 
         // Clear the model cache to avoid running out of space on GitHub Actions.
-        clean_cache(supported_model.model_code.clone())
+        if std::env::var("CI").is_ok() {
+            let _files = RERANKER_FILES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clean_cache(supported_model.model_code.clone())
+        }
     };
     TextRerank::list_supported_models()
         .iter()
@@ -452,18 +495,33 @@ fn test_user_defined_reranking_large_model() {
 
 #[test]
 fn test_user_defined_reranking_model() {
+    let _files = RERANKER_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // Constitute the model in order to ensure it's downloaded and cached
     let test_model_info: fastembed::RerankerModelInfo =
         TextRerank::get_model_info(&RerankerModel::JINARerankerV1TurboEn);
 
     TextRerank::try_new(
-        RerankInitOptions::new(test_model_info.model).with_environment(environment()),
+        RerankInitOptions::new(test_model_info.model.clone()).with_environment(environment()),
     )
     .unwrap();
 
+    // The tokenizer adds two special tokens to a text and four to a query and document pair.
+    let too_short = TextRerank::try_new(
+        RerankInitOptions::new(test_model_info.model)
+            .with_max_length(3)
+            .with_environment(environment()),
+    );
+    assert!(matches!(
+        too_short,
+        Err(fastembed::Error::InvalidArgument(_))
+    ));
+
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
-    let model_dir = Path::new(&get_cache_dir()).join(format!("models--{}", model_name));
+    let model_dir = Path::new(&model_cache_dir()).join(format!("models--{}", model_name));
 
     // Find the "snapshots" sub-directory
     let snapshots_dir = model_dir.join("snapshots");
