@@ -46,6 +46,7 @@ pub struct Config {
     pub rope_scaling: Option<serde_json::Value>,
     pub rope_theta: f64,
     pub sliding_window: Option<usize>,
+    #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default = "default_true")]
     pub use_cache: bool,
@@ -75,17 +76,50 @@ struct Qwen3VLConfig {
 
 #[cfg(any(feature = "hf-hub", test))]
 fn parse_config_and_weight_prefix(config_bytes: &[u8]) -> Result<(Config, Option<&'static str>)> {
-    if let Ok(cfg) = serde_json::from_slice::<Config>(config_bytes) {
-        return Ok((cfg, None));
-    }
+    let failed = |cause: serde_json::Error| {
+        candle_core::Error::Msg(format!(
+            "Failed to parse config as Qwen3 or Qwen3-VL text config: {cause}"
+        ))
+    };
+    let mut config: serde_json::Value = serde_json::from_slice(config_bytes).map_err(failed)?;
+    hoist_rope_parameters(&mut config);
 
-    if let Ok(cfg) = serde_json::from_slice::<Qwen3VLConfig>(config_bytes) {
-        return Ok((cfg.text_config, Some("model.language_model")));
+    let is_vl = config.get("text_config").is_some();
+    let plain = match serde_json::from_value::<Config>(config.clone()) {
+        Ok(cfg) => return Ok((cfg, None)),
+        Err(err) => err,
+    };
+    match serde_json::from_value::<Qwen3VLConfig>(config) {
+        Ok(cfg) => Ok((cfg.text_config, Some("model.language_model"))),
+        Err(nested) if is_vl => Err(failed(nested)),
+        Err(_) => Err(failed(plain)),
     }
+}
 
-    Err(candle_core::Error::Msg(
-        "Failed to parse config as Qwen3 or Qwen3-VL text config".into(),
-    ))
+/// transformers 5 writes `rope_theta` and the MRoPE settings under `rope_parameters`. This puts
+/// them where `Config` reads them, in the config and in its `text_config`.
+#[cfg(any(feature = "hf-hub", test))]
+fn hoist_rope_parameters(config: &mut serde_json::Value) {
+    let Some(config) = config.as_object_mut() else {
+        return;
+    };
+    if let Some(text_config) = config.get_mut("text_config") {
+        hoist_rope_parameters(text_config);
+    }
+    let Some(parameters) = config.get("rope_parameters").cloned() else {
+        return;
+    };
+    if !config.contains_key("rope_theta") {
+        if let Some(theta) = parameters.get("rope_theta") {
+            config.insert("rope_theta".into(), theta.clone());
+        }
+    }
+    if config
+        .get("rope_scaling")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        config.insert("rope_scaling".into(), parameters);
+    }
 }
 
 #[cfg(feature = "qwen3-vl")]
@@ -900,10 +934,23 @@ fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
     x.broadcast_mul(&cos_u)? + rotate_half(x)?.broadcast_mul(&sin_u)?
 }
 
+/// Rows `start..start + len` of a `[B, 1, T, T]` mask, in a tensor that begins at the start of
+/// its buffer, which is where the fused kernel reads a mask from.
+fn mask_rows(mask: &Tensor, start: usize, len: usize) -> Result<Tensor> {
+    let rows = mask.narrow(2, start, len)?;
+    // candle counts one row as contiguous at any offset, so `contiguous` would not copy it.
+    if rows.layout().start_offset() == 0 {
+        rows.contiguous()
+    } else {
+        rows.force_contiguous()
+    }
+}
+
 // repeat_kv (HF): [B, Nkv, T, D] -> [B, Nh, T, D]
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
-        return Ok(x.clone());
+        // The matmul that reads it takes no transposed view of more than one row.
+        return x.contiguous();
     }
     let (b, n_kv, t, d) = x.dims4()?;
     // [B, Nkv, 1, T, D]
@@ -1159,12 +1206,7 @@ impl Qwen3Attention {
         let fused = match mask {
             AttentionMask::Causal => Some((None, rows == Rows::All)),
             AttentionMask::Fused(mask) => Some((
-                Some(mask.narrow(2, q_start, tq)?.contiguous()?.broadcast_as((
-                    b,
-                    self.num_heads,
-                    tq,
-                    t,
-                ))?),
+                Some(mask_rows(mask, q_start, tq)?.broadcast_as((b, self.num_heads, tq, t))?),
                 false,
             )),
             AttentionMask::None | AttentionMask::Additive(_) => None,
@@ -1504,8 +1546,9 @@ impl Qwen3Model {
     }
 
     /// input_ids: `[B,T]`
-    /// attention_mask: optionally `[B,T]` (1=token,0=pad) OR already expanded additive mask `[B,1,T,T]`
-    /// Here we assume additive mask `[B,1,T,T]` for simplicity (HF does that).
+    /// attention_mask_4d: an additive mask that broadcasts onto `[B,heads,T,T]`, such as
+    /// `[B,1,T,T]`. It is added to the attention scores as it is, so a `[B,T]` mask of ones and
+    /// zeros is not converted. `None` applies no mask at all, the causal one included.
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -2445,7 +2488,9 @@ impl Qwen3VLEmbedding {
 
         let cfg_path: PathBuf = repo.get("config.json").map_err(map_err)?;
         let cfg_bytes = std::fs::read(&cfg_path).map_err(map_err)?;
-        let cfg: Qwen3VLFullConfig = serde_json::from_slice(&cfg_bytes).map_err(map_err)?;
+        let mut config: serde_json::Value = serde_json::from_slice(&cfg_bytes).map_err(map_err)?;
+        hoist_rope_parameters(&mut config);
+        let cfg: Qwen3VLFullConfig = serde_json::from_value(config).map_err(map_err)?;
 
         let preproc_path: PathBuf = repo.get("preprocessor_config.json").map_err(map_err)?;
         let preprocessor_bytes = std::fs::read(&preproc_path).map_err(map_err)?;
@@ -3765,6 +3810,23 @@ mod tests {
             "padded",
         );
 
+        // One row, left-padded by eleven: its last mask row is a view that starts mid-buffer.
+        let one_row = input_ids.i(..1).unwrap().contiguous().unwrap();
+        let mut mask = vec![1f32; t];
+        mask[..11].fill(0.0);
+        let one_mask = Tensor::from_vec(mask, (1, t), &device).unwrap();
+        let all = model
+            .forward_padded(&one_row, &one_mask, Rows::All)
+            .unwrap();
+        let last = model
+            .forward_padded(&one_row, &one_mask, Rows::Last)
+            .unwrap();
+        let diff = max_abs_diff(
+            &all.i((.., t - 1..t)).unwrap().to_dtype(DType::F32).unwrap(),
+            &last.to_dtype(DType::F32).unwrap(),
+        );
+        assert!(diff <= tolerance, "one padded row: differs by {diff}");
+
         if !device.is_metal() {
             let mask = super::build_attention_mask_4d(&mask_2d).unwrap();
             let positions = Tensor::arange(0u32, t as u32, &device)
@@ -3800,6 +3862,57 @@ mod tests {
             candle_core::DType::F32,
         );
         assert_last_row_matches(&model, 1e-5);
+    }
+
+    #[test]
+    fn mask_rows_start_at_the_start_of_their_buffer() {
+        use candle_core::{Device, Tensor};
+
+        for batch in [1usize, 2] {
+            let mask = Tensor::arange(0f32, (batch * 25) as f32, &Device::Cpu)
+                .unwrap()
+                .reshape((batch, 1, 5, 5))
+                .unwrap();
+            for (start, len) in [(4, 1), (0, 5), (2, 3)] {
+                let rows = super::mask_rows(&mask, start, len).unwrap();
+                assert_eq!(
+                    rows.layout().start_offset(),
+                    0,
+                    "batch {batch}, row {start}"
+                );
+                assert!(rows.is_contiguous());
+                let want = mask.narrow(2, start, len).unwrap();
+                assert_eq!(
+                    rows.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    want.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_head_and_kv_head_counts_run_more_than_one_row() {
+        let mut cfg = small_config();
+        cfg.num_key_value_heads = cfg.num_attention_heads;
+        let model = super::Qwen3TextEmbedding::new(
+            random_model(cfg, 2, &candle_core::Device::Cpu, candle_core::DType::F32),
+            word_tokenizer(),
+        );
+        // Two texts of one token count run as one forward of two rows.
+        let texts = ["w1 w2 w3", "w4 w5 w6", "w7 w8"];
+        let together = model.embed(&texts).unwrap();
+        let padded = model.embed_padded(&texts).unwrap();
+        for (i, text) in texts.iter().enumerate() {
+            let alone = &model.embed(&[*text]).unwrap()[0];
+            for batched in [&together[i], &padded[i]] {
+                let diff = batched
+                    .iter()
+                    .zip(alone)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(diff < 1e-4, "text {i} differs from alone by {diff}");
+            }
+        }
     }
 
     #[cfg(feature = "metal")]
@@ -3963,6 +4076,40 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(late_cos.iter().any(|&c| (c - 1.0).abs() > 1e-3));
+    }
+
+    #[test]
+    fn interleaved_mrope_takes_height_and_width_at_every_third_frequency() {
+        use super::Qwen3RotaryEmbedding;
+        use candle_core::{DType, Device, Tensor};
+
+        let mut cfg = small_config();
+        cfg.rope_scaling = Some(serde_json::json!({
+            "mrope_section": [4, 2, 2],
+            "mrope_interleaved": true
+        }));
+        let device = Device::Cpu;
+        let rotary = Qwen3RotaryEmbedding::new(&cfg, &device).unwrap();
+        let inv_freq = rotary.inv_freq.to_vec1::<f32>().unwrap();
+        assert_eq!(inv_freq.len(), 8);
+
+        // One token at time 5, height 7 and width 11.
+        let xs = Tensor::zeros((1, 1, cfg.head_dim()), DType::F32, &device).unwrap();
+        let positions = Tensor::from_vec(vec![5u32, 7, 11], (3, 1, 1), &device).unwrap();
+        let (cos, sin) = rotary.forward(&xs, &positions).unwrap();
+
+        // Height at 1 and 4, width at 2 and 5 (below three times their section), time elsewhere.
+        let axis = [5f32, 7.0, 11.0, 5.0, 7.0, 11.0, 5.0, 5.0];
+        let angles: Vec<f32> = axis.iter().zip(&inv_freq).map(|(p, f)| p * f).collect();
+        let angles = [angles.clone(), angles].concat();
+        let (cos, sin) = (
+            cos.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            sin.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        for (i, angle) in angles.iter().enumerate() {
+            assert!((cos[i] - angle.cos()).abs() < 1e-5, "cos {i}");
+            assert!((sin[i] - angle.sin()).abs() < 1e-5, "sin {i}");
+        }
     }
 
     /// A random-looking f32 model on the CPU, and its VarMap for writing the same weights to
@@ -4422,6 +4569,77 @@ mod tests {
         let (cfg, prefix) = parse_config_and_weight_prefix(config.as_bytes()).unwrap();
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(prefix, Some("model.language_model"));
+    }
+
+    #[test]
+    fn parses_the_config_layout_of_transformers_5() {
+        // `rope_parameters` in place of `rope_theta` and `rope_scaling`.
+        let config = r#"{
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "max_position_embeddings": 32768,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "vocab_size": 151669
+        }"#;
+        let (cfg, prefix) = parse_config_and_weight_prefix(config.as_bytes()).unwrap();
+        assert_eq!(prefix, None);
+        assert_eq!(cfg.rope_theta, 1e6);
+
+        // The same inside `text_config`, which also has no `tie_word_embeddings`.
+        let config = r#"{
+            "text_config": {
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "hidden_act": "silu",
+                "hidden_size": 2048,
+                "intermediate_size": 6144,
+                "max_position_embeddings": 262144,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 8,
+                "rms_norm_eps": 1e-06,
+                "rope_parameters": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [24, 20, 20],
+                    "rope_theta": 5000000,
+                    "rope_type": "default"
+                },
+                "vocab_size": 151936
+            }
+        }"#;
+        let (cfg, prefix) = parse_config_and_weight_prefix(config.as_bytes()).unwrap();
+        assert_eq!(prefix, Some("model.language_model"));
+        assert_eq!(cfg.rope_theta, 5e6);
+        assert!(!cfg.tie_word_embeddings);
+        let rotary = super::Qwen3RotaryEmbedding::new(&cfg, &candle_core::Device::Cpu).unwrap();
+        assert!(rotary.mrope_interleaved);
+        assert_eq!(rotary.mrope_section, [24, 20, 20]);
+    }
+
+    #[test]
+    fn a_config_that_does_not_parse_names_the_cause() {
+        let plain = parse_config_and_weight_prefix(br#"{"hidden_size": 1024}"#);
+        let err = plain.err().unwrap().to_string();
+        assert!(err.contains("missing field"), "error was: {err}");
+
+        let nested = parse_config_and_weight_prefix(br#"{"text_config": {"hidden_size": 1}}"#);
+        let err = nested.err().unwrap().to_string();
+        assert!(err.contains("missing field"), "error was: {err}");
+
+        let err = parse_config_and_weight_prefix(b"{")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("EOF"), "error was: {err}");
     }
 
     #[cfg(feature = "qwen3-vl")]
