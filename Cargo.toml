@@ -23,7 +23,7 @@ homepage = "https://crates.io/crates/fastembed"
 include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [package.metadata.docs.rs]
-features = ["qwen3", "nomic-v2-moe"]
+features = ["qwen3", "nomic-v2-moe", "bert-text"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

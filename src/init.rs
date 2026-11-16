@@ -28,7 +28,8 @@ pub struct InitOptionsWithLength<M> {
     pub show_download_progress: bool,
     pub max_length: usize,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
-    /// every available CPU core via `std::thread::available_parallelism`.
+    /// every available CPU core via `std::thread::available_parallelism`, or
+    /// ONNX Runtime's own default when the core count cannot be read.
     /// Set this to cap CPU usage (e.g. on laptops) at the cost of throughput.
     pub intra_threads: Option<usize>,
     /// ONNX Runtime session configuration entries, applied with
@@ -53,7 +54,8 @@ pub struct InitOptions<M> {
     pub cache_dir: PathBuf,
     pub show_download_progress: bool,
     /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
-    /// every available CPU core via `std::thread::available_parallelism`.
+    /// every available CPU core via `std::thread::available_parallelism`, or
+    /// ONNX Runtime's own default when the core count cannot be read.
     /// Set this to cap CPU usage (e.g. on laptops) at the cost of throughput.
     pub intra_threads: Option<usize>,
     /// ONNX Runtime session configuration entries, applied with

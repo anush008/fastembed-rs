@@ -19,16 +19,16 @@ pub enum EmbeddingModel {
     AllMpnetBaseV2,
     /// BAAI/bge-base-en-v1.5
     BGEBaseENV15,
-    /// Quantized BAAI/bge-base-en-v1.5
+    /// Half-precision (fp16) BAAI/bge-base-en-v1.5
     BGEBaseENV15Q,
     /// BAAI/bge-large-en-v1.5
     BGELargeENV15,
-    /// Quantized BAAI/bge-large-en-v1.5
+    /// Half-precision (fp16) BAAI/bge-large-en-v1.5
     BGELargeENV15Q,
     /// BAAI/bge-small-en-v1.5 - Default
     #[default]
     BGESmallENV15,
-    /// Quantized BAAI/bge-small-en-v1.5
+    /// Half-precision (fp16) BAAI/bge-small-en-v1.5
     BGESmallENV15Q,
     /// nomic-ai/nomic-embed-text-v1
     NomicEmbedTextV1,
@@ -38,7 +38,7 @@ pub enum EmbeddingModel {
     NomicEmbedTextV15Q,
     /// sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     ParaphraseMLMiniLML12V2,
-    /// Quantized sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    /// Half-precision (fp16) sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
     ParaphraseMLMiniLML12V2Q,
     /// sentence-transformers/paraphrase-multilingual-mpnet-base-v2
     ParaphraseMLMpnetBaseV2,
@@ -102,9 +102,9 @@ pub enum EmbeddingModel {
     SnowflakeArcticEmbedLQ,
 }
 
-/// Centralized function to initialize the models map.
-fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
-    let models_list = vec![
+/// Get a list of all available models, in the order of this table.
+pub fn models_list() -> Vec<ModelInfo<EmbeddingModel>> {
+    vec![
         ModelInfo {
             model: EmbeddingModel::AllMiniLML6V2,
             dim: 384,
@@ -335,7 +335,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::MxbaiEmbedLargeV1,
             dim: 1024,
-            description: String::from("Large English embedding model from MixedBreed.ai"),
+            description: String::from("Large English embedding model from Mixedbread"),
             model_code: String::from("mixedbread-ai/mxbai-embed-large-v1"),
             model_file: String::from("onnx/model.onnx"),
             additional_files: Vec::new(),
@@ -344,7 +344,7 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
         ModelInfo {
             model: EmbeddingModel::MxbaiEmbedLargeV1Q,
             dim: 1024,
-            description: String::from("Quantized Large English embedding model from MixedBreed.ai"),
+            description: String::from("Quantized Large English embedding model from Mixedbread"),
             model_code: String::from("mixedbread-ai/mxbai-embed-large-v1"),
             model_file: String::from("onnx/model_quantized.onnx"),
             additional_files: Vec::new(),
@@ -534,28 +534,17 @@ fn init_models_map() -> HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
             additional_files: Vec::new(),
             output_key: None,
         },
-    ];
-
-    models_list
-        .into_iter()
-        .fold(HashMap::new(), |mut map, model| {
-            // Insert the model into the map
-            map.insert(model.model.clone(), model);
-            map
-        })
+    ]
 }
 
 /// Get a map of all available models.
 pub fn models_map() -> &'static HashMap<EmbeddingModel, ModelInfo<EmbeddingModel>> {
-    MODEL_MAP.get_or_init(init_models_map)
-}
-
-/// Get a list of all available models.
-///
-/// This will assign new memory to the models list. Where possible, use
-/// [`models_map`] instead.
-pub fn models_list() -> Vec<ModelInfo<EmbeddingModel>> {
-    models_map().values().cloned().collect()
+    MODEL_MAP.get_or_init(|| {
+        models_list()
+            .into_iter()
+            .map(|model| (model.model.clone(), model))
+            .collect()
+    })
 }
 
 impl ModelTrait for EmbeddingModel {
@@ -705,8 +694,16 @@ mod tests {
         for variant in all_variants() {
             assert!(
                 listed.contains(&variant),
-                "{variant:?} is missing from models_list(); get_model_info would panic"
+                "{variant:?} is missing from models_list()"
             );
         }
+    }
+
+    #[test]
+    fn models_list_keeps_the_table_order() {
+        let models: Vec<_> = models_list().into_iter().map(|info| info.model).collect();
+        assert_eq!(models[0], EmbeddingModel::AllMiniLML6V2);
+        assert_eq!(models.last(), Some(&EmbeddingModel::SnowflakeArcticEmbedLQ));
+        assert_eq!(models.len(), models_map().len());
     }
 }
