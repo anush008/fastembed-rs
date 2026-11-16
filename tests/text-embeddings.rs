@@ -2,7 +2,10 @@
 #![allow(clippy::excessive_precision)]
 
 use std::path::Path;
-use std::{fs, sync::OnceLock};
+use std::{
+    fs,
+    sync::{Mutex, OnceLock},
+};
 
 use hf_hub::Repo;
 use ort::environment::Environment;
@@ -20,6 +23,15 @@ fn environment() -> Environment {
         .get_or_init(|| ort::init().build().unwrap())
         .clone()
 }
+
+/// The directory that the library downloads models to.
+fn model_cache_dir() -> String {
+    std::env::var("HF_HOME").unwrap_or_else(|_| get_cache_dir())
+}
+
+/// `test_rerank` deletes each model after use. A test that reads the files of one of those
+/// models from the cache holds this lock for that time.
+static RERANKER_FILES: Mutex<()> = Mutex::new(());
 
 /// A small epsilon value for floating point comparisons.
 const EPS: f32 = 2e-2;
@@ -273,7 +285,7 @@ fn test_user_defined_embedding_model() {
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
-    let model_dir = Path::new(&get_cache_dir()).join(format!("models--{}", model_name));
+    let model_dir = Path::new(&model_cache_dir()).join(format!("models--{}", model_name));
 
     // Find the "snapshots" sub-directory
     let snapshots_dir = model_dir.join("snapshots");
@@ -416,7 +428,12 @@ fn test_rerank() {
         );
 
         // Clear the model cache to avoid running out of space on GitHub Actions.
-        clean_cache(supported_model.model_code.clone())
+        if std::env::var("CI").is_ok() {
+            let _files = RERANKER_FILES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clean_cache(supported_model.model_code.clone())
+        }
     };
     TextRerank::list_supported_models()
         .iter()
@@ -478,6 +495,10 @@ fn test_user_defined_reranking_large_model() {
 
 #[test]
 fn test_user_defined_reranking_model() {
+    let _files = RERANKER_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // Constitute the model in order to ensure it's downloaded and cached
     let test_model_info: fastembed::RerankerModelInfo =
         TextRerank::get_model_info(&RerankerModel::JINARerankerV1TurboEn);
@@ -500,7 +521,7 @@ fn test_user_defined_reranking_model() {
 
     // Get the directory of the model
     let model_name = test_model_info.model_code.replace('/', "--");
-    let model_dir = Path::new(&get_cache_dir()).join(format!("models--{}", model_name));
+    let model_dir = Path::new(&model_cache_dir()).join(format!("models--{}", model_name));
 
     // Find the "snapshots" sub-directory
     let snapshots_dir = model_dir.join("snapshots");

@@ -1,4 +1,5 @@
 #![cfg(all(feature = "image-models", feature = "hf-hub"))]
+#![allow(clippy::excessive_precision)]
 
 use std::sync::OnceLock;
 
@@ -33,10 +34,57 @@ fn test_image_embedding_model() {
         for embedding in &embeddings {
             assert_eq!(embedding.len(), supported_model.dim);
         }
+        if supported_model.model == ImageEmbeddingModel::ClipVitB32 {
+            assert_clip_matches_python_counterpart(&embeddings);
+        }
     };
     ImageEmbedding::list_supported_models()
         .iter()
         .for_each(test_one_model);
+}
+
+/// Compares the ClipVitB32 embeddings of the two test images with the first 8 values that
+/// fastembed 0.9.1 (Python) returns. `image_0.png` is resized first, and PIL rounds the
+/// resized pixels differently from the image crate.
+fn assert_clip_matches_python_counterpart(embeddings: &[Vec<f32>]) {
+    let baseline: [([f32; 8], f32); 2] = [
+        (
+            [
+                2.842_279_0e-2,
+                -1.676_774_0e-2,
+                -5.692_382_8e-3,
+                -3.964_272_1e-2,
+                -8.129_567_8e-3,
+                -3.385_638_1e-2,
+                3.124_806_7e-2,
+                4.087_865_0e-2,
+            ],
+            5e-3,
+        ),
+        (
+            [
+                2.917_035_1e-2,
+                -2.920_276_1e-2,
+                -1.089_769_2e-2,
+                -3.426_397_2e-2,
+                -1.583_512_7e-2,
+                -4.130_660_0e-2,
+                1.180_834_4e-2,
+                8.709_147_6e-2,
+            ],
+            1e-4,
+        ),
+    ];
+    for (embedding, (expected, tolerance)) in embeddings.iter().zip(baseline) {
+        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm {norm}");
+        for (actual, expected) in embedding.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < tolerance,
+                "{actual} is not {expected}"
+            );
+        }
+    }
 }
 
 #[test]
