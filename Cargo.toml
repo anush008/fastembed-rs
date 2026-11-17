@@ -20,6 +20,8 @@ authors = [
 documentation = "https://docs.rs/fastembed"
 repository = "https://github.com/Anush008/fastembed-rs"
 homepage = "https://crates.io/crates/fastembed"
+keywords = ["embeddings", "rag", "onnx", "machine-learning", "vector-search"]
+categories = ["artificial-intelligence", "text-processing", "computer-vision"]
 include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [package.metadata.docs.rs]
